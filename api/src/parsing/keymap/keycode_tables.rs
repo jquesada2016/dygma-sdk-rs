@@ -501,6 +501,16 @@ macros::generate_keycode_tables! {
     LeftShift,
     /// Oneshot Left Alt
     LeftAlt,
+    /// Oneshot Left OS
+    LeftOs,
+    /// Oneshot Right Ctrl
+    RightCtrl,
+    /// Oneshot Right Shift
+    RightShift,
+    /// Oneshot AltGr
+    AltGr,
+    /// Oneshot Right OS
+    RightOs,
   },
   /// Macro keys.
   macros: {
@@ -1021,26 +1031,3 @@ macros::generate_keycode_tables! {
     Super128,
       },
 }
-
-/*
-macros::generate_keycode_tables! {
-  /// Blank keys.
-  blank: {
-    /// "No Key")
-    NoKey = 0,
-    Transparent = 65535,
-  },
-  /// Whitespace keys.
-  #[with_modifiers]
-  #[with_dual_functions]
-  spacing: {
-    Enter = 40,
-    Escape,
-    Backspace,
-    Tab,
-    Space,
-    Insert = 73,
-    Delete = 76,
-  },
-}
-*/
