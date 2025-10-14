@@ -1,6 +1,6 @@
 use crate::{
-    ast,
     codegen::{DualFunctionModifier, KeyCodeOverflowsU16Error, Modifier, lit_int_to_u16},
+    ir,
 };
 use itertools::Itertools;
 use quote::{ToTokens, quote};
@@ -11,25 +11,15 @@ pub struct KeyTableEnum<'a> {
     variants: Vec<Variant>,
 }
 
-impl<'a> From<&'a ast::KeyTable> for KeyTableEnum<'a> {
-    fn from(table: &'a ast::KeyTable) -> Self {
-        let ast::KeyTable {
+impl<'a> From<&'a ir::KeyTable> for KeyTableEnum<'a> {
+    fn from(table: &'a ir::KeyTable) -> Self {
+        let ir::KeyTable {
             doc,
             with_modifiers,
             with_dual_functions,
             name,
             keys,
         } = table;
-
-        let mut offset = 0u16;
-
-        let update_offset = |offset: u16, key: &ast::Key| {
-            key.code
-                .as_ref()
-                .map(lit_int_to_u16)
-                .map(Ok)
-                .unwrap_or_else(|| offset.checked_add(1).ok_or(KeyCodeOverflowsU16Error))
-        };
 
         let mut variants = if with_modifiers.is_some() {
             let powerset = Modifier::powerset();
@@ -38,34 +28,21 @@ impl<'a> From<&'a ast::KeyTable> for KeyTableEnum<'a> {
                 .into_iter()
                 .flat_map(|modifier_set| {
                     keys.iter().filter_map(move |key| {
-                        offset = update_offset(offset, key).ok()?;
-
-                        Variant::new_with_modifiers(key, modifier_set.clone(), offset).ok()
+                        Variant::new_with_modifiers(key, modifier_set.clone()).ok()
                     })
                 })
                 .collect::<Vec<_>>()
         } else {
-            keys.iter()
-                .filter_map(move |key| {
-                    offset = update_offset(offset, key).ok()?;
-
-                    Some(Variant::new(key, offset))
-                })
-                .collect()
+            keys.iter().map(Variant::from).collect()
         };
-
-        let mut offset = 0u16;
 
         if with_dual_functions.is_some() {
             let dual_variants = DualFunctionModifier::VALUES
                 .iter()
                 .copied()
                 .flat_map(|modifier| {
-                    keys.iter().filter_map(move |key| {
-                        offset = update_offset(offset, key).ok()?;
-
-                        Variant::new_with_dual_functions(key, modifier, offset).ok()
-                    })
+                    keys.iter()
+                        .filter_map(move |key| Variant::new_with_dual_functions(key, modifier).ok())
                 });
 
             variants.extend(dual_variants)
@@ -119,30 +96,29 @@ impl ToTokens for Variant {
     }
 }
 
-impl Variant {
-    fn new(key: &ast::Key, offset: u16) -> Self {
-        let ast::Key { doc: _, name, code } = key;
+impl From<&ir::Key> for Variant {
+    fn from(key: &ir::Key) -> Self {
+        let ir::Key { doc: _, name, code } = key;
 
         let meta = VariantMeta::from(key);
 
         let name = name.to_owned();
 
-        let code = code
-            .clone()
-            .unwrap_or_else(|| syn::LitInt::new(&offset.to_string(), name.span()));
+        let code = code.clone();
 
         Self { meta, name, code }
     }
+}
 
+impl Variant {
     fn new_with_modifiers(
-        key: &ast::Key,
+        key: &ir::Key,
         modifiers: Vec<Modifier>,
-        offset: u16,
     ) -> Result<Self, KeyCodeOverflowsU16Error> {
-        let ast::Key { doc: _, name, code } = key;
+        let ir::Key { doc: _, name, code } = key;
 
         if modifiers.is_empty() {
-            return Ok(Self::new(key, offset));
+            return Ok(Self::from(key));
         }
 
         let meta = VariantMeta::new_with_modifiers(key, &modifiers);
@@ -160,10 +136,6 @@ impl Variant {
             .map(Modifier::as_modifier_value)
             .fold(0, std::ops::Add::add);
 
-        let code = code
-            .clone()
-            .unwrap_or_else(|| syn::LitInt::new(&offset.to_string(), name.span()));
-
         let code_u16 = lit_int_to_u16(&code);
 
         let code_u16 = code_u16
@@ -176,19 +148,14 @@ impl Variant {
     }
 
     fn new_with_dual_functions(
-        key: &ast::Key,
+        key: &ir::Key,
         modifier: DualFunctionModifier,
-        offset: u16,
     ) -> Result<Self, KeyCodeOverflowsU16Error> {
-        let ast::Key { doc: _, name, code } = key;
+        let ir::Key { doc: _, name, code } = key;
 
         let meta = VariantMeta::new_with_dual_functions(key, modifier);
 
         let name = quote::format_ident!("Dual{modifier:?}{name}");
-
-        let code = code
-            .clone()
-            .unwrap_or_else(|| syn::LitInt::new(&offset.to_string(), name.span()));
 
         let code_u16 = lit_int_to_u16(&code);
         let modifier_value = modifier.as_modifier_value();
@@ -208,9 +175,9 @@ struct VariantMeta {
     display_name: syn::LitStr,
 }
 
-impl From<&ast::Key> for VariantMeta {
-    fn from(key: &ast::Key) -> Self {
-        let ast::Key { doc, name, code: _ } = key;
+impl From<&ir::Key> for VariantMeta {
+    fn from(key: &ir::Key) -> Self {
+        let ir::Key { doc, name, code: _ } = key;
 
         let display_name = if let Some(lit_str) = doc.as_ref().and_then(attribute_to_lit_str) {
             syn::LitStr::new(lit_str.value().trim(), lit_str.span())
@@ -248,8 +215,8 @@ impl ToTokens for VariantMeta {
 }
 
 impl VariantMeta {
-    fn new_with_modifiers(key: &ast::Key, modifiers: &[Modifier]) -> Self {
-        let ast::Key { doc, name, code: _ } = key;
+    fn new_with_modifiers(key: &ir::Key, modifiers: &[Modifier]) -> Self {
+        let ir::Key { doc, name, code: _ } = key;
 
         let modifier_prefix = modifiers
             .iter()
@@ -273,8 +240,8 @@ impl VariantMeta {
         }
     }
 
-    fn new_with_dual_functions(key: &ast::Key, modifier: DualFunctionModifier) -> Self {
-        let ast::Key { doc, name, code: _ } = key;
+    fn new_with_dual_functions(key: &ir::Key, modifier: DualFunctionModifier) -> Self {
+        let ir::Key { doc, name, code: _ } = key;
 
         let display_name = if let Some(lit_str) = doc.as_ref().and_then(attribute_to_lit_str) {
             syn::LitStr::new(

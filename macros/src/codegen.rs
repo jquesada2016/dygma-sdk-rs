@@ -3,19 +3,18 @@ mod key_kind_enum;
 mod key_table_enum;
 
 use crate::{
-    Ast,
+    Ir, KeyCodeOverflowsU16Error,
     codegen::{
         impl_from_u16_for_key_kind::ImplFromU16ForKeyKind, key_kind_enum::KeyKindEnum,
         key_table_enum::KeyTableEnum,
     },
+    lit_int_to_u16,
 };
 use itertools::Itertools;
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 
-struct KeyCodeOverflowsU16Error;
-
-impl ToTokens for Ast {
+impl ToTokens for Ir {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let key_kind_enum = KeyKindEnum::from(self);
         let key_table_enums = self.0.iter().map(KeyTableEnum::from);
@@ -129,13 +128,5 @@ impl DualFunctionModifier {
             Self::Layer7 => 52754,
             Self::Layer8 => 53010,
         }
-    }
-}
-
-fn lit_int_to_u16(lit: &syn::LitInt) -> u16 {
-    if let Ok(value) = lit.base10_parse() {
-        value
-    } else {
-        abort!(lit.span(), "code must be a valid u16");
     }
 }

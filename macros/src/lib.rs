@@ -5,16 +5,25 @@ extern crate proc_macro_error2;
 
 mod ast;
 mod codegen;
-mod parse;
+mod ir;
 
+use crate::{ast::Ast, ir::Ir};
 use quote::ToTokens;
 
-use crate::ast::Ast;
+struct KeyCodeOverflowsU16Error;
 
 #[proc_macro_error]
 #[proc_macro]
 pub fn generate_keycode_tables(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let model = syn::parse_macro_input!(input as Ast);
+    let ast = syn::parse_macro_input!(input as Ast);
 
-    model.to_token_stream().into()
+    Ir::from(ast).to_token_stream().into()
+}
+
+fn lit_int_to_u16(lit: &syn::LitInt) -> u16 {
+    if let Ok(value) = lit.base10_parse() {
+        value
+    } else {
+        abort!(lit.span(), "code must be a valid u16");
+    }
 }

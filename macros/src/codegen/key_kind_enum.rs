@@ -1,12 +1,12 @@
-use crate::{Ast, ast};
+use crate::{Ir, ir};
 use quote::{ToTokens, quote};
 
 pub struct KeyKindEnum<'a> {
     variants: Vec<Variant<'a>>,
 }
 
-impl<'a> From<&'a Ast> for KeyKindEnum<'a> {
-    fn from(ast: &'a Ast) -> Self {
+impl<'a> From<&'a Ir> for KeyKindEnum<'a> {
+    fn from(ast: &'a Ir) -> Self {
         let variants = ast.0.iter().map(Variant::from).collect();
 
         Self { variants }
@@ -39,9 +39,9 @@ struct Variant<'a> {
     name: &'a syn::Ident,
 }
 
-impl<'a> From<&'a ast::KeyTable> for Variant<'a> {
-    fn from(table: &'a ast::KeyTable) -> Self {
-        let ast::KeyTable {
+impl<'a> From<&'a ir::KeyTable> for Variant<'a> {
+    fn from(table: &'a ir::KeyTable) -> Self {
+        let ir::KeyTable {
             doc,
             with_modifiers: _,
             with_dual_functions: _,

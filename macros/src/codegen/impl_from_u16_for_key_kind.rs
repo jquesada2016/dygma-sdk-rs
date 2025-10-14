@@ -1,6 +1,7 @@
 use crate::{
-    Ast, ast,
+    Ir,
     codegen::{DualFunctionModifier, Modifier, lit_int_to_u16},
+    ir,
 };
 use quote::{ToTokens, quote};
 
@@ -8,9 +9,9 @@ pub struct ImplFromU16ForKeyKind<'a> {
     tables: Vec<KeyTable<'a>>,
 }
 
-impl<'a> From<&'a Ast> for ImplFromU16ForKeyKind<'a> {
-    fn from(value: &'a Ast) -> Self {
-        let tables = value.0.iter().map(KeyTable::from).collect();
+impl<'a> From<&'a Ir> for ImplFromU16ForKeyKind<'a> {
+    fn from(ir: &'a Ir) -> Self {
+        let tables = ir.0.iter().map(KeyTable::from).collect();
 
         Self { tables }
     }
@@ -40,9 +41,9 @@ struct KeyTable<'a> {
     keys: Vec<Key>,
 }
 
-impl<'a> From<&'a ast::KeyTable> for KeyTable<'a> {
-    fn from(table: &'a ast::KeyTable) -> Self {
-        let ast::KeyTable {
+impl<'a> From<&'a ir::KeyTable> for KeyTable<'a> {
+    fn from(table: &'a ir::KeyTable) -> Self {
+        let ir::KeyTable {
             doc: _,
             with_modifiers,
             with_dual_functions,
@@ -65,32 +66,13 @@ impl<'a> From<&'a ast::KeyTable> for KeyTable<'a> {
                 }),
         );
 
-        let mut offset = 0u16;
-
         for key in keys {
-            let ast::Key { doc: _, name, code } = key;
+            let ir::Key { doc: _, name, code } = key;
 
-            offset = if let Some(code) = code {
-                lit_int_to_u16(code)
-            } else if let Some(offset) = offset.checked_add(1) {
-                offset
-            } else {
-                continue;
-            };
-
-            let match_arm_literal = if let Some(code) = code {
-                syn::LitInt::new(&offset.to_string(), code.span())
-            } else {
-                syn::LitInt::new(&offset.to_string(), name.span())
-            };
-
-            normalized_keys.push(Key {
-                name: name.to_owned(),
-                match_arm_literal: match_arm_literal.clone(),
-            });
+            normalized_keys.push(Key::from(key));
 
             if with_modifiers.is_some() {
-                normalized_keys.extend(keys_from_modifiers(key, &powerset, offset));
+                normalized_keys.extend(keys_from_modifiers(key, &powerset));
             }
 
             if with_dual_functions.is_some() {
@@ -101,11 +83,11 @@ impl<'a> From<&'a ast::KeyTable> for KeyTable<'a> {
                         .filter_map(|modifier| {
                             let name = quote::format_ident!("Dual{modifier:?}{name}");
 
-                            let code_u16 = lit_int_to_u16(&match_arm_literal)
-                                .checked_add(modifier.as_modifier_value())?;
+                            let code_u16 =
+                                lit_int_to_u16(&code).checked_add(modifier.as_modifier_value())?;
 
                             let match_arm_literal =
-                                syn::LitInt::new(&code_u16.to_string(), match_arm_literal.span());
+                                syn::LitInt::new(&code_u16.to_string(), code.span());
 
                             Some(Key {
                                 name,
@@ -155,8 +137,22 @@ struct Key {
     match_arm_literal: syn::LitInt,
 }
 
-fn keys_from_modifiers(key: &ast::Key, powerset: &[Vec<Modifier>], offset: u16) -> Vec<Key> {
-    let ast::Key { doc: _, name, code } = key;
+impl From<&ir::Key> for Key {
+    fn from(key: &ir::Key) -> Self {
+        let ir::Key { doc: _, name, code } = key;
+
+        let name = name.to_owned();
+        let match_arm_literal = code.to_owned();
+
+        Key {
+            name,
+            match_arm_literal,
+        }
+    }
+}
+
+fn keys_from_modifiers(key: &ir::Key, powerset: &[Vec<Modifier>]) -> Vec<Key> {
+    let ir::Key { doc: _, name, code } = key;
 
     powerset
         .iter()
@@ -175,14 +171,11 @@ fn keys_from_modifiers(key: &ast::Key, powerset: &[Vec<Modifier>], offset: u16) 
                 .map(|modifier| modifier.as_modifier_value())
                 .fold(0, std::ops::Add::add);
 
-            let match_arm_u16 = offset.checked_add(modifier_value)?;
+            let code_u16 = lit_int_to_u16(code);
 
-            let match_arm_literal = syn::LitInt::new(
-                &match_arm_u16.to_string(),
-                code.as_ref()
-                    .map(|code| code.span())
-                    .unwrap_or_else(|| name.span()),
-            );
+            let match_arm_u16 = code_u16.checked_add(modifier_value)?;
+
+            let match_arm_literal = syn::LitInt::new(&match_arm_u16.to_string(), code.span());
 
             Some(Key {
                 name,
