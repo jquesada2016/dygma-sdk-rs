@@ -43,10 +43,10 @@ impl<'a> From<&'a ir::KeyTable> for Variant<'a> {
     fn from(table: &'a ir::KeyTable) -> Self {
         let ir::KeyTable {
             doc,
-            with_modifiers: _,
-            with_dual_functions: _,
             name,
             keys: _,
+            keys_with_modifiers: _,
+            keys_with_dual_functions: _,
         } = table;
 
         Self { doc, name }

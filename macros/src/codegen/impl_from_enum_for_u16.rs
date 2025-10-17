@@ -10,10 +10,10 @@ impl<'a> From<&'a ir::KeyTable> for ImplFromKeyTableEnumForU16<'a> {
     fn from(table: &'a ir::KeyTable) -> Self {
         let ir::KeyTable {
             doc: _,
-            with_modifiers: _,
-            with_dual_functions: _,
             name,
             keys: _,
+            keys_with_modifiers: _,
+            keys_with_dual_functions: _,
         } = table;
 
         Self { name }
@@ -75,10 +75,10 @@ impl<'a> From<&'a ir::KeyTable> for KeyKindMatchArm<'a> {
     fn from(table: &'a ir::KeyTable) -> Self {
         let ir::KeyTable {
             doc: _,
-            with_modifiers: _,
-            with_dual_functions: _,
             name,
             keys: _,
+            keys_with_modifiers: _,
+            keys_with_dual_functions: _,
         } = table;
 
         Self { name }

@@ -10,8 +10,6 @@ mod ir;
 use crate::{ast::Ast, ir::Ir};
 use quote::ToTokens;
 
-struct KeyCodeOverflowsU16Error;
-
 #[proc_macro_error]
 #[proc_macro]
 pub fn generate_keycode_tables(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
