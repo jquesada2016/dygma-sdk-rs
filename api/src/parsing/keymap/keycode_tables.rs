@@ -1,5 +1,7 @@
 //! This module defines all the possible keycodes and their meaning.
 
+use std::str::FromStr;
+
 /// Mask used to enable/check for ctrl key modifier.
 pub const CONTROL_MODIFIER: u16 = 0x0100;
 
@@ -53,6 +55,11 @@ pub const LAYER_7_DUAL_FUNCTION: u16 = 52754;
 
 /// Offset used to enable/check for layer 8 dual-use functionality.
 pub const LAYER_8_DUAL_FUNCTION: u16 = 53010;
+
+/// Error returned when parsing a [`str`] to a key fails.
+#[derive(Clone, Copy, Debug, Display, Error)]
+#[display("not a valid key")]
+pub struct FromStrError;
 
 macros::generate_keycode_tables! {
   /// Blank keys.
