@@ -4,6 +4,7 @@ extern crate derive_more;
 use clap::{Args, Parser, Subcommand};
 use dygma_cli::focus_api::FocusApi;
 use error_stack::{ResultExt, report};
+use itertools::Itertools;
 use std::path::PathBuf;
 
 const PRODUCT_NAME: &str = "DEFY";
@@ -80,6 +81,16 @@ enum RawCommands {
         #[clap(short = 'H', long, default_value_t = true)]
         human_readable: bool,
     },
+    /// Get a human-readable name for the key code.
+    KeyCode {
+        /// The key code you want to get a human-readable name for.
+        code: u16,
+    },
+    /// Get a human-readable description of a string of key codes.
+    KeyCodeString {
+        /// The string of space-seperated key codes.
+        keys: String,
+    },
 }
 
 impl RawCommands {
@@ -94,6 +105,31 @@ impl RawCommands {
                 let keymap = data.parse::<DefyKeymap>()?;
 
                 println!("{keymap:#?}");
+
+                Ok(())
+            }
+            RawCommands::KeyCode { code } => {
+                use dygma_cli::parsing::keymap::KeyKind;
+
+                let key = KeyKind::from(code);
+
+                println!("{key}");
+
+                Ok(())
+            }
+
+            RawCommands::KeyCodeString { keys } => {
+                use dygma_cli::parsing::keymap::KeyKind;
+
+                let keys = keys
+                    .split(' ')
+                    .filter(|seq| !seq.is_empty())
+                    .map(|seq| seq.parse::<u16>().unwrap())
+                    .map(KeyKind::from)
+                    .map(|key| key.to_string())
+                    .join(" ");
+
+                println!("{keys}");
 
                 Ok(())
             }
