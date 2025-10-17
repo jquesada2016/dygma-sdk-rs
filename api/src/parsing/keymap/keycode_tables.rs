@@ -57,7 +57,7 @@ pub const LAYER_8_DUAL_FUNCTION: u16 = 53010;
 macros::generate_keycode_tables! {
   /// Blank keys.
   blank: {
-    /// "No Key")
+    /// No Key)
     NoKey = 0,
     Transparent = 65535,
   },
