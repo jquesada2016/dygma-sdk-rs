@@ -79,14 +79,19 @@ impl<'a> From<&'a ir::Key> for Variant<'a> {
         );
 
         let debug_name_matcher = syn::LitStr::new(
-            &format!("{name:?}")
+            &name
+                .to_string()
                 .chars()
                 .map(|c| c.to_ascii_lowercase())
                 .collect::<String>(),
             name.span(),
         );
 
-        let matchers = vec![display_name_matcher, debug_name_matcher];
+        let matchers = if display_name_matcher.value() == debug_name_matcher.value() {
+            vec![debug_name_matcher]
+        } else {
+            vec![display_name_matcher, debug_name_matcher]
+        };
 
         Self { name, matchers }
     }
