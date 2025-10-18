@@ -2,7 +2,9 @@
 extern crate derive_more;
 
 use clap::{Args, Parser, Subcommand};
+use dygma_cli::devices::defy::DefyKeymap;
 use dygma_cli::focus_api::FocusApi;
+use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;
 use std::path::PathBuf;
@@ -17,6 +19,9 @@ enum Cli {
     #[command(subcommand)]
     /// Useful commands for working with Bazecore JSON config files.
     Config(ConfigCommands),
+    /// Useful commands for working with keymap key codes.
+    #[command(subcommand)]
+    KeyCodes(KeyCodeCommands),
     /// Useful commands for working with raw string config values.
     #[clap(subcommand)]
     Raw(RawCommands),
@@ -25,12 +30,11 @@ enum Cli {
 impl Cli {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::RunCommand(args) => run_command(args).await?,
-            Self::Config(cmd) => cmd.perform().await?,
-            Cli::Raw(cmd) => cmd.perform().await?,
+            Self::RunCommand(args) => run_command(args).await.map_err(Into::into),
+            Self::Config(cmd) => cmd.perform().await,
+            Cli::Raw(cmd) => cmd.perform().await,
+            Cli::KeyCodes(cmd) => cmd.perform(),
         }
-
-        Ok(())
     }
 }
 
@@ -65,7 +69,7 @@ enum ConfigCommands {
 impl ConfigCommands {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            ConfigCommands::Keymap { path } => todo!(),
+            Self::Keymap { path } => todo!(),
         }
     }
 }
@@ -81,46 +85,59 @@ enum RawCommands {
         #[clap(short = 'H', long, default_value_t = true)]
         human_readable: bool,
     },
-    /// Get a human-readable name for the key code.
-    KeyCode {
-        /// The key code you want to get a human-readable name for.
-        code: u16,
-    },
-    /// Get a human-readable description of a string of key codes.
-    KeyCodeString {
-        /// The string of space-seperated key codes.
-        keys: String,
-    },
 }
 
 impl RawCommands {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            RawCommands::Keymap {
+            Self::Keymap {
                 data,
                 human_readable,
             } => {
-                use dygma_cli::devices::defy::DefyKeymap;
-
                 let keymap = data.parse::<DefyKeymap>()?;
 
                 println!("{keymap:#?}");
 
                 Ok(())
             }
-            RawCommands::KeyCode { code } => {
-                use dygma_cli::parsing::keymap::KeyKind;
+        }
+    }
+}
 
+#[derive(Subcommand)]
+enum KeyCodeCommands {
+    /// Get a human-readable name for the key code.
+    DescribeKeyCode {
+        /// The key code you want to get a human-readable name for.
+        code: u16,
+    },
+    /// Get a human-readable description of a string of key codes.
+    DescribeKeyCodeSequence {
+        /// The string of space-seperated key codes.
+        keys: String,
+    },
+    /// Parse a string into a key code.
+    Parse {
+        /// The string representing the key.
+        data: String,
+        /// If true, the raw u16 key code will be returned, otherwise, a parsable
+        /// key ID will be returned.
+        #[clap(short, long)]
+        raw: bool,
+    },
+}
+
+impl KeyCodeCommands {
+    fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::DescribeKeyCode { code } => {
                 let key = KeyKind::from(code);
 
                 println!("{key}");
 
                 Ok(())
             }
-
-            RawCommands::KeyCodeString { keys } => {
-                use dygma_cli::parsing::keymap::KeyKind;
-
+            Self::DescribeKeyCodeSequence { keys } => {
                 let keys = keys
                     .split(' ')
                     .filter(|seq| !seq.is_empty())
@@ -130,6 +147,23 @@ impl RawCommands {
                     .join(" ");
 
                 println!("{keys}");
+
+                Ok(())
+            }
+            Self::Parse { data, raw } => {
+                let Ok(key) = data.parse::<KeyKind>() else {
+                    println!("Could not recognize the key.");
+
+                    return Ok(());
+                };
+
+                if raw {
+                    let code: u16 = key.into();
+
+                    println!("{code}");
+                } else {
+                    println!("{key:?}");
+                }
 
                 Ok(())
             }
