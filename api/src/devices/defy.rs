@@ -96,7 +96,7 @@ pub struct DefyThumbClusterLayout {
 }
 
 /// Full Defy keymap.
-#[derive(Clone, Debug, Deref, DerefMut)]
+#[derive(Clone, Debug, Deref, DerefMut, Serialize, Deserialize)]
 pub struct DefyKeymap(pub Vec<DefyKeymapLayer>);
 
 impl FromStr for DefyKeymap {
@@ -114,7 +114,7 @@ impl FromStr for DefyKeymap {
 }
 
 /// A single human-readable Defy layer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyKeymapLayer {
     /// Left half of the keyboard.
     pub left: DefyKeymapLeft,
@@ -132,16 +132,16 @@ impl From<&DefyLayerData> for DefyKeymapLayer {
 }
 
 /// Left half human-readable Defy keymap.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyKeymapLeft {
     /// Row 1.
-    pub row_1: [String; 7],
+    pub row_1: [KeyKind; 7],
     /// Row 2.
-    pub row_2: [String; 7],
+    pub row_2: [KeyKind; 7],
     /// Row 3.
-    pub row_3: [String; 7],
+    pub row_3: [KeyKind; 7],
     /// Row 4.
-    pub row_4: [String; 6],
+    pub row_4: [KeyKind; 6],
     /// Thumb cluster.
     pub thumb_cluster: DefyThumbclusterKeymapLeft,
 }
@@ -153,26 +153,22 @@ impl From<&DefyLayerData> for DefyKeymapLeft {
         let row_1 = left_layout
             .row_1
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_2 = left_layout
             .row_2
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_3 = left_layout
             .row_3
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_4 = left_layout
             .row_4
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let thumb_cluster = DefyThumbclusterKeymapLeft::from(layer_data);
 
@@ -187,12 +183,12 @@ impl From<&DefyLayerData> for DefyKeymapLeft {
 }
 
 /// Left Defy thumb cluster keymap.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyThumbclusterKeymapLeft {
     /// The top four keys of the thumb cluster, from left to right.
-    pub top: [String; 4],
+    pub top: [KeyKind; 4],
     /// The bottom four keys of the thumb cluster, from left to right.
-    pub bottom: [String; 4],
+    pub bottom: [KeyKind; 4],
 }
 
 impl From<&DefyLayerData> for DefyThumbclusterKeymapLeft {
@@ -203,31 +199,29 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapLeft {
             .thumb_cluster
             .top
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let bottom = left_layout
             .thumb_cluster
             .bottom
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         Self { top, bottom }
     }
 }
 
 /// Right half human-readable Defy keymap.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyKeymapRight {
     /// Row 1.
-    pub row_1: [String; 7],
+    pub row_1: [KeyKind; 7],
     /// Row 2.
-    pub row_2: [String; 7],
+    pub row_2: [KeyKind; 7],
     /// Row 3.
-    pub row_3: [String; 7],
+    pub row_3: [KeyKind; 7],
     /// Row 4.
-    pub row_4: [String; 6],
+    pub row_4: [KeyKind; 6],
     /// Thumb cluster.
     pub thumb_cluster: DefyThumbclusterKeymapRight,
 }
@@ -239,26 +233,22 @@ impl From<&DefyLayerData> for DefyKeymapRight {
         let row_1 = right_layout
             .row_1
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_2 = right_layout
             .row_2
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_3 = right_layout
             .row_3
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let row_4 = right_layout
             .row_4
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let thumb_cluster = DefyThumbclusterKeymapRight::from(layer_data);
 
@@ -273,12 +263,12 @@ impl From<&DefyLayerData> for DefyKeymapRight {
 }
 
 /// Left Defy thumb cluster keymap.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyThumbclusterKeymapRight {
     /// The top four keys of the thumb cluster, from left to right.
-    pub top: [String; 4],
+    pub top: [KeyKind; 4],
     /// The bottom four keys of the thumb cluster, from left to right.
-    pub bottom: [String; 4],
+    pub bottom: [KeyKind; 4],
 }
 
 impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
@@ -289,15 +279,13 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
             .thumb_cluster
             .top
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         let bottom = right_layout
             .thumb_cluster
             .bottom
             .map(|index| layer_data[index as usize])
-            .map(KeyKind::from)
-            .map(|key| key.to_string());
+            .map(KeyKind::from);
 
         Self { top, bottom }
     }

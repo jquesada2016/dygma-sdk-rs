@@ -61,6 +61,29 @@ pub const LAYER_8_DUAL_FUNCTION: u16 = 53010;
 #[display("not a valid key")]
 pub struct FromStrError;
 
+impl serde::Serialize for KeyKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KeyKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let s = String::deserialize(deserializer)?;
+
+        s.parse::<Self>()
+            .map_err(|_| D::Error::custom(format!("`{s}` is not a parsable key")))
+    }
+}
+
 macros::generate_keycode_tables! {
   /// Blank keys.
   blank: {
