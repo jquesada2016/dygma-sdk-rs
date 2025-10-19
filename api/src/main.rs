@@ -1,13 +1,18 @@
 #[macro_use]
 extern crate derive_more;
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 use dygma_cli::devices::defy::DefyKeymap;
 use dygma_cli::focus_api::FocusApi;
 use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;
-use std::path::PathBuf;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+};
 
 const PRODUCT_NAME: &str = "DEFY";
 const BAUD_RATE: u32 = 115_200;
@@ -16,23 +21,19 @@ const BAUD_RATE: u32 = 115_200;
 enum Cli {
     /// Allows executing low level commands on Dygma hardware.
     RunCommand(RunCommandArgs),
+    /// Useful commands for working with keymaps.
     #[command(subcommand)]
-    /// Useful commands for working with Bazecore JSON config files.
-    Config(ConfigCommands),
+    Keymap(KeymapCommands),
     /// Useful commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCodes(KeyCodeCommands),
-    /// Useful commands for working with raw string config values.
-    #[clap(subcommand)]
-    Raw(RawCommands),
 }
 
 impl Cli {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::RunCommand(args) => run_command(args).await.map_err(Into::into),
-            Self::Config(cmd) => cmd.perform().await,
-            Cli::Raw(cmd) => cmd.perform().await,
+            Self::Keymap(cmd) => cmd.perform().await,
             Cli::KeyCodes(cmd) => cmd.perform(),
         }
     }
@@ -57,46 +58,58 @@ struct RunCommandArgs {
 }
 
 #[derive(Subcommand)]
-enum ConfigCommands {
-    /// Reads the Bazecore config file and outputs a human-readable
-    /// keymap file.
-    Keymap {
-        /// The path to the JSON config file.
+enum KeymapCommands {
+    /// Create a new keymap config file.
+    New {
+        /// The raw keymap string found in the bazecore config file.
+        #[clap(short, long)]
+        keymap: String,
+        /// The path the keymap will be saved to.
+        #[clap(default_value = "keymap.json")]
+        path: PathBuf,
+    },
+    /// Reads a keymap file and outputs it as a raw keymap data string that can
+    /// be used to send to the keyboard.
+    ToCommandData {
+        /// The path of the keymap file.
         path: PathBuf,
     },
 }
 
-impl ConfigCommands {
+impl KeymapCommands {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Keymap { path } => todo!(),
-        }
-    }
-}
+            KeymapCommands::New { keymap, path } => {
+                let keymap = keymap.parse::<DefyKeymap>()?;
 
-#[derive(Subcommand)]
-enum RawCommands {
-    /// Takes a raw keymap string and returns an optionally human-readable
-    /// JSON version of the keymap.
-    Keymap {
-        /// Raw keymap data.
-        data: String,
-        /// Whether or not to render the output in human-readable format.
-        #[clap(short = 'H', long, default_value_t = true)]
-        human_readable: bool,
-    },
-}
+                let file = File::create_new(path).await?;
 
-impl RawCommands {
-    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Keymap {
-                data,
-                human_readable,
-            } => {
-                let keymap = data.parse::<DefyKeymap>()?;
+                let mut writer = BufWriter::new(file);
 
-                println!("{keymap:#?}");
+                let data = serde_json::to_vec_pretty(&keymap)?;
+
+                writer.write_all(&data).await?;
+
+                writer.flush().await?;
+
+                Ok(())
+            }
+            KeymapCommands::ToCommandData { path } => {
+                let file = File::open(path).await?;
+
+                let mut data = vec![];
+
+                BufReader::new(file).read_to_end(&mut data).await?;
+
+                let keymap = serde_json::from_reader::<_, DefyKeymap>(data.as_slice())?;
+
+                let res = keymap
+                    .to_keymap_custom_data()?
+                    .into_iter()
+                    .map(|key| key.unwrap_or_default())
+                    .join(" ");
+
+                println!("{res}");
 
                 Ok(())
             }

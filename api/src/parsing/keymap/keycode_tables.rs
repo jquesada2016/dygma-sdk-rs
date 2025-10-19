@@ -84,6 +84,18 @@ impl<'de> serde::Deserialize<'de> for KeyKind {
     }
 }
 
+impl PartialEq<u16> for KeyKind {
+    fn eq(&self, other: &u16) -> bool {
+        u16::from(*self) == *other
+    }
+}
+
+impl PartialEq<KeyKind> for u16 {
+    fn eq(&self, other: &KeyKind) -> bool {
+        u16::from(*other) == *self
+    }
+}
+
 macros::generate_keycode_tables! {
   /// Blank keys.
   blank: {
