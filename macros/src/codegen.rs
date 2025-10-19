@@ -1,4 +1,5 @@
 mod impl_from_enum_for_u16;
+mod impl_from_str_for_key_kind_enum;
 mod impl_from_str_for_key_table_enums;
 mod impl_from_u16_for_key_kind;
 mod key_kind_enum;
@@ -8,6 +9,7 @@ use crate::{
     Ir,
     codegen::{
         impl_from_enum_for_u16::{ImplFromKeyKindEnumForU16, ImplFromKeyTableEnumForU16},
+        impl_from_str_for_key_kind_enum::ImplFromStrForKeyKindEnum,
         impl_from_str_for_key_table_enums::ImplFromStrForKeyTableEnum,
         impl_from_u16_for_key_kind::ImplFromU16ForKeyKind,
         key_kind_enum::KeyKindEnum,
@@ -25,6 +27,7 @@ impl ToTokens for Ir {
         let impl_from_key_table_enum_for_u16s = self.0.iter().map(ImplFromKeyTableEnumForU16::from);
         let impl_from_key_kind_enum_for_u16 = ImplFromKeyKindEnumForU16::from(self);
         let impl_from_str_for_table_enums = self.0.iter().map(ImplFromStrForKeyTableEnum::from);
+        let impl_from_str_for_key_kind_enum = ImplFromStrForKeyKindEnum::from(self);
 
         let token_stream = quote! {
             paste::paste! {
@@ -33,6 +36,8 @@ impl ToTokens for Ir {
                 #impl_from_key_kind_enum_for_u16
 
                 #impl_from_u16_for_key_kind
+
+                #impl_from_str_for_key_kind_enum
 
                 #( #key_table_enums )*
 

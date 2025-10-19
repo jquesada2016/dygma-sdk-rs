@@ -43,6 +43,7 @@ impl<'a> ToTokens for ImplFromStrForKeyTableEnum<'a> {
                         .map(|c| c.to_ascii_lowercase())
                         .collect::<String>();
 
+                    #[allow(unreachable_patterns)]
                     match s.as_str() {
                         #( #variants ),*,
                         _ => Err(FromStrError)

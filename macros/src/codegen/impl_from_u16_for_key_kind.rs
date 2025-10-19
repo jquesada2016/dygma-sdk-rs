@@ -20,6 +20,7 @@ impl<'a> ToTokens for ImplFromU16ForKeyKind<'a> {
         let token_stream = quote! {
           impl From<u16> for KeyKind {
             fn from(code: u16) -> Self {
+              #[allow(unreachable_patterns)]
               match code {
                 #( #tables ),*,
                 other => Self::Unknown(other)
