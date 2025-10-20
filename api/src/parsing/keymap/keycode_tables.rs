@@ -243,56 +243,56 @@ macros::generate_keycode_tables! {
   #[with_modifiers]
   #[with_dual_functions]
   symbols: {
-    /// `-``
+    /// -
     Dash = 45,
-    /// `=`
+    /// =
     Equals,
-    /// `[`
+    /// [
     BracketLeft,
-    /// `]`
+    /// ]
     BracketRight,
-    /// `\`
+    /// \
     Backslash,
-    /// `;`
+    /// ;
     Semicolon = 51,
-    /// `'``
+    /// '
     SingleQuote,
-    /// ```
+    /// `
     BackTick,
-    /// `,`
+    /// ,
     Comma,
-    /// `.`
+    /// .
     Period,
-    /// `/`
+    /// /
     Slash,
     /// Caps Lock
     CapsLock,
-    /// ISO `<>`
+    /// ISO <>
     IsoGTLT = 100,
   },
   /// [`Symbols`] keys with the `Shift` key applied.
   shift_symbols: {
-    /// `_`
+    /// _
     Underscore = 2093,
-    /// `+`
+    /// +
     Plus,
-    /// `{{`
+    /// {{
     BraceLeft,
-    /// `}}`
+    /// }}
     BraceRight,
-    /// `|`
+    /// |
     Pipe,
-    /// `:`
+    /// :
     Colon = 2099,
-    /// `"`
+    /// "
     DoubleQuote,
-    /// `~`
+    /// ~
     Tilde,
-    /// `<`
+    /// <
     LT,
-    /// `>`
+    /// >
     GT,
-    /// `?`
+    /// ?
     QuestionMark,
     /// Non-U.S. |
     AltPipe = 2148,
