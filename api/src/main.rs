@@ -82,22 +82,14 @@ enum KeymapCommands {
 impl KeymapCommands {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            KeymapCommands::New { keymap, path } => {
+            Self::New { keymap, path } => {
                 let keymap = keymap.parse::<DefyKeymap>()?;
 
-                let file = File::create_new(path).await?;
-
-                let mut writer = BufWriter::new(file);
-
-                let data = serde_json::to_vec_pretty(&keymap)?;
-
-                writer.write_all(&data).await?;
-
-                writer.flush().await?;
+                save_keymap_file(keymap, &path).await?;
 
                 Ok(())
             }
-            KeymapCommands::ToCommandData { path } => {
+            Self::ToCommandData { path } => {
                 let keymap = read_keymap_file(&path).await?;
 
                 let res = keymap
@@ -110,7 +102,7 @@ impl KeymapCommands {
 
                 Ok(())
             }
-            KeymapCommands::Apply { path } => {
+            Self::Apply { path } => {
                 let keymap = read_keymap_file(&path).await?;
 
                 let data = keymap
@@ -122,6 +114,10 @@ impl KeymapCommands {
                 let mut defy = DefyKeyboard::new().await?;
 
                 defy.run_command("keymap.custom", Some(&data)).await?;
+
+                // TODO: make this configurable
+                // Overwrite the keymap file to ensure file remains prettified
+                save_keymap_file(keymap, &path).await?;
 
                 Ok(())
             }
@@ -280,4 +276,21 @@ async fn read_keymap_file(path: &Path) -> Result<DefyKeymap, Box<dyn std::error:
     BufReader::new(file).read_to_end(&mut data).await?;
 
     serde_json::from_reader::<_, DefyKeymap>(data.as_slice()).map_err(Into::into)
+}
+
+async fn save_keymap_file(
+    keymap: DefyKeymap,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create(path).await?;
+
+    let mut writer = BufWriter::new(file);
+
+    let data = serde_json::to_vec_pretty(&keymap)?;
+
+    writer.write_all(&data).await?;
+
+    writer.flush().await?;
+
+    Ok(())
 }
