@@ -165,8 +165,6 @@ impl DefyKeyboard {
     ) -> Result<(), ApplySuperkeyError> {
         let data = superkeys.to_superkey_map_data()?.into_iter().join(" ");
 
-        let data = format!("{data} ");
-
         self.run_command(Self::SUPERKEY_MAP_COMMAND_NAME, Some(&data))
             .await?;
 
