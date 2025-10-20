@@ -36,10 +36,10 @@ pub struct RawSuperKey {
     pub tap: Option<u16>,
     /// Action performed when holding the key.
     pub hold: Option<u16>,
-    /// Action performed when double tapping the key.
-    pub double_tap: Option<u16>,
     /// Action performed when tapping and holding the key.
     pub tap_hold: Option<u16>,
+    /// Action performed when double tapping the key.
+    pub double_tap: Option<u16>,
     /// Action performed when double tapping and holding the key.
     pub double_tap_hold: Option<u16>,
 }
@@ -53,7 +53,7 @@ fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<RawSuperKey>> {
 }
 
 fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
-    let (tap, hold, double_tap, tap_hold, double_tap_hold) = (
+    let (tap, hold, tap_hold, double_tap, double_tap_hold) = (
         superkey_action_parser,
         superkey_action_parser,
         superkey_action_parser,
@@ -65,8 +65,8 @@ fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
     Ok(RawSuperKey {
         tap,
         hold,
-        double_tap,
         tap_hold,
+        double_tap,
         double_tap_hold,
     })
 }
