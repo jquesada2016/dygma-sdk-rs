@@ -276,9 +276,9 @@ macros::generate_keycode_tables! {
     Underscore = 2093,
     /// +
     Plus,
-    /// {{
+    /// {
     BraceLeft,
-    /// }}
+    /// }
     BraceRight,
     /// |
     Pipe,
