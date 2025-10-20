@@ -1,8 +1,10 @@
 //! Provides the [`DefyKeyboard`] struct for programatically interacting with
 //! the keyboard.
 
+use itertools::Itertools;
+
 use crate::{
-    focus_api::{CreateFocusApiError, FocusApi},
+    focus_api::{CreateFocusApiError, FocusApi, RunCommandError},
     parsing::{self, keymap::KeyKind},
 };
 use std::{array, str::FromStr};
@@ -59,6 +61,27 @@ pub struct ParseKeymapError(parsing::keymap::ParseKeymapError);
 #[display("keymap does not have exactly 10 layers")]
 pub struct KeymapDoesNotHave10LayersError;
 
+/// Error returned from [`DefyKeyboard::apply_custom_keymap`].
+#[derive(Debug, Display, Error, From)]
+pub enum ApplyCustomKeymapError {
+    /// 10 layers are required, but this keymap has a different number of them.
+    #[display("{_0}")]
+    IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
+    /// Command failed to run.
+    #[display("{_0}")]
+    CommandFailed(RunCommandError),
+}
+
+/// Error returned from [`DefyKeyboard::get_custom_keymap`].
+#[derive(Debug, Display, Error, From)]
+pub enum GetCustomKeymapError {
+    /// Failed to run command.
+    #[display("{_0}")]
+    CommandFailed(RunCommandError),
+    /// Keymap returned by the keyboard failed to parse.
+    KeymapParsingFailure(ParseKeymapError),
+}
+
 /// A handle to the Dygma Defy keyboard, allowing for programatic control.
 #[derive(Debug, Deref, DerefMut)]
 pub struct DefyKeyboard {
@@ -69,11 +92,38 @@ impl DefyKeyboard {
     const PRODUCT_NAME: &str = "DEFY";
     const BAUD_RATE: u32 = 115_200;
 
+    const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
+
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
         let focus_api = FocusApi::new(Self::PRODUCT_NAME, Self::BAUD_RATE).await?;
 
         Ok(Self { focus_api })
+    }
+
+    /// Get the custom keymap from the keyboard.
+    pub async fn get_custom_keymap(&mut self) -> Result<DefyKeymap, GetCustomKeymapError> {
+        self.run_command(Self::KEYMAP_CUSTOM_COMMAND_NAME, None)
+            .await?
+            .parse()
+            .map_err(Into::into)
+    }
+
+    /// Apply the keymap to the keyboard.
+    pub async fn apply_custom_keymap(
+        &mut self,
+        keymap: &DefyKeymap,
+    ) -> Result<(), ApplyCustomKeymapError> {
+        let data = keymap
+            .to_keymap_custom_data()?
+            .into_iter()
+            .map(|key| key.unwrap_or_default())
+            .join(" ");
+
+        self.run_command(Self::KEYMAP_CUSTOM_COMMAND_NAME, Some(&data))
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -147,7 +197,7 @@ impl DefyKeymap {
             .flat_map(|layer| layer.to_keymap_data())
             .collect::<Vec<_>>()
             .try_into()
-            .unwrap();
+            .expect("`keymap.custom` command data has 800 entries");
 
         Ok(data)
     }
