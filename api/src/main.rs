@@ -60,8 +60,10 @@ enum KeymapCommands {
     /// Create a new keymap config file.
     New {
         /// The raw keymap string found in the bazecore config file.
+        ///
+        /// If omitted, will attempt to read it from the keyboard.
         #[clap(short, long)]
-        keymap: String,
+        keymap: Option<String>,
         /// The path the keymap will be saved to.
         #[clap(default_value = "keymap.json")]
         path: PathBuf,
@@ -83,7 +85,13 @@ impl KeymapCommands {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::New { keymap, path } => {
-                let keymap = keymap.parse::<DefyKeymap>()?;
+                let keymap = if let Some(keymap) = keymap {
+                    keymap.parse::<DefyKeymap>()?
+                } else {
+                    let mut defy = DefyKeyboard::new().await?;
+
+                    defy.get_custom_keymap().await?
+                };
 
                 save_keymap_file(keymap, &path).await?;
 
@@ -105,15 +113,9 @@ impl KeymapCommands {
             Self::Apply { path } => {
                 let keymap = read_keymap_file(&path).await?;
 
-                let data = keymap
-                    .to_keymap_custom_data()?
-                    .into_iter()
-                    .map(|key| key.unwrap_or_default())
-                    .join(" ");
-
                 let mut defy = DefyKeyboard::new().await?;
 
-                defy.run_command("keymap.custom", Some(&data)).await?;
+                defy.apply_custom_keymap(&keymap).await?;
 
                 // TODO: make this configurable
                 // Overwrite the keymap file to ensure file remains prettified
