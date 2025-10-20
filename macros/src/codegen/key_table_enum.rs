@@ -54,7 +54,7 @@ impl<'a> ToTokens for KeyTableEnum<'a> {
 }
 
 struct Variant<'a> {
-    meta: VariantMeta<'a>,
+    meta: VariantMeta,
     name: &'a syn::Ident,
     code: &'a syn::LitInt,
 }
@@ -82,16 +82,22 @@ impl<'a> ToTokens for Variant<'a> {
     }
 }
 
-struct VariantMeta<'a> {
+struct VariantMeta {
     doc_str: syn::LitStr,
-    display_name: &'a syn::LitStr,
+    display_name: syn::LitStr,
 }
 
-impl<'a> From<&'a ir::KeyMeta> for VariantMeta<'a> {
-    fn from(key: &'a ir::KeyMeta) -> Self {
+impl From<&ir::KeyMeta> for VariantMeta {
+    fn from(key: &ir::KeyMeta) -> Self {
         let ir::KeyMeta { display_name } = key;
 
         let doc_str = syn::LitStr::new(&format!(" {}", display_name.value()), display_name.span());
+
+        // We need to escape `{` and `}` characters
+        let display_name = syn::LitStr::new(
+            &display_name.value().replace('{', "{{").replace('}', "}}"),
+            display_name.span(),
+        );
 
         Self {
             doc_str,
@@ -100,7 +106,7 @@ impl<'a> From<&'a ir::KeyMeta> for VariantMeta<'a> {
     }
 }
 
-impl<'a> ToTokens for VariantMeta<'a> {
+impl ToTokens for VariantMeta {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let Self {
             doc_str,
