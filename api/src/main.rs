@@ -1,10 +1,10 @@
 #[macro_use]
 extern crate derive_more;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use dygma_cli::devices::defy::DefyKeymap;
+use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap};
 use dygma_cli::focus_api::FocusApi;
 use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
@@ -47,8 +47,6 @@ struct RunCommandArgs {
     /// The data to be submitted along with this command.
     #[arg(short, long)]
     data: Option<String>,
-    /// The manufacturer name used to identify compatible serial ports.
-
     /// The product name used to identify compatible serial ports.
     #[arg(short, long, default_value = PRODUCT_NAME)]
     product_name: String,
@@ -74,6 +72,11 @@ enum KeymapCommands {
         /// The path of the keymap file.
         path: PathBuf,
     },
+    /// Apply the keymap to the keyboard.
+    Apply {
+        /// The path of the keymap file.
+        path: PathBuf,
+    },
 }
 
 impl KeymapCommands {
@@ -95,13 +98,7 @@ impl KeymapCommands {
                 Ok(())
             }
             KeymapCommands::ToCommandData { path } => {
-                let file = File::open(path).await?;
-
-                let mut data = vec![];
-
-                BufReader::new(file).read_to_end(&mut data).await?;
-
-                let keymap = serde_json::from_reader::<_, DefyKeymap>(data.as_slice())?;
+                let keymap = read_keymap_file(&path).await?;
 
                 let res = keymap
                     .to_keymap_custom_data()?
@@ -110,6 +107,21 @@ impl KeymapCommands {
                     .join(" ");
 
                 println!("{res}");
+
+                Ok(())
+            }
+            KeymapCommands::Apply { path } => {
+                let keymap = read_keymap_file(&path).await?;
+
+                let data = keymap
+                    .to_keymap_custom_data()?
+                    .into_iter()
+                    .map(|key| key.unwrap_or_default())
+                    .join(" ");
+
+                let mut defy = DefyKeyboard::new().await?;
+
+                defy.run_command("keymap.custom", Some(&data)).await?;
 
                 Ok(())
             }
@@ -258,4 +270,14 @@ pub fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &st
         .take(5)
         .map(|(_, cmd)| cmd)
         .collect::<Vec<_>>()
+}
+
+async fn read_keymap_file(path: &Path) -> Result<DefyKeymap, Box<dyn std::error::Error>> {
+    let file = File::open(path).await?;
+
+    let mut data = vec![];
+
+    BufReader::new(file).read_to_end(&mut data).await?;
+
+    serde_json::from_reader::<_, DefyKeymap>(data.as_slice()).map_err(Into::into)
 }
