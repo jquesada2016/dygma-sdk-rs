@@ -14,6 +14,7 @@ use winnow::{
 pub struct ParseSuperkeyMapError(#[error(not(source))] String);
 
 /// Struct containing a list of defined superkeys.
+#[derive(Clone, Debug)]
 pub struct RawSuperkeyMap(pub Vec<RawSuperKey>);
 
 impl FromStr for RawSuperkeyMap {
@@ -29,6 +30,7 @@ impl FromStr for RawSuperkeyMap {
 }
 
 /// Superkey containing uninterpreted actions.
+#[derive(Clone, Debug)]
 pub struct RawSuperKey {
     /// Action performed when tapping the key.
     pub tap: Option<u16>,
@@ -72,7 +74,7 @@ fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
 fn superkey_action_parser(input: &mut &str) -> ModalResult<Option<u16>> {
     let (action, _) = (dec_uint, space1).parse_next(input)?;
 
-    Ok((action == 1).then_some(action))
+    Ok((action != 1).then_some(action))
 }
 
 #[cfg(test)]
