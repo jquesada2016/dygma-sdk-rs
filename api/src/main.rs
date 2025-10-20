@@ -4,7 +4,7 @@ extern crate derive_more;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap};
+use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
 use dygma_cli::focus_api::FocusApi;
 use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
@@ -24,6 +24,9 @@ enum Cli {
     /// Useful commands for working with keymaps.
     #[command(subcommand)]
     Keymap(KeymapCommands),
+    /// Useful commands for working with superkeys.
+    #[command(subcommand)]
+    Superkeys(SuperkeyCommands),
     /// Useful commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCodes(KeyCodeCommands),
@@ -34,7 +37,8 @@ impl Cli {
         match self {
             Self::RunCommand(args) => run_command(args).await.map_err(Into::into),
             Self::Keymap(cmd) => cmd.perform().await,
-            Cli::KeyCodes(cmd) => cmd.perform(),
+            Self::Superkeys(cmd) => cmd.perform().await,
+            Self::KeyCodes(cmd) => cmd.perform(),
         }
     }
 }
@@ -93,12 +97,12 @@ impl KeymapCommands {
                     defy.get_custom_keymap().await?
                 };
 
-                save_keymap_file(keymap, &path).await?;
+                safe_pretty_json_file(&keymap, &path).await?;
 
                 Ok(())
             }
             Self::ToCommandData { path } => {
-                let keymap = read_keymap_file(&path).await?;
+                let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
                 let res = keymap
                     .to_keymap_custom_data()?
@@ -111,7 +115,7 @@ impl KeymapCommands {
                 Ok(())
             }
             Self::Apply { path } => {
-                let keymap = read_keymap_file(&path).await?;
+                let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
                 let mut defy = DefyKeyboard::new().await?;
 
@@ -119,7 +123,76 @@ impl KeymapCommands {
 
                 // TODO: make this configurable
                 // Overwrite the keymap file to ensure file remains prettified
-                save_keymap_file(keymap, &path).await?;
+                safe_pretty_json_file(&keymap, &path).await?;
+
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum SuperkeyCommands {
+    /// Create a new keymap config file.
+    New {
+        /// The raw keymap string found in the bazecore config file.
+        ///
+        /// If omitted, will attempt to read it from the keyboard.
+        #[clap(short, long)]
+        superkeys: Option<String>,
+        /// The path the keymap will be saved to.
+        #[clap(default_value = "keymap.json")]
+        path: PathBuf,
+    },
+    /// Reads a keymap file and outputs it as a raw keymap data string that can
+    /// be used to send to the keyboard.
+    ToCommandData {
+        /// The path of the keymap file.
+        path: PathBuf,
+    },
+    /// Apply the keymap to the keyboard.
+    Apply {
+        /// The path of the keymap file.
+        path: PathBuf,
+    },
+}
+
+impl SuperkeyCommands {
+    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::New { superkeys, path } => {
+                let map = if let Some(superkeys) = superkeys {
+                    superkeys.parse::<SuperkeyMap>()?
+                } else {
+                    let mut defy = DefyKeyboard::new().await?;
+
+                    defy.get_superkeys().await?
+                };
+
+                safe_pretty_json_file(&map, &path).await?;
+
+                Ok(())
+            }
+            Self::ToCommandData { path } => {
+                let map = read_json_file::<SuperkeyMap>(&path).await?;
+
+                let str_data = map.to_superkey_map_data()?.into_iter().join(" ");
+
+                println!("{str_data} ");
+
+                Ok(())
+            }
+            Self::Apply { path } => {
+                let map = read_json_file::<SuperkeyMap>(&path).await?;
+
+                let mut defy = DefyKeyboard::new().await?;
+
+                defy.apply_superkeys(&map).await?;
+
+                // TODO: Make this configurable
+                // We override the original config file to make sure everything stays
+                // nice and prettified
+                safe_pretty_json_file(&map, &path).await?;
 
                 Ok(())
             }
@@ -270,25 +343,28 @@ pub fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &st
         .collect::<Vec<_>>()
 }
 
-async fn read_keymap_file(path: &Path) -> Result<DefyKeymap, Box<dyn std::error::Error>> {
+async fn read_json_file<T>(path: &Path) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
     let file = File::open(path).await?;
 
     let mut data = vec![];
 
     BufReader::new(file).read_to_end(&mut data).await?;
 
-    serde_json::from_reader::<_, DefyKeymap>(data.as_slice()).map_err(Into::into)
+    serde_json::from_reader::<_, T>(data.as_slice()).map_err(Into::into)
 }
 
-async fn save_keymap_file(
-    keymap: DefyKeymap,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: serde::Serialize,
+{
     let file = File::create(path).await?;
 
     let mut writer = BufWriter::new(file);
 
-    let data = serde_json::to_vec_pretty(&keymap)?;
+    let data = serde_json::to_vec_pretty(data)?;
 
     writer.write_all(&data).await?;
 
