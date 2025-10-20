@@ -11,18 +11,18 @@ use winnow::{
 /// Error when parsing a superkeys map..
 #[derive(Clone, Debug, Display, Error, From)]
 #[display("{_0}")]
-pub struct ParseSuperkeysMapError(#[error(not(source))] String);
+pub struct ParseSuperkeyMapError(#[error(not(source))] String);
 
 /// Struct containing a list of defined superkeys.
-pub struct RawSuperkeysMap(pub Vec<RawSuperKey>);
+pub struct RawSuperkeyMap(pub Vec<RawSuperKey>);
 
-impl FromStr for RawSuperkeysMap {
-    type Err = ParseSuperkeysMapError;
+impl FromStr for RawSuperkeyMap {
+    type Err = ParseSuperkeyMapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let map = super_keys_parser
             .parse(s)
-            .map_err(|err| ParseSuperkeysMapError(err.to_string()))?;
+            .map_err(|err| ParseSuperkeyMapError(err.to_string()))?;
 
         Ok(Self(map))
     }
@@ -83,6 +83,6 @@ mod tests {
 
     #[test]
     fn parse_succeeds() {
-        let _ = SUPERKEY_DATA.parse::<RawSuperkeysMap>().unwrap();
+        let _ = SUPERKEY_DATA.parse::<RawSuperkeyMap>().unwrap();
     }
 }

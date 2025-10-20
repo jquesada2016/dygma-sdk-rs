@@ -5,7 +5,7 @@ use itertools::Itertools;
 
 use crate::{
     focus_api::{CreateFocusApiError, FocusApi, RunCommandError},
-    parsing::{self, keymap::KeyKind},
+    parsing::{self, keymap::KeyKind, superkeys::RawSuperkeyMap},
 };
 use std::{array, str::FromStr};
 
@@ -54,6 +54,11 @@ pub struct CreateDefyKeyboardError(CreateFocusApiError);
 #[derive(Clone, Debug, Display, From, Error)]
 #[display("failed to parse keymap: {_0}")]
 pub struct ParseKeymapError(parsing::keymap::ParseKeymapError);
+
+/// Error when parsing a superkey map from a string slice.
+#[derive(Clone, Debug, Display, From, Error)]
+#[display("failed to parse superkeys map: {_0}")]
+pub struct ParseSuperkeyMapError(parsing::superkeys::ParseSuperkeyMapError);
 
 /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
 /// creating the command data.
@@ -449,6 +454,74 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
 
         Self { top, bottom }
     }
+}
+
+/// Holds a superkey map.
+#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, Deserialize)]
+pub struct SuperkeyMap(pub Vec<Superkey>);
+
+impl serde::Serialize for SuperkeyMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, key)| Superkey {
+                id: i as u8 + 1,
+                ..key
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+}
+
+impl FromStr for SuperkeyMap {
+    type Err = ParseSuperkeyMapError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let map = s
+            .parse::<RawSuperkeyMap>()?
+            .0
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| Superkey {
+                id: i as u8 + 1,
+                tap: key.tap.map(Into::into),
+                hold: key.hold.map(Into::into),
+                tap_hold: key.tap_hold.map(Into::into),
+                double_tap: key.double_tap.map(Into::into),
+                double_tap_hold: key.double_tap_hold.map(Into::into),
+            })
+            .collect();
+
+        Ok(Self(map))
+    }
+}
+
+/// Represents a single superkey.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Superkey {
+    /// User-facing ID used to make reading superkey map arrays easier.
+    ///
+    /// **Note**: This is purely for UX. When deserializing, the ID the user
+    /// writes is entirely ignored. The idea is that you define the superkeys
+    /// you want, and use this number to know what [`KeyKind`] to use to assign
+    /// the particular superkey.
+    #[serde(skip_deserializing)]
+    pub id: u8,
+    /// Action performed when the key is tapped.
+    pub tap: Option<KeyKind>,
+    /// Action performed when the key is held.
+    pub hold: Option<KeyKind>,
+    /// Action performed when the key is tapped and held.
+    pub tap_hold: Option<KeyKind>,
+    /// Action performed when the key is double tapped.
+    pub double_tap: Option<KeyKind>,
+    /// Action performed when the key is double tapped and held.
+    pub double_tap_hold: Option<KeyKind>,
 }
 
 #[cfg(test)]
