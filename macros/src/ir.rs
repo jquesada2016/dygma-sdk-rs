@@ -38,15 +38,17 @@ impl From<ast::KeyTable> for KeyTable {
             .filter_map(|key| Key::new(key, &mut offset).ok())
             .collect::<Vec<_>>();
 
-        let keys_with_modifiers = with_modifiers
-            .is_some()
-            .then(|| create_keys_with_modifiers(&keys))
-            .unwrap_or_default();
+        let keys_with_modifiers = if with_modifiers.is_some() {
+            create_keys_with_modifiers(&keys)
+        } else {
+            Vec::default()
+        };
 
-        let keys_with_dual_functions = with_dual_functions
-            .is_some()
-            .then(|| create_keys_with_dual_functions(&keys))
-            .unwrap_or_default();
+        let keys_with_dual_functions = if with_dual_functions.is_some() {
+            create_keys_with_dual_functions(&keys)
+        } else {
+            Vec::default()
+        };
 
         Self {
             doc,
