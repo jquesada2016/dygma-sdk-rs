@@ -3,9 +3,8 @@ extern crate derive_more;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
-use dygma_cli::focus_api::FocusApi;
 use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;
@@ -14,13 +13,17 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
 };
 
-const PRODUCT_NAME: &str = "DEFY";
-const BAUD_RATE: u32 = 115_200;
-
 #[derive(Parser)]
 enum Cli {
     /// Allows executing low level commands on Dygma hardware.
-    RunCommand(RunCommandArgs),
+    RunCommand {
+        /// The command to be executed.
+        #[arg(short, long = "command")]
+        cmd: String,
+        /// The data to be submitted along with this command.
+        #[arg(short, long)]
+        data: Option<String>,
+    },
     /// Useful commands for working with keymaps.
     #[command(subcommand)]
     Keymap(KeymapCommands),
@@ -35,28 +38,41 @@ enum Cli {
 impl Cli {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::RunCommand(args) => run_command(args).await.map_err(Into::into),
+            Self::RunCommand { cmd, data } => {
+                let mut defy = DefyKeyboard::new().await?;
+
+                let available_cmds = defy
+                    .available_commands()
+                    .await
+                    .change_context(RunCommandError)?;
+
+                if !available_cmds.contains(&cmd) {
+                    let suggestions = get_command_suggestions(&available_cmds, &cmd);
+
+                    let report = report!(RunCommandError)
+                        .attach_printable(format!("`{cmd}` is not a valid command"))
+                        .attach_printable(format!(
+                            "did you mean one of these? {}",
+                            suggestions.join(", ")
+                        ));
+
+                    return Err(report.into());
+                }
+
+                let res = defy
+                    .run_command(&cmd, data.as_deref())
+                    .await
+                    .change_context(RunCommandError)?;
+
+                println!("{res}");
+
+                Ok(())
+            }
             Self::Keymap(cmd) => cmd.perform().await,
             Self::Superkeys(cmd) => cmd.perform().await,
             Self::KeyCodes(cmd) => cmd.perform(),
         }
     }
-}
-
-#[derive(Args)]
-struct RunCommandArgs {
-    /// The command to be executed.
-    #[arg(short, long = "command")]
-    cmd: String,
-    /// The data to be submitted along with this command.
-    #[arg(short, long)]
-    data: Option<String>,
-    /// The product name used to identify compatible serial ports.
-    #[arg(short, long, default_value = PRODUCT_NAME)]
-    product_name: String,
-    /// The baud rate to use for communication with the device.
-    #[arg(short, long, default_value_t = BAUD_RATE)]
-    baud_rate: u32,
 }
 
 #[derive(Subcommand)]
@@ -277,46 +293,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Clone, Copy, Debug, Display, Error)]
 #[display("failed to run command")]
 struct RunCommandError;
-
-async fn run_command(args: RunCommandArgs) -> error_stack::Result<(), RunCommandError> {
-    let RunCommandArgs {
-        cmd,
-        data,
-        product_name,
-        baud_rate,
-    } = args;
-
-    let mut focus_api = FocusApi::new(&product_name, baud_rate)
-        .await
-        .change_context(RunCommandError)?;
-
-    let available_cmds = focus_api
-        .available_commands()
-        .await
-        .change_context(RunCommandError)?;
-
-    if !available_cmds.contains(&cmd) {
-        let suggestions = get_command_suggestions(&available_cmds, &cmd);
-
-        let report = report!(RunCommandError)
-            .attach_printable(format!("`{cmd}` is not a valid command"))
-            .attach_printable(format!(
-                "did you mean one of these? {}",
-                suggestions.join(", ")
-            ));
-
-        return Err(report);
-    }
-
-    let res = focus_api
-        .run_command(&cmd, data.as_deref())
-        .await
-        .change_context(RunCommandError)?;
-
-    println!("{res}");
-
-    Ok(())
-}
 
 /// Utility function for getting possible commands the user might
 /// have intended to write, but did not.
