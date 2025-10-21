@@ -178,7 +178,7 @@ impl SuperkeyCommands {
 
                 let str_data = map.to_superkey_map_data()?.into_iter().join(" ");
 
-                println!("{str_data} ");
+                println!("{str_data}");
 
                 Ok(())
             }

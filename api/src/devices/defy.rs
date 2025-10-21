@@ -595,7 +595,7 @@ pub struct Superkey {
 
 impl Superkey {
     /// Converts this type into a form suitable for sending to the keyboard.
-    pub fn to_superkey_map_data(&self) -> [u16; 7] {
+    pub fn to_superkey_map_data(&self) -> [u16; 6] {
         let Self {
             id: _,
             tap,
@@ -611,7 +611,7 @@ impl Superkey {
         let double_tap = double_tap.map(u16::from).unwrap_or(1);
         let double_tap_hold = double_tap_hold.map(u16::from).unwrap_or(1);
 
-        [tap, hold, tap_hold, double_tap, double_tap_hold, 0, 0]
+        [tap, hold, tap_hold, double_tap, double_tap_hold, 0]
     }
 }
 

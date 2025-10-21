@@ -1,11 +1,10 @@
 //! Types for parsing superkeys.
 
 use std::str::FromStr;
-
 use winnow::{
     ModalResult, Parser,
     ascii::{dec_uint, space1},
-    combinator::{repeat, terminated},
+    combinator::{repeat, repeat_till, terminated},
 };
 
 /// Error when parsing a superkeys map..
@@ -45,7 +44,8 @@ pub struct RawSuperKey {
 }
 
 fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<RawSuperKey>> {
-    let superkey_map = repeat(1.., terminated(super_key_parser, "0 0 ")).parse_next(input)?;
+    let (superkey_map, _) =
+        repeat_till(1.., terminated(super_key_parser, "0 "), "0 ").parse_next(input)?;
 
     let _: Vec<_> = repeat(.., "65535 ").parse_next(input)?;
 
