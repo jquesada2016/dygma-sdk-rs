@@ -4,7 +4,7 @@
 use itertools::Itertools;
 
 use crate::{
-    focus_api::{CreateSerialPortFocusApiError, SerialPortFocusApi, SerialPortRunCommandError},
+    focus_api::{CreateHidFoducApiError, HidFocusApi, HidRunCommandError},
     parsing::{self, keymap::KeyKind, superkeys::RawSuperkeyMap},
 };
 use std::{array, str::FromStr};
@@ -48,7 +48,7 @@ pub const LAYOUT: &DefyLayout = &DefyLayout {
 /// Error returned when creating a handle to the keyboard.
 #[derive(Debug, Display, From, Error)]
 #[display("failed to create handle to the Dygma Defy keyboard: {_0}")]
-pub struct CreateDefyKeyboardError(CreateSerialPortFocusApiError);
+pub struct CreateDefyKeyboardError(CreateHidFoducApiError);
 
 /// Error when parsing a keymap from a string slice.
 #[derive(Clone, Debug, Display, From, Error)]
@@ -74,7 +74,7 @@ pub enum ApplyCustomKeymapError {
     IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
     /// Command failed to run.
     #[display("{_0}")]
-    CommandFailed(SerialPortRunCommandError),
+    CommandFailed(HidRunCommandError),
 }
 
 /// Error returned from [`DefyKeyboard::get_custom_keymap`].
@@ -82,7 +82,7 @@ pub enum ApplyCustomKeymapError {
 pub enum GetCustomKeymapError {
     /// Failed to run command.
     #[display("{_0}")]
-    CommandFailed(SerialPortRunCommandError),
+    CommandFailed(HidRunCommandError),
     /// Keymap returned by the keyboard failed to parse.
     KeymapParsingFailure(ParseKeymapError),
 }
@@ -92,7 +92,7 @@ pub enum GetCustomKeymapError {
 pub enum GetSuperkeyMapError {
     /// Failed to run command.
     #[display("{_0}")]
-    CommandFailed(SerialPortRunCommandError),
+    CommandFailed(HidRunCommandError),
     /// Keymap returned by the keyboard failed to parse.
     KeymapParsingFailure(ParseSuperkeyMapError),
 }
@@ -105,7 +105,7 @@ pub enum ApplySuperkeyError {
     TooManySuperkeys(TooManySuperkeysError),
     /// Command failed to run.
     #[display("{_0}")]
-    CommandFailed(SerialPortRunCommandError),
+    CommandFailed(HidRunCommandError),
 }
 
 /// Error returned when there are too many superkeys in a [`SuperkeyMap`]
@@ -116,19 +116,20 @@ pub struct TooManySuperkeysError;
 /// A handle to the Dygma Defy keyboard, allowing for programatic control.
 #[derive(Debug, Deref, DerefMut)]
 pub struct DefyKeyboard {
-    focus_api: SerialPortFocusApi,
+    focus_api: HidFocusApi,
 }
 
 impl DefyKeyboard {
-    const PRODUCT_NAME: &str = "DEFY";
-    const BAUD_RATE: u32 = 115_200;
+    const HID_PRODUCT_ID: u16 = 17;
+    // const PRODUCT_NAME: &str = "DEFY";
+    // const BAUD_RATE: u32 = 115_200;
 
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
-        let focus_api = SerialPortFocusApi::new(Self::PRODUCT_NAME, Self::BAUD_RATE).await?;
+        let focus_api = HidFocusApi::new(Self::HID_PRODUCT_ID).await?;
 
         Ok(Self { focus_api })
     }

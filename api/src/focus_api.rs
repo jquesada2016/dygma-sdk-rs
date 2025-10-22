@@ -31,7 +31,7 @@ pub enum SerialPortRunCommandError {
 /// Error while getting a list of available commands supported by the device.
 #[derive(Debug, Display, From, Error)]
 #[display("failed to retrieve available commands with the `help command: {_0}")]
-pub struct GetCommandsError(SerialPortRunCommandError);
+pub struct GetCommandsError(HidRunCommandError);
 
 /// Error creating Focus API struct.
 #[derive(Debug, Display, Error, From)]
@@ -135,26 +135,18 @@ impl SerialPortFocusApi {
 
         Err(SerialPortRunCommandError::ResponseStreamTerminatedPrematurely)
     }
-
-    /// Gets a list of available commands on the device.
-    pub async fn available_commands(&mut self) -> Result<Vec<String>, GetCommandsError> {
-        let cmds = self
-            .run_command("help", None)
-            .await?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect();
-
-        Ok(cmds)
-    }
 }
 
 /// Abstracts over a HID connection to provide the firmware's
 /// Focus API, which is used for controlling the keyboard.
 ///
 /// Note that this works also over BTLE.
+#[derive(Debug)]
 pub struct HidFocusApi {
+    _device: async_hid::Device,
+    #[debug(ignore)]
     reader: async_hid::DeviceReader,
+    #[debug(ignore)]
     writer: async_hid::DeviceWriter,
 }
 
@@ -194,7 +186,11 @@ impl HidFocusApi {
             .await
             .map_err(CreateHidFoducApiError::ConnectingToDevice)?;
 
-        Ok(Self { reader, writer })
+        Ok(Self {
+            _device: device,
+            reader,
+            writer,
+        })
     }
 
     /// Executes commands and returns their response.
@@ -255,5 +251,17 @@ impl HidFocusApi {
                 Err(err) => return Err(HidRunCommandError::UnexpectedResponse(err)),
             };
         }
+    }
+
+    /// Gets a list of available commands on the device.
+    pub async fn available_commands(&mut self) -> Result<Vec<String>, GetCommandsError> {
+        let cmds = self
+            .run_command("help", None)
+            .await?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+
+        Ok(cmds)
     }
 }
