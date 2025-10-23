@@ -3,6 +3,7 @@ extern crate derive_more;
 
 use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
+use dygma_cli::focus_api::FocusApiConnection;
 use dygma_cli::parsing::keymap::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;

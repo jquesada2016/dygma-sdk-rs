@@ -11,7 +11,7 @@ use winnow::{
 
 /// Error when parsing a keymap.
 #[derive(Clone, Debug, Display, Error, From)]
-#[display("{_0}")]
+#[display("failed to parse keymap data:\n{_0}")]
 pub struct ParseKeymapError(#[error(not(source))] String);
 
 /// A complete raw keymap with individual layers and uninterpreted keycodes.

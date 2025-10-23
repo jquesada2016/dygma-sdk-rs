@@ -9,7 +9,7 @@ use winnow::{
 
 /// Error when parsing a superkeys map..
 #[derive(Clone, Debug, Display, Error, From)]
-#[display("{_0}")]
+#[display("failed to parse superkey map data:\n{_0}")]
 pub struct ParseSuperkeyMapError(#[error(not(source))] String);
 
 /// Struct containing a list of defined superkeys.

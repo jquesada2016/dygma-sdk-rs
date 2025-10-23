@@ -11,6 +11,71 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
+/// Trait used to abstract over focus API connections.
+#[allow(async_fn_in_trait)]
+pub trait FocusApiConnection {
+    /// Executes commands and returns their response.
+    async fn run_command(
+        &mut self,
+        command: &str,
+        data: Option<&str>,
+    ) -> Result<String, RunCommandError>;
+
+    /// Gets a list of available commands on the device.
+    async fn available_commands(&mut self) -> Result<Vec<String>, GetCommandsError> {
+        let cmds = self
+            .run_command("help", None)
+            .await?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+
+        Ok(cmds)
+    }
+}
+
+/// Error returned when running commands.
+#[derive(Debug, Display, Error)]
+pub enum RunCommandError {
+    /// We hit an error sending the command to the device.
+    #[display("Failed to send command: {_0}")]
+    SendingCommand(Box<dyn std::error::Error + Send + Sync>),
+    /// We were not able to receive a response from the device.
+    #[display("Failed to receive response: {_0}")]
+    RecievingResponse(Box<dyn std::error::Error + Send + Sync>),
+    /// The response from the device could not be interpreted.
+    #[display("received an unexpected response:\n{_0}")]
+    UnexpectedResponse(parsing::focus_api::TryFromResponseError),
+    /// The response stream completed before a response could be interpreted.
+    #[display("response stream terminated while waiting for the response to complete")]
+    ResponseStreamTerminatedPrematurely,
+}
+
+impl From<SerialPortRunCommandError> for RunCommandError {
+    fn from(err: SerialPortRunCommandError) -> Self {
+        match err {
+            SerialPortRunCommandError::SendingCommand(err) => Self::SendingCommand(err.into()),
+            SerialPortRunCommandError::RecievingResponse(err) => {
+                Self::RecievingResponse(err.into())
+            }
+            SerialPortRunCommandError::UnexpectedResponse(err) => Self::UnexpectedResponse(err),
+            SerialPortRunCommandError::ResponseStreamTerminatedPrematurely => {
+                Self::ResponseStreamTerminatedPrematurely
+            }
+        }
+    }
+}
+
+impl From<HidRunCommandError> for RunCommandError {
+    fn from(err: HidRunCommandError) -> Self {
+        match err {
+            HidRunCommandError::SendingCommand(err) => Self::SendingCommand(err.into()),
+            HidRunCommandError::RecievingResponse(err) => Self::RecievingResponse(err.into()),
+            HidRunCommandError::UnexpectedResponse(err) => Self::UnexpectedResponse(err),
+        }
+    }
+}
+
 /// Error returned when running commands.
 #[derive(Debug, Display, Error)]
 pub enum SerialPortRunCommandError {
@@ -31,7 +96,7 @@ pub enum SerialPortRunCommandError {
 /// Error while getting a list of available commands supported by the device.
 #[derive(Debug, Display, From, Error)]
 #[display("failed to retrieve available commands with the `help command: {_0}")]
-pub struct GetCommandsError(HidRunCommandError);
+pub struct GetCommandsError(RunCommandError);
 
 /// Error creating Focus API struct.
 #[derive(Debug, Display, Error, From)]
@@ -69,6 +134,16 @@ pub enum HidRunCommandError {
 #[derive(Debug)]
 pub struct SerialPortFocusApi(SerialPort);
 
+impl FocusApiConnection for SerialPortFocusApi {
+    async fn run_command(
+        &mut self,
+        command: &str,
+        data: Option<&str>,
+    ) -> Result<String, RunCommandError> {
+        self.run_command(command, data).await.map_err(Into::into)
+    }
+}
+
 impl SerialPortFocusApi {
     const MANUFACTURER_NAME: &str = "DYGMA";
 
@@ -83,7 +158,7 @@ impl SerialPortFocusApi {
     }
 
     /// Executes commands and returns their response.
-    pub async fn run_command(
+    async fn run_command(
         &mut self,
         command: &str,
         data: Option<&str>,
@@ -150,6 +225,16 @@ pub struct HidFocusApi {
     writer: async_hid::DeviceWriter,
 }
 
+impl FocusApiConnection for HidFocusApi {
+    async fn run_command(
+        &mut self,
+        command: &str,
+        data: Option<&str>,
+    ) -> Result<String, RunCommandError> {
+        self.run_command(command, data).await.map_err(Into::into)
+    }
+}
+
 impl HidFocusApi {
     const VENDOR_ID: u16 = 13807;
     const USAGE_ID: u16 = 1;
@@ -194,7 +279,7 @@ impl HidFocusApi {
     }
 
     /// Executes commands and returns their response.
-    pub async fn run_command(
+    async fn run_command(
         &mut self,
         command: &str,
         data: Option<&str>,
@@ -251,17 +336,5 @@ impl HidFocusApi {
                 Err(err) => return Err(HidRunCommandError::UnexpectedResponse(err)),
             };
         }
-    }
-
-    /// Gets a list of available commands on the device.
-    pub async fn available_commands(&mut self) -> Result<Vec<String>, GetCommandsError> {
-        let cmds = self
-            .run_command("help", None)
-            .await?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect();
-
-        Ok(cmds)
     }
 }

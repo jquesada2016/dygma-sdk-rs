@@ -21,7 +21,7 @@ pub enum TryFromResponseError {
     #[display("data is incomplete")]
     Incomplete,
     /// We encountered an unrecoverable error parsing the response.
-    #[display("{_0}")]
+    #[display("failed to parse focus API response:\n{_0}")]
     Err(#[error(not(source))] String),
 }
 

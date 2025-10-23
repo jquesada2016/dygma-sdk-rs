@@ -1,12 +1,14 @@
 //! Provides the [`DefyKeyboard`] struct for programatically interacting with
 //! the keyboard.
 
-use itertools::Itertools;
-
 use crate::{
-    focus_api::{CreateHidFoducApiError, HidFocusApi, HidRunCommandError},
+    focus_api::{
+        CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
+        SerialPortFocusApi,
+    },
     parsing::{self, keymap::KeyKind, superkeys::RawSuperkeyMap},
 };
+use itertools::Itertools;
 use std::{array, str::FromStr};
 
 /// Type alias for the raw keymap data.
@@ -74,7 +76,7 @@ pub enum ApplyCustomKeymapError {
     IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
     /// Command failed to run.
     #[display("{_0}")]
-    CommandFailed(HidRunCommandError),
+    CommandFailed(RunCommandError),
 }
 
 /// Error returned from [`DefyKeyboard::get_custom_keymap`].
@@ -82,7 +84,7 @@ pub enum ApplyCustomKeymapError {
 pub enum GetCustomKeymapError {
     /// Failed to run command.
     #[display("{_0}")]
-    CommandFailed(HidRunCommandError),
+    CommandFailed(RunCommandError),
     /// Keymap returned by the keyboard failed to parse.
     KeymapParsingFailure(ParseKeymapError),
 }
@@ -92,7 +94,7 @@ pub enum GetCustomKeymapError {
 pub enum GetSuperkeyMapError {
     /// Failed to run command.
     #[display("{_0}")]
-    CommandFailed(HidRunCommandError),
+    CommandFailed(RunCommandError),
     /// Keymap returned by the keyboard failed to parse.
     KeymapParsingFailure(ParseSuperkeyMapError),
 }
@@ -105,7 +107,7 @@ pub enum ApplySuperkeyError {
     TooManySuperkeys(TooManySuperkeysError),
     /// Command failed to run.
     #[display("{_0}")]
-    CommandFailed(HidRunCommandError),
+    CommandFailed(RunCommandError),
 }
 
 /// Error returned when there are too many superkeys in a [`SuperkeyMap`]
@@ -114,22 +116,27 @@ pub enum ApplySuperkeyError {
 pub struct TooManySuperkeysError;
 
 /// A handle to the Dygma Defy keyboard, allowing for programatic control.
-#[derive(Debug, Deref, DerefMut)]
+#[derive(Debug, Deref, DerefMut, From)]
 pub struct DefyKeyboard {
-    focus_api: HidFocusApi,
+    focus_api: DynFocusApi,
 }
 
 impl DefyKeyboard {
     const HID_PRODUCT_ID: u16 = 18;
-    // const PRODUCT_NAME: &str = "DEFY";
-    // const BAUD_RATE: u32 = 115_200;
+    const PRODUCT_NAME: &str = "DEFY";
+    const BAUD_RATE: u32 = 115_200;
 
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
-        let focus_api = HidFocusApi::new(Self::HID_PRODUCT_ID).await?;
+        let sp_focus_api_res = SerialPortFocusApi::new(Self::PRODUCT_NAME, Self::BAUD_RATE)
+            .await
+            .map(Into::into);
+        let bt_focus_api_res = HidFocusApi::new(Self::HID_PRODUCT_ID).await.map(Into::into);
+
+        let focus_api = sp_focus_api_res.or(bt_focus_api_res)?;
 
         Ok(Self { focus_api })
     }
@@ -180,6 +187,30 @@ impl DefyKeyboard {
             .parse::<SuperkeyMap>()?;
 
         Ok(map)
+    }
+}
+
+/// Static dispatch for focus API connections.
+#[derive(Debug, From)]
+pub enum DynFocusApi {
+    /// Connections to the device over serial port,
+    /// which includes both wired over USB, as well as
+    /// wireless over RF.
+    Serial(SerialPortFocusApi),
+    /// Connections to the device over BTLE.
+    Bluetooth(HidFocusApi),
+}
+
+impl FocusApiConnection for DynFocusApi {
+    async fn run_command(
+        &mut self,
+        command: &str,
+        data: Option<&str>,
+    ) -> Result<String, crate::focus_api::RunCommandError> {
+        match self {
+            Self::Serial(sp) => sp.run_command(command, data).await,
+            Self::Bluetooth(hid) => hid.run_command(command, data).await,
+        }
     }
 }
 
