@@ -45,7 +45,7 @@ pub enum RunCommandError {
     RecievingResponse(Box<dyn std::error::Error + Send + Sync>),
     /// The response from the device could not be interpreted.
     #[display("received an unexpected response:\n{_0}")]
-    UnexpectedResponse(parsing::focus_api::TryFromResponseError),
+    UnexpectedResponse(parsing::focus_api::ParseResponseError),
     /// The response stream completed before a response could be interpreted.
     #[display("response stream terminated while waiting for the response to complete")]
     ResponseStreamTerminatedPrematurely,
@@ -87,7 +87,7 @@ pub enum SerialPortRunCommandError {
     RecievingResponse(std::io::Error),
     /// The response from the device could not be interpreted.
     #[display("received an unexpected response:\n{_0}")]
-    UnexpectedResponse(parsing::focus_api::TryFromResponseError),
+    UnexpectedResponse(parsing::focus_api::ParseResponseError),
     /// The response stream completed before a response could be interpreted.
     #[display("response stream terminated while waiting for the response to complete")]
     ResponseStreamTerminatedPrematurely,
@@ -126,7 +126,7 @@ pub enum HidRunCommandError {
     RecievingResponse(async_hid::HidError),
     /// The response from the device could not be interpreted.
     #[display("received an unexpected response:\n{_0}")]
-    UnexpectedResponse(parsing::focus_api::TryFromResponseError),
+    UnexpectedResponse(parsing::focus_api::ParseResponseError),
 }
 
 /// Abstracts over a serial port connection to provide the firmware's
@@ -201,9 +201,12 @@ impl SerialPortFocusApi {
                 }
             };
 
-            return match parsing::focus_api::Response::try_from(data).map(|res| res.0) {
+            return match data
+                .parse::<parsing::focus_api::Response>()
+                .map(|res| res.0)
+            {
                 Ok(res) => Ok(res),
-                Err(parsing::focus_api::TryFromResponseError::Incomplete) => continue,
+                Err(parsing::focus_api::ParseResponseError::Incomplete) => continue,
                 Err(err) => return Err(SerialPortRunCommandError::UnexpectedResponse(err)),
             };
         }
@@ -317,7 +320,8 @@ impl HidFocusApi {
                 .await
                 .map_err(HidRunCommandError::RecievingResponse)?;
 
-            res.extend_from_slice(&buf[..bytes_read]);
+            // Skip the first byte, as it's the report id
+            res.extend_from_slice(&buf[1..bytes_read]);
 
             let str_res = match str::from_utf8(res.as_ref()) {
                 Ok(data) => data,
@@ -330,9 +334,12 @@ impl HidFocusApi {
                 }
             };
 
-            return match parsing::focus_api::Response::try_from(str_res).map(|res| res.0) {
+            return match str_res
+                .parse::<parsing::focus_api::Response>()
+                .map(|res| res.0)
+            {
                 Ok(res) => Ok(res),
-                Err(parsing::focus_api::TryFromResponseError::Incomplete) => continue,
+                Err(parsing::focus_api::ParseResponseError::Incomplete) => continue,
                 Err(err) => return Err(HidRunCommandError::UnexpectedResponse(err)),
             };
         }

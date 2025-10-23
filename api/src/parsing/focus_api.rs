@@ -9,14 +9,9 @@ use winnow::{
     stream::Accumulate,
 };
 
-/// Error returned when parsing Focus API response fails.
-#[derive(Clone, Debug, Display, Error)]
-#[display("{_0}")]
-pub struct ParseResponseError(#[error(not(source))] String);
-
 /// Error when parsing a Focus API response fails.
 #[derive(Clone, Debug, Display, Error)]
-pub enum TryFromResponseError {
+pub enum ParseResponseError {
     /// We don't yet have enough data to parse the response.
     #[display("data is incomplete")]
     Incomplete,
@@ -25,8 +20,8 @@ pub enum TryFromResponseError {
     Err(#[error(not(source))] String),
 }
 
-impl From<winnow::error::ErrMode<winnow::error::ContextError>> for TryFromResponseError {
-    fn from(err: winnow::error::ErrMode<winnow::error::ContextError>) -> Self {
+impl ParseResponseError {
+    fn from_winnow_err(err: winnow::error::ErrMode<winnow::error::ContextError>) -> Self {
         match err {
             winnow::error::ErrMode::Incomplete(_) => Self::Incomplete,
             err => Self::Err(err.to_string()),
@@ -43,19 +38,8 @@ impl FromStr for Response {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let res = response_parser
-            .parse(Partial::new(s))
-            .map_err(|err| err.to_string())
-            .map_err(ParseResponseError)?;
-
-        Ok(Self(res))
-    }
-}
-
-impl TryFrom<&str> for Response {
-    type Error = TryFromResponseError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        let res = response_parser.parse_next(&mut Partial::new(s))?;
+            .parse_next(&mut Partial::new(s))
+            .map_err(ParseResponseError::from_winnow_err)?;
 
         Ok(Self(res))
     }
@@ -98,7 +82,7 @@ mod test {
     fn parser_succeeds_on_single_response() {
         let data = "this.is a test\r\nto test the parser\r\n.";
 
-        let res = Response::try_from(data).unwrap().0;
+        let res = data.parse::<Response>().unwrap().0;
 
         assert_eq!(
             "this.is a test\n\
