@@ -120,7 +120,7 @@ pub struct DefyKeyboard {
 }
 
 impl DefyKeyboard {
-    const HID_PRODUCT_ID: u16 = 17;
+    const HID_PRODUCT_ID: u16 = 18;
     // const PRODUCT_NAME: &str = "DEFY";
     // const BAUD_RATE: u32 = 115_200;
 
