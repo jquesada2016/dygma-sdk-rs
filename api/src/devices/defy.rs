@@ -592,6 +592,8 @@ impl SuperkeyMap {
             .flat_map(|key| key.to_superkey_map_data())
             .collect::<Vec<_>>();
 
+        data.push(0);
+
         if data.len() > 512 {
             return Err(TooManySuperkeysError);
         }
