@@ -304,7 +304,7 @@ macros::generate_keycode_tables! {
     LeftCtrl = 224,
     /// Left Shift
     LeftShift,
-    /// Left Shift
+    /// Left Alt
     LeftAlt,
     /// Left OS
     LeftOs,
