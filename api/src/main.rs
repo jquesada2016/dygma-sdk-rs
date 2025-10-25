@@ -32,7 +32,7 @@ enum Cli {
     Superkeys(SuperkeyCommands),
     /// Useful commands for working with keymap key codes.
     #[command(subcommand)]
-    KeyCodes(KeyCodeCommands),
+    KeyCode(KeyCodeCommands),
 }
 
 impl Cli {
@@ -70,7 +70,7 @@ impl Cli {
             }
             Self::Keymap(cmd) => cmd.perform().await,
             Self::Superkeys(cmd) => cmd.perform().await,
-            Self::KeyCodes(cmd) => cmd.perform(),
+            Self::KeyCode(cmd) => cmd.perform(),
         }
     }
 }
@@ -88,10 +88,16 @@ enum KeymapCommands {
         #[clap(default_value = "keymap.json")]
         path: PathBuf,
     },
+    /// Formats the keymap file.
+    Format {
+        /// The path of the keymap JSON file.
+        #[clap(default_value = "keymap.json")]
+        path: PathBuf,
+    },
     /// Reads a keymap file and outputs it as a raw keymap data string that can
     /// be used to send to the keyboard.
     ToCommandData {
-        /// The path of the keymap file.
+        /// The path of the keymap JSON file.
         path: PathBuf,
     },
     /// Apply the keymap to the keyboard.
@@ -143,6 +149,13 @@ impl KeymapCommands {
 
                 Ok(())
             }
+            Self::Format { path } => {
+                let keymap = read_json_file::<DefyKeymap>(&path).await?;
+
+                safe_pretty_json_file(&keymap, &path).await?;
+
+                Ok(())
+            }
         }
     }
 }
@@ -160,10 +173,15 @@ enum SuperkeyCommands {
         #[clap(default_value = "keymap.json")]
         path: PathBuf,
     },
+    /// Formats the super keys JSON file.
+    Format {
+        /// The path of the keymap JSON file.
+        path: PathBuf,
+    },
     /// Reads a keymap file and outputs it as a raw keymap data string that can
     /// be used to send to the keyboard.
     ToCommandData {
-        /// The path of the keymap file.
+        /// The path of the keymap JSON file.
         path: PathBuf,
     },
     /// Apply the keymap to the keyboard.
@@ -212,6 +230,13 @@ impl SuperkeyCommands {
 
                 Ok(())
             }
+            Self::Format { path } => {
+                let map = read_json_file::<SuperkeyMap>(&path).await?;
+
+                safe_pretty_json_file(&map, &path).await?;
+
+                Ok(())
+            }
         }
     }
 }
@@ -219,12 +244,12 @@ impl SuperkeyCommands {
 #[derive(Subcommand)]
 enum KeyCodeCommands {
     /// Get a human-readable name for the key code.
-    DescribeKeyCode {
+    Describe {
         /// The key code you want to get a human-readable name for.
         code: u16,
     },
     /// Get a human-readable description of a string of key codes.
-    DescribeKeyCodeSequence {
+    DescribeSequence {
         /// The string of space-seperated key codes.
         keys: String,
     },
@@ -242,14 +267,14 @@ enum KeyCodeCommands {
 impl KeyCodeCommands {
     fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::DescribeKeyCode { code } => {
+            Self::Describe { code } => {
                 let key = KeyKind::from(code);
 
                 println!("{key}");
 
                 Ok(())
             }
-            Self::DescribeKeyCodeSequence { keys } => {
+            Self::DescribeSequence { keys } => {
                 let keys = keys
                     .split(' ')
                     .filter(|seq| !seq.is_empty())
