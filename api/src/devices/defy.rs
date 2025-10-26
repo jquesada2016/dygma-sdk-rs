@@ -552,7 +552,7 @@ impl serde::Serialize for SuperkeyMap {
             .copied()
             .enumerate()
             .map(|(i, key)| Superkey {
-                id: i as u8 + 1,
+                macro_number: i as u8 + 1,
                 ..key
             })
             .collect::<Vec<_>>()
@@ -570,7 +570,7 @@ impl FromStr for SuperkeyMap {
             .into_iter()
             .enumerate()
             .map(|(i, key)| Superkey {
-                id: i as u8 + 1,
+                macro_number: i as u8 + 1,
                 tap: key.tap.map(Into::into),
                 hold: key.hold.map(Into::into),
                 tap_hold: key.tap_hold.map(Into::into),
@@ -614,7 +614,7 @@ pub struct Superkey {
     /// you want, and use this number to know what [`KeyKind`] to use to assign
     /// the particular superkey.
     #[serde(skip_deserializing)]
-    pub id: u8,
+    pub macro_number: u8,
     /// Action performed when the key is tapped.
     pub tap: Option<KeyKind>,
     /// Action performed when the key is held.
@@ -631,7 +631,7 @@ impl Superkey {
     /// Converts this type into a form suitable for sending to the keyboard.
     pub fn to_superkey_map_data(&self) -> [u16; 6] {
         let Self {
-            id: _,
+            macro_number: _,
             tap,
             hold,
             tap_hold,
