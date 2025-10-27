@@ -19,7 +19,7 @@ impl<'a> ToTokens for KeyKindEnum<'a> {
 
         let token_stream = quote! {
           /// Represents all possible keys in a keymap.
-          #[derive(Clone, Copy, Debug, Display, From, Hash, PartialEq, Eq, PartialOrd, Ord)]
+          #[derive(Clone, Copy, Debug, Display, From, Hash, PartialEq, Eq)]
           #[display("{_0}")]
           pub enum KeyKind {
             #( #variants ),*,

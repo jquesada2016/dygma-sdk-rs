@@ -4,6 +4,7 @@ mod impl_from_str_for_key_table_enums;
 mod impl_from_u16_for_key_kind;
 mod key_kind_enum;
 mod key_table_enum;
+mod mpl_partial_eq_key_table_enum_for_key_kind;
 
 use crate::{
     Ir,
@@ -14,6 +15,7 @@ use crate::{
         impl_from_u16_for_key_kind::ImplFromU16ForKeyKind,
         key_kind_enum::KeyKindEnum,
         key_table_enum::KeyTableEnum,
+        mpl_partial_eq_key_table_enum_for_key_kind::ImplPartialEqKeyTableForKeyKind,
     },
 };
 use proc_macro2::TokenStream;
@@ -28,6 +30,8 @@ impl ToTokens for Ir {
         let impl_from_key_kind_enum_for_u16 = ImplFromKeyKindEnumForU16::from(self);
         let impl_from_str_for_table_enums = self.0.iter().map(ImplFromStrForKeyTableEnum::from);
         let impl_from_str_for_key_kind_enum = ImplFromStrForKeyKindEnum::from(self);
+        let impl_partial_eq_key_table_for_key_kinds =
+            self.0.iter().map(ImplPartialEqKeyTableForKeyKind::from);
 
         let token_stream = quote! {
             paste::paste! {
@@ -38,6 +42,8 @@ impl ToTokens for Ir {
                 #impl_from_u16_for_key_kind
 
                 #impl_from_str_for_key_kind_enum
+
+                #( #impl_partial_eq_key_table_for_key_kinds )*
 
                 #( #key_table_enums )*
 
