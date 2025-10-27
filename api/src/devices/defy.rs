@@ -252,7 +252,7 @@ pub struct DefyThumbClusterLayout {
 }
 
 /// Full Defy keymap.
-#[derive(Clone, Debug, Deref, DerefMut, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deref, DerefMut, Deserialize)]
 pub struct DefyKeymap(pub Vec<DefyKeymapLayer>);
 
 impl FromStr for DefyKeymap {
@@ -266,6 +266,24 @@ impl FromStr for DefyKeymap {
             .collect();
 
         Ok(Self(layers))
+    }
+}
+
+impl serde::Serialize for DefyKeymap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, layer)| DefyKeymapLayer {
+                layer_number: i as u8 + 1,
+                ..layer
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
     }
 }
 
@@ -297,6 +315,13 @@ impl DefyKeymap {
 /// A single human-readable Defy layer.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DefyKeymapLayer {
+    /// A human-readable label for knowing what layer your editing in the
+    /// JSON file.
+    ///
+    /// **Note**: This number is only a UX aid, and is not taken
+    /// into account when deserializing from the config file.
+    #[serde(skip_deserializing)]
+    pub layer_number: u8,
     /// Left half of the keyboard.
     pub left: DefyKeymapLeft,
     /// Right half of the keyboard.
@@ -306,6 +331,7 @@ pub struct DefyKeymapLayer {
 impl From<&DefyLayerData> for DefyKeymapLayer {
     fn from(layer_data: &DefyLayerData) -> Self {
         Self {
+            layer_number: 0,
             left: DefyKeymapLeft::from(layer_data),
             right: DefyKeymapRight::from(layer_data),
         }
