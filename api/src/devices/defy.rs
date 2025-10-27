@@ -6,7 +6,11 @@ use crate::{
         CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
         SerialPortFocusApi,
     },
-    parsing::{self, keymap::KeyKind, superkeys::RawSuperkeyMap},
+    parsing::{
+        self,
+        keymap::{Blank, KeyKind},
+        superkeys::SuperkeyMap as RawSuperkeyMap,
+    },
 };
 use itertools::Itertools;
 use std::{array, str::FromStr};
@@ -571,11 +575,11 @@ impl FromStr for SuperkeyMap {
             .enumerate()
             .map(|(i, key)| Superkey {
                 macro_number: i as u8 + 1,
-                tap: key.tap.map(Into::into),
-                hold: key.hold.map(Into::into),
-                tap_hold: key.tap_hold.map(Into::into),
-                double_tap: key.double_tap.map(Into::into),
-                double_tap_hold: key.double_tap_hold.map(Into::into),
+                tap: key.tap,
+                hold: key.hold,
+                tap_hold: key.tap_hold,
+                double_tap: key.double_tap,
+                double_tap_hold: key.double_tap_hold,
             })
             .collect();
 
@@ -639,11 +643,17 @@ impl Superkey {
             double_tap_hold,
         } = self;
 
-        let tap = tap.map(u16::from).unwrap_or(1);
-        let hold = hold.map(u16::from).unwrap_or(1);
-        let tap_hold = tap_hold.map(u16::from).unwrap_or(1);
-        let double_tap = double_tap.map(u16::from).unwrap_or(1);
-        let double_tap_hold = double_tap_hold.map(u16::from).unwrap_or(1);
+        let action_to_u16 = |key| match key {
+            Some(KeyKind::Blank(Blank::NoKey)) => 1,
+            Some(key) => key.into(),
+            None => 1,
+        };
+
+        let tap = action_to_u16(*tap);
+        let hold = action_to_u16(*hold);
+        let tap_hold = action_to_u16(*tap_hold);
+        let double_tap = action_to_u16(*double_tap);
+        let double_tap_hold = action_to_u16(*double_tap_hold);
 
         [tap, hold, tap_hold, double_tap, double_tap_hold, 0]
     }

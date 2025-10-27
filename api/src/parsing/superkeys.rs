@@ -1,5 +1,6 @@
 //! Types for parsing superkeys.
 
+use crate::parsing::keymap::{Blank, KeyKind};
 use std::str::FromStr;
 use winnow::{
     ModalResult, Parser,
@@ -14,9 +15,9 @@ pub struct ParseSuperkeyMapError(#[error(not(source))] String);
 
 /// Struct containing a list of defined superkeys.
 #[derive(Clone, Debug)]
-pub struct RawSuperkeyMap(pub Vec<RawSuperKey>);
+pub struct SuperkeyMap(pub Vec<SuperKey>);
 
-impl FromStr for RawSuperkeyMap {
+impl FromStr for SuperkeyMap {
     type Err = ParseSuperkeyMapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -30,20 +31,20 @@ impl FromStr for RawSuperkeyMap {
 
 /// Superkey containing uninterpreted actions.
 #[derive(Clone, Debug)]
-pub struct RawSuperKey {
+pub struct SuperKey {
     /// Action performed when tapping the key.
-    pub tap: Option<u16>,
+    pub tap: Option<KeyKind>,
     /// Action performed when holding the key.
-    pub hold: Option<u16>,
+    pub hold: Option<KeyKind>,
     /// Action performed when tapping and holding the key.
-    pub tap_hold: Option<u16>,
+    pub tap_hold: Option<KeyKind>,
     /// Action performed when double tapping the key.
-    pub double_tap: Option<u16>,
+    pub double_tap: Option<KeyKind>,
     /// Action performed when double tapping and holding the key.
-    pub double_tap_hold: Option<u16>,
+    pub double_tap_hold: Option<KeyKind>,
 }
 
-fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<RawSuperKey>> {
+fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<SuperKey>> {
     let (superkey_map, _) =
         repeat_till(1.., terminated(super_key_parser, "0 "), "0 ").parse_next(input)?;
 
@@ -52,7 +53,7 @@ fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<RawSuperKey>> {
     Ok(superkey_map)
 }
 
-fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
+fn super_key_parser(input: &mut &str) -> ModalResult<SuperKey> {
     let (tap, hold, tap_hold, double_tap, double_tap_hold) = (
         superkey_action_parser,
         superkey_action_parser,
@@ -62,7 +63,7 @@ fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
     )
         .parse_next(input)?;
 
-    Ok(RawSuperKey {
+    Ok(SuperKey {
         tap,
         hold,
         tap_hold,
@@ -71,10 +72,20 @@ fn super_key_parser(input: &mut &str) -> ModalResult<RawSuperKey> {
     })
 }
 
-fn superkey_action_parser(input: &mut &str) -> ModalResult<Option<u16>> {
-    let (action, _) = (dec_uint, space1).parse_next(input)?;
+fn superkey_action_parser(input: &mut &str) -> ModalResult<Option<KeyKind>> {
+    let (action, _) = (dec_uint::<_, u16, _>, space1).parse_next(input)?;
 
-    Ok((action != 1).then_some(action))
+    if action == 1 {
+        return Ok(None);
+    }
+
+    let key = KeyKind::from(action);
+
+    if key == Blank::NoKey {
+        return Ok(None);
+    }
+
+    Ok(Some(key))
 }
 
 #[cfg(test)]
@@ -85,6 +96,6 @@ mod tests {
 
     #[test]
     fn parse_succeeds() {
-        let _ = SUPERKEY_DATA.parse::<RawSuperkeyMap>().unwrap();
+        let _ = SUPERKEY_DATA.parse::<SuperkeyMap>().unwrap();
     }
 }
