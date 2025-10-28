@@ -267,6 +267,16 @@ impl HidFocusApi {
             .await
             .map_err(CreateHidFoducApiError::ConnectingToDevice)?;
 
+        eprintln!(
+            "Warning:\n\
+            You are connected to the keyboard via Bluetooth, \
+            which is currently failing to send commands with large data payloads.\n\
+            \n\
+            Please reconnect with wired or wireless RF and try again if the \
+            keyboard becomes unresponsive after this operation.\n\
+            \n\
+            Nothing bad will happen, just restart the keyboard if it becomes unresponsive."
+        );
         Ok(Self {
             _device: device,
             reader,
