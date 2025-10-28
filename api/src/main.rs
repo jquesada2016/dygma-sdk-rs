@@ -126,13 +126,9 @@ impl KeymapCommands {
             Self::ToCommandData { path } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
-                let res = keymap
-                    .to_keymap_custom_data()?
-                    .into_iter()
-                    .map(|key| key.unwrap_or_default())
-                    .join(" ");
+                let data = keymap.to_keymap_custom_data()?;
 
-                println!("{res}");
+                println!("{data}");
 
                 Ok(())
             }

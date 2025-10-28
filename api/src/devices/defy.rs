@@ -13,10 +13,7 @@ use itertools::Itertools;
 use std::{array, str::FromStr};
 
 /// Type alias for the raw keymap data.
-pub type DefyLayerData = [u16; KEYS_PER_LAYER];
-
-/// Data shape required for the "keymap.custom" command.
-pub type DefyKeymapCustomData = [Option<u16>; KEYS_PER_LAYER * KEYMAP_CUSTOM_COMMAND_LAYERS];
+pub type DefyLayerData = [KeyKind; KEYS_PER_LAYER];
 
 /// Number of keys per layer.
 pub const KEYS_PER_LAYER: usize = 80;
@@ -155,11 +152,7 @@ impl DefyKeyboard {
         &mut self,
         keymap: &DefyKeymap,
     ) -> Result<(), ApplyCustomKeymapError> {
-        let data = keymap
-            .to_keymap_custom_data()?
-            .into_iter()
-            .map(|key| key.unwrap_or_default())
-            .join(" ");
+        let data = keymap.to_keymap_custom_data()?;
 
         self.run_command(Self::KEYMAP_CUSTOM_COMMAND_NAME, Some(&data))
             .await?;
@@ -257,9 +250,9 @@ impl FromStr for DefyKeymap {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let layers = s
-            .parse::<parsing::keymap::RawKeymap>()?
+            .parse::<parsing::keymap::Keymap>()?
             .iter()
-            .map(Into::into)
+            .map(DefyKeymapLayer::from)
             .collect();
 
         Ok(Self(layers))
@@ -287,12 +280,7 @@ impl serde::Serialize for DefyKeymap {
 impl DefyKeymap {
     /// Converts this keymap into a form suitable for sending over to the keyboard
     /// as the data of a `keymap.custom` command.
-    ///
-    /// Please refer to [`DefyKeymapLayer::to_keymap_data`] for more details as to
-    /// why this function returns `Option<u16>` rathern than `u16`.
-    pub fn to_keymap_custom_data(
-        &self,
-    ) -> Result<DefyKeymapCustomData, KeymapDoesNotHave10LayersError> {
+    pub fn to_keymap_custom_data(&self) -> Result<String, KeymapDoesNotHave10LayersError> {
         if self.0.len() != KEYMAP_CUSTOM_COMMAND_LAYERS {
             return Err(KeymapDoesNotHave10LayersError);
         };
@@ -300,12 +288,16 @@ impl DefyKeymap {
         let data = self
             .0
             .iter()
-            .flat_map(|layer| layer.to_keymap_data())
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("`keymap.custom` command data has 800 entries");
+            .map(|layer| {
+                layer
+                    .to_keymap_data()
+                    .map(|opt| opt.unwrap_or(KeyKind::from(0)))
+            })
+            .collect::<Vec<_>>();
 
-        Ok(data)
+        let keymap = parsing::keymap::Keymap(data);
+
+        Ok(keymap.to_string())
     }
 }
 
@@ -396,12 +388,12 @@ impl DefyKeymapLayer {
 
     /// Converts this layer into a form suitable for using with keymap commands.
     ///
-    /// **Note**: This function returns `Option<u16>`, rather than `u16`.
+    /// **Note**: This function returns [`Option<KeyKind>`], rather than [`KeyKind`].
     /// This is done because a keymap layer must contain 80 keys, but the keyboard only
     /// has 70 keys. Therefore, there are 10 missing keys. You should therefore pick
     /// a difault placeholder key, usually `u16::MIN` or `u16::MAX`.
-    pub fn to_keymap_data(&self) -> [Option<u16>; KEYS_PER_LAYER] {
-        array::from_fn(|i| self.get_key_by_index(i as u8).map(Into::into))
+    pub fn to_keymap_data(&self) -> [Option<KeyKind>; KEYS_PER_LAYER] {
+        array::from_fn(|i| self.get_key_by_index(i as u8))
     }
 }
 
@@ -424,25 +416,13 @@ impl From<&DefyLayerData> for DefyKeymapLeft {
     fn from(layer_data: &DefyLayerData) -> Self {
         let left_layout = &LAYOUT.left;
 
-        let row_1 = left_layout
-            .row_1
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_1 = left_layout.row_1.map(|index| layer_data[index as usize]);
 
-        let row_2 = left_layout
-            .row_2
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_2 = left_layout.row_2.map(|index| layer_data[index as usize]);
 
-        let row_3 = left_layout
-            .row_3
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_3 = left_layout.row_3.map(|index| layer_data[index as usize]);
 
-        let row_4 = left_layout
-            .row_4
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_4 = left_layout.row_4.map(|index| layer_data[index as usize]);
 
         let thumb_cluster = DefyThumbclusterKeymapLeft::from(layer_data);
 
@@ -472,14 +452,12 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapLeft {
         let top = left_layout
             .thumb_cluster
             .top
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+            .map(|index| layer_data[index as usize]);
 
         let bottom = left_layout
             .thumb_cluster
             .bottom
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+            .map(|index| layer_data[index as usize]);
 
         Self { top, bottom }
     }
@@ -504,25 +482,13 @@ impl From<&DefyLayerData> for DefyKeymapRight {
     fn from(layer_data: &DefyLayerData) -> Self {
         let right_layout = &LAYOUT.right;
 
-        let row_1 = right_layout
-            .row_1
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_1 = right_layout.row_1.map(|index| layer_data[index as usize]);
 
-        let row_2 = right_layout
-            .row_2
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_2 = right_layout.row_2.map(|index| layer_data[index as usize]);
 
-        let row_3 = right_layout
-            .row_3
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_3 = right_layout.row_3.map(|index| layer_data[index as usize]);
 
-        let row_4 = right_layout
-            .row_4
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+        let row_4 = right_layout.row_4.map(|index| layer_data[index as usize]);
 
         let thumb_cluster = DefyThumbclusterKeymapRight::from(layer_data);
 
@@ -552,14 +518,12 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
         let top = right_layout
             .thumb_cluster
             .top
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+            .map(|index| layer_data[index as usize]);
 
         let bottom = right_layout
             .thumb_cluster
             .bottom
-            .map(|index| layer_data[index as usize])
-            .map(KeyKind::from);
+            .map(|index| layer_data[index as usize]);
 
         Self { top, bottom }
     }
@@ -740,7 +704,7 @@ mod tests {
                             layer_data[i * KEYS_PER_LAYER + j] = 0;
                         }
 
-                        key.unwrap_or_default()
+                        key.unwrap_or(Blank::NoKey.into())
                     })
                     .collect::<Vec<_>>()
             })
