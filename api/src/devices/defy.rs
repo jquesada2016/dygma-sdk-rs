@@ -4,8 +4,7 @@
 use crate::{
     focus_api::{
         CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
-        SerialPortFocusApi,
-        parsing::{self, superkeys::SuperkeyMap as RawSuperkeyMap},
+        SerialPortFocusApi, parsing,
     },
     keycode_tables::{Blank, KeyKind},
 };
@@ -543,7 +542,7 @@ impl serde::Serialize for SuperkeyMap {
             .copied()
             .enumerate()
             .map(|(i, key)| Superkey {
-                macro_number: i as u8 + 1,
+                superkey_number: i as u8 + 1,
                 ..key
             })
             .collect::<Vec<_>>()
@@ -556,12 +555,12 @@ impl FromStr for SuperkeyMap {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let map = s
-            .parse::<RawSuperkeyMap>()?
+            .parse::<parsing::superkeys::SuperkeyMap>()?
             .0
             .into_iter()
             .enumerate()
             .map(|(i, key)| Superkey {
-                macro_number: i as u8 + 1,
+                superkey_number: i as u8 + 1,
                 tap: key.tap,
                 hold: key.hold,
                 tap_hold: key.tap_hold,
@@ -605,7 +604,7 @@ pub struct Superkey {
     /// you want, and use this number to know what [`KeyKind`] to use to assign
     /// the particular superkey.
     #[serde(skip_deserializing)]
-    pub macro_number: u8,
+    pub superkey_number: u8,
     /// Action performed when the key is tapped.
     pub tap: Option<KeyKind>,
     /// Action performed when the key is held.
@@ -622,7 +621,7 @@ impl Superkey {
     /// Converts this type into a form suitable for sending to the keyboard.
     pub fn to_superkey_map_data(&self) -> [u16; 6] {
         let Self {
-            macro_number: _,
+            superkey_number: _,
             tap,
             hold,
             tap_hold,
