@@ -6,9 +6,8 @@ use crate::{
         CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
         SerialPortFocusApi, parsing,
     },
-    keycode_tables::{Blank, KeyKind},
+    keycode_tables::KeyKind,
 };
-use itertools::Itertools;
 use std::{array, str::FromStr};
 
 /// Type alias for the raw keymap data.
@@ -101,16 +100,11 @@ pub enum GetSuperkeyMapError {
 pub enum ApplySuperkeyError {
     /// Too many superkeys were used.
     #[display("{_0}")]
-    TooManySuperkeys(TooManySuperkeysError),
+    TooManySuperkeys(parsing::superkeys::TooManySuperkeysError),
     /// Command failed to run.
     #[display("{_0}")]
     CommandFailed(RunCommandError),
 }
-
-/// Error returned when there are too many superkeys in a [`SuperkeyMap`]
-/// and thus, creating the command data would overflow.
-#[derive(Clone, Copy, Debug, Display, Error)]
-pub struct TooManySuperkeysError;
 
 /// A handle to the Dygma Defy keyboard, allowing for programatic control.
 #[derive(Debug, Deref, DerefMut, From)]
@@ -125,6 +119,9 @@ impl DefyKeyboard {
 
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
+
+    /// The memory size of the superkey map.
+    pub const SUPERKEY_MEMORY_SIZE: usize = 512;
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
@@ -164,7 +161,8 @@ impl DefyKeyboard {
         &mut self,
         superkeys: &SuperkeyMap,
     ) -> Result<(), ApplySuperkeyError> {
-        let data = superkeys.to_superkey_map_data()?.into_iter().join(" ");
+        let data = parsing::superkeys::SuperkeyMap::from(superkeys)
+            .to_command_data::<{ Self::SUPERKEY_MEMORY_SIZE }>()?;
 
         self.run_command(Self::SUPERKEY_MAP_COMMAND_NAME, Some(&data))
             .await?;
@@ -573,24 +571,9 @@ impl FromStr for SuperkeyMap {
     }
 }
 
-impl SuperkeyMap {
-    /// Converts this type into a form suitable for sending to the keyboard.
-    pub fn to_superkey_map_data(&self) -> Result<[u16; 512], TooManySuperkeysError> {
-        let mut data = self
-            .0
-            .iter()
-            .flat_map(|key| key.to_superkey_map_data())
-            .collect::<Vec<_>>();
-
-        data.push(0);
-
-        if data.len() > 512 {
-            return Err(TooManySuperkeysError);
-        }
-
-        data.resize(512, u16::MAX);
-
-        Ok(data.try_into().expect("size should be exactly 512"))
+impl From<&SuperkeyMap> for parsing::superkeys::SuperkeyMap {
+    fn from(map: &SuperkeyMap) -> Self {
+        Self(map.0.iter().copied().map(Into::into).collect())
     }
 }
 
@@ -617,36 +600,33 @@ pub struct Superkey {
     pub double_tap_hold: Option<KeyKind>,
 }
 
-impl Superkey {
-    /// Converts this type into a form suitable for sending to the keyboard.
-    pub fn to_superkey_map_data(&self) -> [u16; 6] {
-        let Self {
+impl From<Superkey> for parsing::superkeys::Superkey {
+    fn from(key: Superkey) -> Self {
+        let Superkey {
             superkey_number: _,
             tap,
             hold,
             tap_hold,
             double_tap,
             double_tap_hold,
-        } = self;
+        } = key;
 
-        let action_to_u16 = |key| match key {
-            Some(KeyKind::Blank(Blank::NoKey)) => 1,
-            Some(key) => key.into(),
-            None => 1,
-        };
-
-        let tap = action_to_u16(*tap);
-        let hold = action_to_u16(*hold);
-        let tap_hold = action_to_u16(*tap_hold);
-        let double_tap = action_to_u16(*double_tap);
-        let double_tap_hold = action_to_u16(*double_tap_hold);
-
-        [tap, hold, tap_hold, double_tap, double_tap_hold, 0]
+        Self {
+            tap,
+            hold,
+            tap_hold,
+            double_tap,
+            double_tap_hold,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
+    use crate::keycode_tables::Blank;
+
     use super::*;
 
     const KEYMAP_DATA: &str = "41 30 31 32 33 34 0 0 0 0 35 36 37 38 39 0 43 20 26 8 21 23 0 0 0 0 28 24 12 18 19 0 57 4 22 7 9 10 17152 0 0 0 11 13 14 15 51 52 53980 29 27 6 25 5 0 0 0 0 17 16 54 55 56 0 53853 17452 44 49467 49209 226 227 0 0 231 76 49209 52028 44 49162 230 41 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 43 85 95 96 97 87 0 0 0 0 75 74 82 77 0 0 0 84 92 93 94 86 83 0 0 0 78 80 81 79 70 0 0 46 89 90 91 99 0 0 0 0 0 0 0 0 0 0 0 0 98 65535 65535 65535 0 0 0 0 0 65535 65535 65535 65535 0 0 58 59 60 61 62 63 65535 65535 64 65 66 67 68 69 0 0 0 0 22710 22709 23785 0 65535 65535 0 0 23663 0 0 65535 0 0 0 22713 22711 22733 23785 0 65535 65535 0 0 23664 20866 20865 0 0 0 0 0 0 0 19682 65535 65535 65535 65535 0 0 0 0 0 0 0 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 65535 65535 0 0 0 0 0 0 0 0 53 2079 2080 2081 2101 0 65535 65535 0 2083 2095 2096 2093 2094 0 0 2078 56 2102 2103 2082 0 65535 65535 0 2084 2086 2087 45 46 0 0 0 0 49 2097 0 65535 65535 65535 65535 0 47 48 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 65535 0 0 0 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 ";
@@ -716,7 +696,9 @@ mod tests {
     fn superkeys_round_trips_from_str() {
         let map = SUPERKEY_DATA.parse::<SuperkeyMap>().unwrap();
 
-        let str_data = map.to_superkey_map_data().unwrap().into_iter().join(" ");
+        let str_data = parsing::superkeys::SuperkeyMap::from(&map)
+            .to_command_data::<512>()
+            .unwrap();
 
         assert_eq!(format!("{str_data} "), SUPERKEY_DATA);
     }

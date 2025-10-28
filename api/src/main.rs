@@ -3,7 +3,7 @@ extern crate derive_more;
 
 use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
-use dygma_cli::focus_api::FocusApiConnection;
+use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;
@@ -206,7 +206,8 @@ impl SuperkeyCommands {
             Self::ToCommandData { path } => {
                 let map = read_json_file::<SuperkeyMap>(&path).await?;
 
-                let str_data = map.to_superkey_map_data()?.into_iter().join(" ");
+                let str_data = parsing::superkeys::SuperkeyMap::from(&map)
+                    .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()?;
 
                 println!("{str_data}");
 
