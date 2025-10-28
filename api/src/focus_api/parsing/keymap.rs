@@ -1,8 +1,7 @@
 //! Types for parsing keymaps.
 
-mod keycode_tables;
+pub mod keycode_tables;
 
-pub use keycode_tables::*;
 use std::str::FromStr;
 use winnow::{
     combinator::{opt, repeat, terminated},

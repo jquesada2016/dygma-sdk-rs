@@ -1,12 +1,13 @@
 //! Types for parsing superkeys.
 
-use crate::focus_api::parsing::keymap::{Blank, KeyKind};
 use std::str::FromStr;
 use winnow::{
     ModalResult, Parser,
     ascii::{dec_uint, space1},
     combinator::{repeat, repeat_till, terminated},
 };
+
+use crate::keycode_tables::{Blank, KeyKind};
 
 /// Error when parsing a superkeys map..
 #[derive(Clone, Debug, Display, Error, From)]

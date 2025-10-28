@@ -1,4 +1,4 @@
-//! This module defines all the possible keycodes and their meaning.
+//! This module defines all possible keycodes.
 
 use std::str::FromStr;
 

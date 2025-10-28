@@ -1,12 +1,13 @@
 //! Types for parsing macros.
 
-use crate::focus_api::parsing::keymap::KeyKind;
 use winnow::{
     ModalResult, Parser,
     ascii::dec_uint,
     combinator::{fail, repeat, repeat_till},
     error::{StrContext, StrContextValue},
 };
+
+use crate::keycode_tables::KeyKind;
 
 /// Represents a single macro.
 #[derive(Clone, Debug)]

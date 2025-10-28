@@ -4,7 +4,7 @@ extern crate derive_more;
 use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
 use dygma_cli::focus_api::FocusApiConnection;
-use dygma_cli::focus_api::parsing::keymap::KeyKind;
+use dygma_cli::keycode_tables::KeyKind;
 use error_stack::{ResultExt, report};
 use itertools::Itertools;
 use std::path::{Path, PathBuf};

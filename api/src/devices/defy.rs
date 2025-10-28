@@ -2,15 +2,12 @@
 //! the keyboard.
 
 use crate::{
-    focus_api::parsing::{
-        self,
-        keymap::{Blank, KeyKind},
-        superkeys::SuperkeyMap as RawSuperkeyMap,
-    },
     focus_api::{
         CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
         SerialPortFocusApi,
+        parsing::{self, superkeys::SuperkeyMap as RawSuperkeyMap},
     },
+    keycode_tables::{Blank, KeyKind},
 };
 use itertools::Itertools;
 use std::{array, str::FromStr};
