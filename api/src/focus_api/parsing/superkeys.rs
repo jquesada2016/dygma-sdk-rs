@@ -1,6 +1,6 @@
 //! Types for parsing superkeys.
 
-use crate::parsing::keymap::{Blank, KeyKind};
+use crate::focus_api::parsing::keymap::{Blank, KeyKind};
 use std::str::FromStr;
 use winnow::{
     ModalResult, Parser,

@@ -29,11 +29,11 @@ impl ParseResponseError {
     }
 }
 
-/// String response from Focus API command.
-#[derive(Clone, Debug, Deref)]
-pub struct Response(pub String);
+/// String response from Focus API commands.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deref)]
+pub struct FocusApiCommandResponse(String);
 
-impl FromStr for Response {
+impl FromStr for FocusApiCommandResponse {
     type Err = ParseResponseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -42,6 +42,13 @@ impl FromStr for Response {
             .map_err(ParseResponseError::from_winnow_err)?;
 
         Ok(Self(res))
+    }
+}
+
+impl FocusApiCommandResponse {
+    /// Returns the inner String responts.
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -74,6 +81,16 @@ fn line_parser<'s>(input: &mut Partial<&'s str>) -> ModalResult<&'s str> {
     terminated(till_line_ending, line_ending).parse_next(input)
 }
 
+/// Formats command data to the correct format suitable for sending
+/// over the wire to the Focus API device.
+pub fn serialize_command(command: &str, data: Option<&str>) -> String {
+    if let Some(data) = data {
+        format!("{command} {data}\n")
+    } else {
+        format!("{command}\n")
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -82,7 +99,7 @@ mod test {
     fn parser_succeeds_on_single_response() {
         let data = "this.is a test\r\nto test the parser\r\n.";
 
-        let res = data.parse::<Response>().unwrap().0;
+        let res = data.parse::<FocusApiCommandResponse>().unwrap().0;
 
         assert_eq!(
             "this.is a test\n\

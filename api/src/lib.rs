@@ -12,6 +12,4 @@ extern crate tracing;
 
 pub mod devices;
 pub mod focus_api;
-pub mod parsing;
 pub mod schema;
-mod serial_port;

@@ -1,15 +1,17 @@
-//! Low-level functions for interacting with the Focus API provided with Dygma
+//! Functions for interacting with the Focus API provided with Dygma
 //! firmware.
 
-use crate::{
-    parsing,
-    serial_port::{OpenSerialPortError, SerialPort},
-};
+pub mod parsing;
+mod serial_port;
+
 use async_hid::{AsyncHidRead, AsyncHidWrite};
 use bytes::Bytes;
+use serial_port::{OpenSerialPortError, SerialPort};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
+
+use crate::focus_api::parsing::focus_api::serialize_command;
 
 /// Trait used to abstract over focus API connections.
 #[allow(async_fn_in_trait)]
@@ -165,20 +167,11 @@ impl SerialPortFocusApi {
     ) -> Result<String, SerialPortRunCommandError> {
         let port = &mut self.0;
 
-        let mut write = async |str: &str| {
-            port.write_all(str.as_bytes())
-                .await
-                .map_err(SerialPortRunCommandError::SendingCommand)
-        };
+        let data_to_send = serialize_command(command, data);
 
-        write(command).await?;
-
-        if let Some(data) = data {
-            write(" ").await?;
-            write(data).await?;
-        }
-
-        write("\n").await?;
+        port.write_all(data_to_send.as_bytes())
+            .await
+            .map_err(SerialPortRunCommandError::SendingCommand)?;
 
         let mut stream = ReaderStream::new(port);
 
@@ -202,8 +195,8 @@ impl SerialPortFocusApi {
             };
 
             return match data
-                .parse::<parsing::focus_api::Response>()
-                .map(|res| res.0)
+                .parse::<parsing::focus_api::FocusApiCommandResponse>()
+                .map(|res| res.into_inner())
             {
                 Ok(res) => Ok(res),
                 Err(parsing::focus_api::ParseResponseError::Incomplete) => continue,
@@ -287,17 +280,7 @@ impl HidFocusApi {
         command: &str,
         data: Option<&str>,
     ) -> Result<String, HidRunCommandError> {
-        let data_to_send = if let Some(data) = data {
-            [
-                command.as_bytes(),
-                " ".as_bytes(),
-                data.as_bytes(),
-                "\n".as_bytes(),
-            ]
-            .concat()
-        } else {
-            [command.as_bytes(), "\n".as_bytes()].concat()
-        };
+        let data_to_send = serialize_command(command, data).into_bytes();
 
         for chunk in data_to_send.chunks(Self::MAX_SEND_SIZE) {
             let data = [&[Self::REPORT_ID], chunk].concat();
@@ -335,8 +318,8 @@ impl HidFocusApi {
             };
 
             return match str_res
-                .parse::<parsing::focus_api::Response>()
-                .map(|res| res.0)
+                .parse::<parsing::focus_api::FocusApiCommandResponse>()
+                .map(|res| res.into_inner())
             {
                 Ok(res) => Ok(res),
                 Err(parsing::focus_api::ParseResponseError::Incomplete) => continue,

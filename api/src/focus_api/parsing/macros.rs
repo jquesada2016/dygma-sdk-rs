@@ -1,6 +1,6 @@
 //! Types for parsing macros.
 
-use crate::parsing::keymap::KeyKind;
+use crate::focus_api::parsing::keymap::KeyKind;
 use winnow::{
     ModalResult, Parser,
     ascii::dec_uint,

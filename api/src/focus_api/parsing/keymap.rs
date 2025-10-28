@@ -48,7 +48,7 @@ fn layer_parser(input: &mut &str) -> ModalResult<[u16; 80]> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parsing::keymap::RawKeymap;
+    use crate::focus_api::parsing::keymap::RawKeymap;
 
     #[test]
     fn parse_default_keymap() {

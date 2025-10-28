@@ -2,14 +2,14 @@
 //! the keyboard.
 
 use crate::{
-    focus_api::{
-        CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
-        SerialPortFocusApi,
-    },
-    parsing::{
+    focus_api::parsing::{
         self,
         keymap::{Blank, KeyKind},
         superkeys::SuperkeyMap as RawSuperkeyMap,
+    },
+    focus_api::{
+        CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
+        SerialPortFocusApi,
     },
 };
 use itertools::Itertools;
