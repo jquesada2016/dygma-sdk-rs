@@ -12,4 +12,3 @@ extern crate tracing;
 
 pub mod devices;
 pub mod focus_api;
-pub mod schema;
