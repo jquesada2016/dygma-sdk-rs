@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::KeyKind;
-use error_stack::{ResultExt, report};
 use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use tokio::{
@@ -41,22 +40,15 @@ impl Cli {
             Self::RunCommand { cmd, data } => {
                 let mut defy = DefyKeyboard::new().await?;
 
-                let available_cmds = defy
-                    .available_commands()
-                    .await
-                    .change_context(RunCommandError)?;
+                let available_cmds = defy.available_commands().await?;
 
                 if !available_cmds.contains(&cmd) {
                     let suggestions = get_command_suggestions(&available_cmds, &cmd);
 
-                    let report = report!(RunCommandError)
-                        .attach_printable(format!("`{cmd}` is not a valid command"))
-                        .attach_printable(format!(
-                            "did you mean one of these? {}",
-                            suggestions.join(", ")
-                        ));
+                    eprintln!("`{cmd}` is not a valid command");
+                    eprintln!("did you mean one of these? {}", suggestions.join(", "));
 
-                    return Err(report.into());
+                    return Err(RunCommandError.into());
                 }
 
                 let res = defy
