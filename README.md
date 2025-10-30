@@ -20,7 +20,7 @@ removed.
 
 There are three main parts to this repo.
 
-1. {CLI](/api/src/main.rs)
+1. [CLI](/api/src/main.rs)
 2. [Rust SDK](/api/src/lib.rs)
 3. [Rust macro Keymap key code generator](/macros/src/lib.rs)
 

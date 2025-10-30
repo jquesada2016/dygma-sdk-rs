@@ -15,6 +15,14 @@ use tokio::{
 #[derive(Parser)]
 enum Cli {
     /// Allows executing low level commands on Dygma hardware.
+    ///
+    /// # Example:
+    /// Run the following command to get a list of all supported commands
+    /// on your device:
+    ///
+    /// ```sh
+    /// cargo r -- run-command -c help
+    /// ```
     RunCommand {
         /// The command to be executed.
         #[arg(short, long = "command")]
@@ -51,10 +59,7 @@ impl Cli {
                     return Err(RunCommandError.into());
                 }
 
-                let res = defy
-                    .run_command(&cmd, data.as_deref())
-                    .await
-                    .change_context(RunCommandError)?;
+                let res = defy.run_command(&cmd, data.as_deref()).await?;
 
                 println!("{res}");
 
