@@ -52,6 +52,13 @@ called `keymap.json`:
 cargo r -- keymap new keymap.json
 ```
 
+The following command will get a list of available commands on the device
+itself (via the Focus API which is part of the firmware):
+
+```sh
+cargo r -- run-command -c help
+```
+
 **Node**: the `--` between `cargo r` and `keymap new keymap.json` is only
 required if you run the CLI using cargo. If you run the binary directly, you
 should omit the `--`. It is used by `cargo` to disambiguate between it's own
