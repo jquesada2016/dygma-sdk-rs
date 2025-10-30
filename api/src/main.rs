@@ -18,37 +18,16 @@ use tokio::{
 #[derive(Parser)]
 #[clap(about, author)]
 enum Cli {
-    /// Allows executing low level commands on Dygma hardware.
-    ///
-    /// # Examples:
-    ///
-    /// Run the following command to get a list of all supported commands
-    /// on your device:
-    ///
-    /// ```sh
-    /// cargo r -- run-command -c help
-    /// ```
-    ///
-    /// The following command will switch to layer 6:
-    ///
-    /// ```sh
-    /// cargo r -- run-command --command layer.activate --data 5
-    /// ```
-    RunCommand {
-        /// The command to be executed.
-        #[arg(short, long = "command")]
-        cmd: String,
-        /// The data to be submitted along with this command.
-        #[arg(short, long)]
-        data: Option<String>,
-    },
-    /// Useful commands for working with keymaps.
+    /// Commands for talking with your device.
+    #[command(subcommand)]
+    Command(CommandCommands),
+    /// Commands for working with keymaps.
     #[command(subcommand)]
     Keymap(KeymapCommands),
-    /// Useful commands for working with superkeys.
+    /// Commands for working with superkeys.
     #[command(subcommand)]
     Superkeys(SuperkeyCommands),
-    /// Useful commands for working with keymap key codes.
+    /// Commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCode(KeyCodeCommands),
 }
@@ -56,7 +35,46 @@ enum Cli {
 impl Cli {
     async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::RunCommand { cmd, data } => {
+            Self::Command(cmd) => cmd.perform().await,
+            Self::Keymap(cmd) => cmd.perform().await,
+            Self::Superkeys(cmd) => cmd.perform().await,
+            Self::KeyCode(cmd) => cmd.perform(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum CommandCommands {
+    /// Runs a low-level command on the device.
+    ///
+    /// You can use the `command list` command to get a list of available
+    /// commands.
+    ///
+    /// # Examples:
+    ///
+    /// The following command will switch to layer 6:
+    ///
+    /// ```sh
+    /// cargo r -- command run layer.activate --data 5
+    /// ```
+    Run {
+        /// The command to be executed.
+        cmd: String,
+        /// The data to be submitted along with this command.
+        #[arg(short, long)]
+        data: Option<String>,
+    },
+    /// Lists available commands.
+    List {
+        /// If provided, filters commands using this prefix.
+        prefix: Option<String>,
+    },
+}
+
+impl CommandCommands {
+    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Run { cmd, data } => {
                 let mut defy = DefyKeyboard::new().await?;
 
                 let available_cmds = defy.available_commands().await?;
@@ -76,9 +94,23 @@ impl Cli {
 
                 Ok(())
             }
-            Self::Keymap(cmd) => cmd.perform().await,
-            Self::Superkeys(cmd) => cmd.perform().await,
-            Self::KeyCode(cmd) => cmd.perform(),
+            Self::List { prefix } => {
+                let mut defy = DefyKeyboard::new().await?;
+
+                defy.available_commands()
+                    .await?
+                    .into_iter()
+                    .filter(|cmd| {
+                        if let Some(prefix) = prefix.as_ref() {
+                            cmd.starts_with(prefix)
+                        } else {
+                            true
+                        }
+                    })
+                    .for_each(|cmd| println!("{cmd}"));
+
+                Ok(())
+            }
         }
     }
 }

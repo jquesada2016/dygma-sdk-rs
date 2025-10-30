@@ -43,20 +43,20 @@ on each available command:
 cargo r -- --help
 ```
 
-## Example command
+## Example commands
 
 The following command will read the keymap on your Defy and save it to a file
 called `keymap.json`:
 
 ```sh
-cargo r -- keymap new keymap.json
+Dcargo r -- keymap new keymap.json
 ```
 
 The following command will get a list of available commands on the device
 itself (via the Focus API which is part of the firmware):
 
 ```sh
-cargo r -- run-command -c help
+cargo r -- command list
 ```
 
 **Node**: the `--` between `cargo r` and `keymap new keymap.json` is only
