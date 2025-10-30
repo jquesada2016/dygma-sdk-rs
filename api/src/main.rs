@@ -12,16 +12,27 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
 };
 
+/// CLI for programatically configuring and talking with your Dygma keyboard.
+///
+/// Made with Rust and <3.
 #[derive(Parser)]
+#[clap(about, author)]
 enum Cli {
     /// Allows executing low level commands on Dygma hardware.
     ///
-    /// # Example:
+    /// # Examples:
+    ///
     /// Run the following command to get a list of all supported commands
     /// on your device:
     ///
     /// ```sh
     /// cargo r -- run-command -c help
+    /// ```
+    ///
+    /// The following command will switch to layer 6:
+    ///
+    /// ```sh
+    /// cargo r -- run-command --command layer.activate --data 5
     /// ```
     RunCommand {
         /// The command to be executed.
@@ -237,17 +248,24 @@ impl SuperkeyCommands {
 
 #[derive(Subcommand)]
 enum KeyCodeCommands {
-    /// Get a human-readable name for the key code.
+    /// Get a human-readable name for a raw u16 key code.
     Describe {
         /// The key code you want to get a human-readable name for.
         code: u16,
     },
-    /// Get a human-readable description of a string of key codes.
+    /// Get a human-readable description of a string of space-seperated
+    /// raw u16 key codes.
     DescribeSequence {
-        /// The string of space-seperated key codes.
+        /// The string of space-seperated u16 key codes.
         keys: String,
     },
     /// Parse a string into a key code.
+    ///
+    /// # Examples:
+    ///
+    /// ```sh
+    /// cargo r -- key-code parse "A / Ctrl"
+    /// ```
     Parse {
         /// The string representing the key.
         data: String,
