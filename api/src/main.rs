@@ -333,7 +333,7 @@ struct RunCommandError;
 
 /// Utility function for getting possible commands the user might
 /// have intended to write, but did not.
-pub fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &str) -> Vec<&'a str> {
+fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &str) -> Vec<&'a str> {
     use strsim::jaro_winkler;
 
     let mut scored_suggestions = available_cmds
