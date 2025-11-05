@@ -8,7 +8,86 @@ use crate::{
     },
     keycode_tables::KeyKind,
 };
+pub use error::*;
 use std::{array, str::FromStr};
+
+mod error {
+    use super::*;
+
+    /// Error returned when creating a handle to the keyboard.
+    #[derive(Debug, Display, From, Error)]
+    #[display("failed to create handle to the Dygma Defy keyboard: {_0}")]
+    pub struct CreateDefyKeyboardError(CreateHidFoducApiError);
+
+    /// Error when parsing a keymap from a string slice.
+    #[derive(Clone, Debug, Display, From, Error)]
+    #[display("failed to parse keymap: {_0}")]
+    pub struct ParseKeymapError(parsing::keymap::ParseKeymapError);
+
+    /// Error when parsing a superkey map from a string slice.
+    #[derive(Clone, Debug, Display, From, Error)]
+    #[display("failed to parse superkeys map: {_0}")]
+    pub struct ParseSuperkeyMapError(parsing::superkeys::ParseSuperkeyMapError);
+
+    /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
+    /// creating the command data.
+    #[derive(Clone, Copy, Debug, Display, Error)]
+    #[display("keymap does not have exactly 10 layers")]
+    pub struct KeymapDoesNotHave10LayersError;
+
+    /// Error returned from [`DefyKeyboard::apply_custom_keymap`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum ApplyCustomKeymapError {
+        /// 10 layers are required, but this keymap has a different number of them.
+        #[display("{_0}")]
+        IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
+        /// Command failed to run.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+    }
+
+    /// Error returned from [`DefyKeyboard::get_custom_keymap`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetCustomKeymapError {
+        /// Failed to run command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// Keymap returned by the keyboard failed to parse.
+        KeymapParsingFailure(ParseKeymapError),
+    }
+
+    /// Error returned from [`DefyKeyboard::get_superkeys`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetSuperkeyMapError {
+        /// Failed to run command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// Keymap returned by the keyboard failed to parse.
+        KeymapParsingFailure(ParseSuperkeyMapError),
+    }
+
+    /// Error returned from [`DefyKeyboard::apply_superkeys`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum ApplySuperkeyError {
+        /// Too many superkeys were used.
+        #[display("{_0}")]
+        TooManySuperkeys(parsing::superkeys::TooManySuperkeysError),
+        /// Command failed to run.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+    }
+
+    /// Possible errors when clearing a [`DefyKeymap`] layer.
+    #[derive(Clone, Copy, Debug, Display, Error)]
+    pub enum ClearLayerError {
+        /// Layer 0 is not a valid layer. Layers start with index 1.
+        #[display("0 is not a valid layer, layers start at index 1")]
+        ZeroIndexProvided,
+        /// Tried to clear a layer that does not exist.
+        #[display("the layer does not exist in this keymap")]
+        LayerDoesNotExist,
+    }
+}
 
 /// Type alias for the raw keymap data.
 pub type DefyLayerData = [KeyKind; KEYS_PER_LAYER];
@@ -42,69 +121,6 @@ pub const LAYOUT: &DefyLayout = &DefyLayout {
         },
     },
 };
-
-/// Error returned when creating a handle to the keyboard.
-#[derive(Debug, Display, From, Error)]
-#[display("failed to create handle to the Dygma Defy keyboard: {_0}")]
-pub struct CreateDefyKeyboardError(CreateHidFoducApiError);
-
-/// Error when parsing a keymap from a string slice.
-#[derive(Clone, Debug, Display, From, Error)]
-#[display("failed to parse keymap: {_0}")]
-pub struct ParseKeymapError(parsing::keymap::ParseKeymapError);
-
-/// Error when parsing a superkey map from a string slice.
-#[derive(Clone, Debug, Display, From, Error)]
-#[display("failed to parse superkeys map: {_0}")]
-pub struct ParseSuperkeyMapError(parsing::superkeys::ParseSuperkeyMapError);
-
-/// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
-/// creating the command data.
-#[derive(Clone, Copy, Debug, Display, Error)]
-#[display("keymap does not have exactly 10 layers")]
-pub struct KeymapDoesNotHave10LayersError;
-
-/// Error returned from [`DefyKeyboard::apply_custom_keymap`].
-#[derive(Debug, Display, From, Error)]
-pub enum ApplyCustomKeymapError {
-    /// 10 layers are required, but this keymap has a different number of them.
-    #[display("{_0}")]
-    IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
-    /// Command failed to run.
-    #[display("{_0}")]
-    CommandFailed(RunCommandError),
-}
-
-/// Error returned from [`DefyKeyboard::get_custom_keymap`].
-#[derive(Debug, Display, From, Error)]
-pub enum GetCustomKeymapError {
-    /// Failed to run command.
-    #[display("{_0}")]
-    CommandFailed(RunCommandError),
-    /// Keymap returned by the keyboard failed to parse.
-    KeymapParsingFailure(ParseKeymapError),
-}
-
-/// Error returned from [`DefyKeyboard::get_superkeys`].
-#[derive(Debug, Display, From, Error)]
-pub enum GetSuperkeyMapError {
-    /// Failed to run command.
-    #[display("{_0}")]
-    CommandFailed(RunCommandError),
-    /// Keymap returned by the keyboard failed to parse.
-    KeymapParsingFailure(ParseSuperkeyMapError),
-}
-
-/// Error returned from [`DefyKeyboard::apply_superkeys`].
-#[derive(Debug, Display, From, Error)]
-pub enum ApplySuperkeyError {
-    /// Too many superkeys were used.
-    #[display("{_0}")]
-    TooManySuperkeys(parsing::superkeys::TooManySuperkeysError),
-    /// Command failed to run.
-    #[display("{_0}")]
-    CommandFailed(RunCommandError),
-}
 
 /// A handle to the Dygma Defy keyboard, allowing for programatic control.
 #[derive(Debug, Deref, DerefMut, From)]
@@ -239,7 +255,7 @@ pub struct DefyThumbClusterLayout {
 }
 
 /// Full Defy keymap.
-#[derive(Clone, Debug, Deref, DerefMut, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, From, Deref, DerefMut, Deserialize)]
 pub struct DefyKeymap(pub Vec<DefyKeymapLayer>);
 
 impl FromStr for DefyKeymap {
@@ -296,10 +312,27 @@ impl DefyKeymap {
 
         Ok(keymap.to_string())
     }
+
+    /// Clears the layer to the provided key.
+    pub fn clear_layer_to(&mut self, layer: usize, key: KeyKind) -> Result<(), ClearLayerError> {
+        if layer == 0 {
+            return Err(ClearLayerError::ZeroIndexProvided);
+        }
+
+        let layer = layer - 1;
+
+        if self.len() <= layer {
+            return Err(ClearLayerError::LayerDoesNotExist);
+        }
+
+        self[layer] = DefyKeymapLayer::new_cleared_to(key);
+
+        Ok(())
+    }
 }
 
 /// A single human-readable Defy layer.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Serialize, Deserialize)]
 pub struct DefyKeymapLayer {
     /// A human-readable label for knowing what layer your editing in the
     /// JSON file.
@@ -321,6 +354,19 @@ impl From<&DefyLayerData> for DefyKeymapLayer {
             left: DefyKeymapLeft::from(layer_data),
             right: DefyKeymapRight::from(layer_data),
         }
+    }
+}
+
+impl PartialEq for DefyKeymapLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.left == other.left && self.right == other.right
+    }
+}
+
+impl std::hash::Hash for DefyKeymapLayer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.left.hash(state);
+        self.right.hash(state);
     }
 }
 
@@ -392,10 +438,17 @@ impl DefyKeymapLayer {
     pub fn to_keymap_data(&self) -> [Option<KeyKind>; KEYS_PER_LAYER] {
         array::from_fn(|i| self.get_key_by_index(i as u8))
     }
+
+    /// Clears the entire layer to the provided key.
+    pub fn new_cleared_to(key: KeyKind) -> Self {
+        let keys: DefyLayerData = [key; KEYS_PER_LAYER];
+
+        DefyKeymapLayer::from(&keys)
+    }
 }
 
 /// Left half human-readable Defy keymap.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DefyKeymapLeft {
     /// Row 1.
     pub row_1: [KeyKind; 7],
@@ -434,7 +487,7 @@ impl From<&DefyLayerData> for DefyKeymapLeft {
 }
 
 /// Left Defy thumb cluster keymap.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DefyThumbclusterKeymapLeft {
     /// The top four keys of the thumb cluster, from left to right.
     pub top: [KeyKind; 4],
@@ -461,7 +514,7 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapLeft {
 }
 
 /// Right half human-readable Defy keymap.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DefyKeymapRight {
     /// Row 1.
     pub row_1: [KeyKind; 7],
@@ -500,7 +553,7 @@ impl From<&DefyLayerData> for DefyKeymapRight {
 }
 
 /// Left Defy thumb cluster keymap.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DefyThumbclusterKeymapRight {
     /// The top four keys of the thumb cluster, from left to right.
     pub top: [KeyKind; 4],

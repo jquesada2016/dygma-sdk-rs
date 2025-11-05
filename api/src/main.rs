@@ -4,7 +4,7 @@ extern crate derive_more;
 use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
-use dygma_cli::keycode_tables::KeyKind;
+use dygma_cli::keycode_tables::{Blank, KeyKind};
 use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use tokio::{
@@ -145,6 +145,23 @@ enum KeymapCommands {
         /// The path of the keymap file.
         path: PathBuf,
     },
+    /// Clears an entire layer, optionally with the specified key.
+    ///
+    /// This command does not automatically apply the change to the keyboard,
+    /// only to the keymap file.
+    ClearLayer {
+        /// The path of the keymap file.
+        path: PathBuf,
+        /// The layer number to clear. Index starts at 1.
+        ///
+        /// The layer number should match the `layer_number` shown in your keymap JSON
+        /// file after running the `keymap format` command.
+        #[clap(short, long)]
+        layer: u8,
+        /// The key to use to clear the layer.
+        #[arg(short, long, default_value_t = KeyKind::Blank(Blank::NoKey))]
+        key: KeyKind,
+    },
 }
 
 impl KeymapCommands {
@@ -187,6 +204,15 @@ impl KeymapCommands {
             }
             Self::Format { path } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
+
+                safe_pretty_json_file(&keymap, &path).await?;
+
+                Ok(())
+            }
+            Self::ClearLayer { path, layer, key } => {
+                let mut keymap = read_json_file::<DefyKeymap>(&path).await?;
+
+                keymap.clear_layer_to(layer as usize, key)?;
 
                 safe_pretty_json_file(&keymap, &path).await?;
 
