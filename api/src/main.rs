@@ -5,12 +5,17 @@ use clap::{Parser, Subcommand};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
+use error_stack::{IntoReport, ResultExt};
 use itertools::Itertools;
 use std::path::{Path, PathBuf};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
 };
+
+#[derive(Clone, Copy, Debug, Display, Error)]
+#[display("something went wrong running the command")]
+struct Error;
 
 /// CLI for programatically configuring and talking with your Dygma keyboard.
 ///
@@ -33,7 +38,7 @@ enum Cli {
 }
 
 impl Cli {
-    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::Command(cmd) => cmd.perform().await,
             Self::Keymap(cmd) => cmd.perform().await,
@@ -66,43 +71,61 @@ enum CommandCommands {
     },
     /// Lists available commands.
     List {
-        /// If provided, filters commands using this prefix.
-        prefix: Option<String>,
+        /// If provided, filters commands that contain this term.
+        term: Option<String>,
     },
 }
 
 impl CommandCommands {
-    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::Run { cmd, data } => {
-                let mut defy = DefyKeyboard::new().await?;
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
 
-                let available_cmds = defy.available_commands().await?;
+                let available_cmds = defy
+                    .available_commands()
+                    .await
+                    .change_context(Error)
+                    .attach("getting list of available commands")?;
 
                 if !available_cmds.contains(&cmd) {
-                    let suggestions = get_command_suggestions(&available_cmds, &cmd);
+                    let suggestions = get_command_suggestions(&available_cmds, &cmd)
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect();
 
-                    eprintln!("`{cmd}` is not a valid command");
-                    eprintln!("did you mean one of these? {}", suggestions.join(", "));
-
-                    return Err(RunCommandError.into());
+                    return Err(RunCommandError { cmd, suggestions }
+                        .into_report()
+                        .change_context(Error));
                 }
 
-                let res = defy.run_command(&cmd, data.as_deref()).await?;
+                let res = defy
+                    .run_command(&cmd, data.as_deref())
+                    .await
+                    .change_context(Error)
+                    .attach_with(|| format!("running `{cmd}` command"))?;
 
                 println!("{res}");
 
                 Ok(())
             }
-            Self::List { prefix } => {
-                let mut defy = DefyKeyboard::new().await?;
+            Self::List { term } => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
 
                 defy.available_commands()
-                    .await?
+                    .await
+                    .change_context(Error)
+                    .attach("getting list of available commands")?
                     .into_iter()
                     .filter(|cmd| {
-                        if let Some(prefix) = prefix.as_ref() {
-                            cmd.starts_with(prefix)
+                        if let Some(term) = term.as_ref() {
+                            cmd.contains(term)
                         } else {
                             true
                         }
@@ -165,15 +188,24 @@ enum KeymapCommands {
 }
 
 impl KeymapCommands {
-    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::New { keymap, path } => {
                 let keymap = if let Some(keymap) = keymap {
-                    keymap.parse::<DefyKeymap>()?
+                    keymap
+                        .parse::<DefyKeymap>()
+                        .change_context(Error)
+                        .attach("parsing keymap JSON file")?
                 } else {
-                    let mut defy = DefyKeyboard::new().await?;
+                    let mut defy = DefyKeyboard::new()
+                        .await
+                        .change_context(Error)
+                        .attach("connecting to the Defy keyboard")?;
 
-                    defy.get_custom_keymap().await?
+                    defy.get_custom_keymap()
+                        .await
+                        .change_context(Error)
+                        .attach("getting the custom keymap from the Defy")?
                 };
 
                 safe_pretty_json_file(&keymap, &path).await?;
@@ -183,7 +215,10 @@ impl KeymapCommands {
             Self::ToCommandData { path } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
-                let data = keymap.to_keymap_custom_data()?;
+                let data = keymap
+                    .to_keymap_custom_data()
+                    .change_context(Error)
+                    .attach("serializing keymap into command data")?;
 
                 println!("{data}");
 
@@ -192,9 +227,15 @@ impl KeymapCommands {
             Self::Apply { path } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
-                let mut defy = DefyKeyboard::new().await?;
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
 
-                defy.apply_custom_keymap(&keymap).await?;
+                defy.apply_custom_keymap(&keymap)
+                    .await
+                    .change_context(Error)
+                    .attach("applying the keymap to the Defy")?;
 
                 // TODO: make this configurable
                 // Overwrite the keymap file to ensure file remains prettified
@@ -212,7 +253,10 @@ impl KeymapCommands {
             Self::ClearLayer { path, layer, key } => {
                 let mut keymap = read_json_file::<DefyKeymap>(&path).await?;
 
-                keymap.clear_layer_to(layer as usize, key)?;
+                keymap
+                    .clear_layer_to(layer as usize, key)
+                    .change_context(Error)
+                    .attach_with(|| format!("clearing the `{layer}` layer to key `{key}`"))?;
 
                 safe_pretty_json_file(&keymap, &path).await?;
 
@@ -254,15 +298,24 @@ enum SuperkeyCommands {
 }
 
 impl SuperkeyCommands {
-    async fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::New { superkeys, path } => {
                 let map = if let Some(superkeys) = superkeys {
-                    superkeys.parse::<SuperkeyMap>()?
+                    superkeys
+                        .parse::<SuperkeyMap>()
+                        .change_context(Error)
+                        .attach("parsing superkeys JSON file")?
                 } else {
-                    let mut defy = DefyKeyboard::new().await?;
+                    let mut defy = DefyKeyboard::new()
+                        .await
+                        .change_context(Error)
+                        .attach("connecting to the Defy keyboard")?;
 
-                    defy.get_superkeys().await?
+                    defy.get_superkeys()
+                        .await
+                        .change_context(Error)
+                        .attach("getting superkeys from the Defy")?
                 };
 
                 safe_pretty_json_file(&map, &path).await?;
@@ -273,7 +326,9 @@ impl SuperkeyCommands {
                 let map = read_json_file::<SuperkeyMap>(&path).await?;
 
                 let str_data = parsing::superkeys::SuperkeyMap::from(&map)
-                    .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()?;
+                    .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()
+                    .change_context(Error)
+                    .attach("serializing superkeys to command data")?;
 
                 println!("{str_data}");
 
@@ -282,9 +337,15 @@ impl SuperkeyCommands {
             Self::Apply { path } => {
                 let map = read_json_file::<SuperkeyMap>(&path).await?;
 
-                let mut defy = DefyKeyboard::new().await?;
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
 
-                defy.apply_superkeys(&map).await?;
+                defy.apply_superkeys(&map)
+                    .await
+                    .change_context(Error)
+                    .attach("applying superkeys to the Defy")?;
 
                 // TODO: Make this configurable
                 // We override the original config file to make sure everything stays
@@ -335,7 +396,7 @@ enum KeyCodeCommands {
 }
 
 impl KeyCodeCommands {
-    fn perform(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::Describe { code } => {
                 let key = KeyKind::from(code);
@@ -379,15 +440,21 @@ impl KeyCodeCommands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), error_stack::Report<Error>> {
     Cli::parse().perform().await?;
 
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Display, Error)]
-#[display("failed to run command")]
-struct RunCommandError;
+#[derive(Clone, Debug, Display, Error)]
+#[display(
+    "failed to run command: `{cmd}` is not a valid command, did you mean one of these? {}",
+    suggestions.join(", ")
+)]
+struct RunCommandError {
+    cmd: String,
+    suggestions: Vec<String>,
+}
 
 /// Utility function for getting possible commands the user might
 /// have intended to write, but did not.
@@ -414,32 +481,58 @@ fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &str) -
         .collect::<Vec<_>>()
 }
 
-async fn read_json_file<T>(path: &Path) -> Result<T, Box<dyn std::error::Error>>
+async fn read_json_file<T>(path: &Path) -> Result<T, error_stack::Report<Error>>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let file = File::open(path).await?;
+    let file = File::open(path)
+        .await
+        .change_context(Error)
+        .attach("opening the file")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
 
     let mut data = vec![];
 
-    BufReader::new(file).read_to_end(&mut data).await?;
+    BufReader::new(file)
+        .read_to_end(&mut data)
+        .await
+        .change_context(Error)
+        .attach("reading file contents")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
 
-    serde_json::from_reader::<_, T>(data.as_slice()).map_err(Into::into)
+    serde_json::from_reader::<_, T>(data.as_slice())
+        .change_context(Error)
+        .attach("parsing file contents")
+        .attach_with(|| path.to_string_lossy().into_owned())
 }
 
-async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), Box<dyn std::error::Error>>
+async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), error_stack::Report<Error>>
 where
     T: serde::Serialize,
 {
-    let file = File::create(path).await?;
+    let file = File::create(path)
+        .await
+        .change_context(Error)
+        .attach("creating file")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
 
     let mut writer = BufWriter::new(file);
 
-    let data = serde_json::to_vec_pretty(data)?;
+    let data = serde_json::to_vec_pretty(data).unwrap();
 
-    writer.write_all(&data).await?;
+    writer
+        .write_all(&data)
+        .await
+        .change_context(Error)
+        .attach("writing data to the file")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
 
-    writer.flush().await?;
+    writer
+        .flush()
+        .await
+        .change_context(Error)
+        .attach("flushing data to the file")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
 
     Ok(())
 }
