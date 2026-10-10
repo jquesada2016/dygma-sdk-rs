@@ -28,7 +28,7 @@ The only fancy thing going on in this project is the Rust macro crate that is
 used to define and generate key kinds, which are used in keymaps, superkeys,
 and macros.
 
-You can find the [key definitions here](/api/src/parsing/keymap/keycode_tables.rs).
+You can find the [key definitions here](/api/src/focus_api/parsing/keymap/keycode_tables.rs).
 
 # Building and Running
 
@@ -49,7 +49,7 @@ The following command will read the keymap on your Defy and save it to a file
 called `keymap.json`:
 
 ```sh
-Dcargo r -- keymap new keymap.json
+cargo r -- keymap new keymap.json
 ```
 
 The following command will get a list of available commands on the device
