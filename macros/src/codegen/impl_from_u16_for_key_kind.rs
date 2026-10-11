@@ -20,6 +20,11 @@ impl<'a> ToTokens for ImplFromU16ForKeyKind<'a> {
         let token_stream = quote! {
           impl From<u16> for KeyKind {
             fn from(code: u16) -> Self {
+              // Load-bearing until the `shift_symbols` family is
+              // deduplicated (its keys collide with generated `Shift`
+              // modifier variants; see `ir::abort_on_duplicate_codes`,
+              // which hard-errors on every duplicate not involving
+              // `shift_symbols`).
               #[allow(unreachable_patterns)]
               match code {
                 #( #tables ),*,

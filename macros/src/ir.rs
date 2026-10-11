@@ -1,5 +1,6 @@
 use crate::{ast, lit_int_to_u16};
 use itertools::Itertools;
+use std::collections::HashMap;
 
 struct KeyCodeOverflowsU16Error;
 
@@ -7,9 +8,78 @@ pub struct Ir(pub Vec<KeyTable>);
 
 impl From<ast::Ast> for Ir {
     fn from(ast: ast::Ast) -> Self {
-        let tables = ast.0.into_iter().map(KeyTable::from).collect();
+        let tables: Vec<KeyTable> = ast.0.into_iter().map(KeyTable::from).collect();
+
+        abort_on_duplicate_codes(&tables);
 
         Self(tables)
+    }
+}
+
+/// Every generated key ends up as a match arm on the same `u16`, so two
+/// keys sharing a code would silently make one of them unreachable.
+/// Aborts the compile, pointing at the second key, when a code repeats.
+///
+/// The one exemption is `shift_symbols`, whose keys intentionally
+/// duplicate codes that are also generated as `Shift` modifier variants
+/// of `symbols` keys (e.g. `Underscore = 2093` is the `Shift` variant of
+/// `symbols::Dash`, `-`). The table is declared before `symbols`, so
+/// first-match-wins resolves those codes to the named `shift_symbols`
+/// keys — mirroring Bazecor, which renders 2093 as "_" — leaving the
+/// generated `Shift` arms the genuinely unreachable ones (hence the
+/// `#[allow(unreachable_patterns)]` on the `From<u16> for KeyKind`
+/// match).
+///
+/// Note the scope of that exemption: cross-table duplicates involving
+/// `shift_symbols` compile silently against *any* other table, not just
+/// `symbols`. Intra-table duplicates still abort. This is interim — the
+/// exemption, and the `#[allow]` above, go away entirely once the dead
+/// `Shift` variants are dropped (issue #14).
+fn abort_on_duplicate_codes(tables: &[KeyTable]) {
+    let mut first_key_by_code: HashMap<u16, String> = HashMap::new();
+
+    for table in tables {
+        if table.name == "shift_symbols" {
+            abort_on_intra_table_duplicates(table);
+            continue;
+        }
+
+        check_table_for_duplicates(table, &mut first_key_by_code);
+    }
+}
+
+/// Aborts the compile when two keys within the same table share a code.
+///
+/// Used for the cross-table-exempted `shift_symbols` table, where an
+/// intra-table duplicate would still be silently unreachable.
+fn abort_on_intra_table_duplicates(table: &KeyTable) {
+    check_table_for_duplicates(table, &mut HashMap::new());
+}
+
+/// Checks `table`'s keys against `seen`, aborting the compile when a key
+/// repeats a code — either from an earlier key of the same table, or
+/// (when `seen` is carried across tables) from an earlier table.
+fn check_table_for_duplicates(table: &KeyTable, seen: &mut HashMap<u16, String>) {
+    let keys = table
+        .keys
+        .iter()
+        .chain(&table.keys_with_modifiers)
+        .chain(&table.keys_with_dual_functions);
+
+    for key in keys {
+        let code = lit_int_to_u16(&key.code);
+        let name = format!("{}::{}", table.name, key.name);
+
+        if let Some(first_name) = seen.insert(code, name.clone()) {
+            abort!(
+                key.code.span(),
+                "duplicate key code {}: `{}` collides with `{}`",
+                code,
+                name,
+                first_name;
+                help = "every key must have a unique code"
+            );
+        }
     }
 }
 
@@ -101,7 +171,7 @@ impl Key {
             .iter()
             .copied()
             .map(|modifier| modifier.as_modifier_value())
-            .fold(0, std::ops::Add::add);
+            .sum::<u16>();
 
         let code_u16 = lit_int_to_u16(code)
             .checked_add(modifier_value)

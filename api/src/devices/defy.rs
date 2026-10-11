@@ -3,7 +3,7 @@
 
 use crate::{
     focus_api::{
-        CreateHidFoducApiError, FocusApiConnection, HidFocusApi, RunCommandError,
+        CreateHidFocusApiError, FocusApiConnection, HidFocusApi, RunCommandError,
         SerialPortFocusApi, parsing,
     },
     keycode_tables::KeyKind,
@@ -17,7 +17,7 @@ mod error {
     /// Error returned when creating a handle to the keyboard.
     #[derive(Debug, Display, From, Error)]
     #[display("failed to create handle to the Dygma Defy keyboard: {_0}")]
-    pub struct CreateDefyKeyboardError(CreateHidFoducApiError);
+    pub struct CreateDefyKeyboardError(CreateHidFocusApiError);
 
     /// Error when parsing a keymap from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
@@ -28,6 +28,11 @@ mod error {
     #[derive(Clone, Debug, Display, From, Error)]
     #[display("failed to parse superkeys map: {_0}")]
     pub struct ParseSuperkeyMapError(parsing::superkeys::ParseSuperkeyMapError);
+
+    /// Error when parsing a macro map from a string slice.
+    #[derive(Clone, Debug, Display, From, Error)]
+    #[display("failed to parse macros map: {_0}")]
+    pub struct ParseMacroMapError(parsing::macros::ParseMacroMapError);
 
     /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
     /// creating the command data.
@@ -75,6 +80,41 @@ mod error {
         /// Command failed to run.
         #[display("{_0}")]
         CommandFailed(RunCommandError),
+    }
+
+    /// Error returned from [`DefyKeyboard::get_macros`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetMacroMapError {
+        /// Failed to run command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// Macro map returned by the keyboard failed to parse.
+        MacroMapParsingFailure(ParseMacroMapError),
+    }
+
+    /// Error returned from [`DefyKeyboard::apply_macros`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum ApplyMacroError {
+        /// Too many macros were in the map to fit in the macro memory.
+        #[display("{_0}")]
+        TooManyMacros(parsing::macros::TooManyMacrosError),
+        /// A key code was too large for a single-byte macro action.
+        #[display("{_0}")]
+        KeyCodeTooLarge(parsing::macros::KeyCodeTooLargeError),
+        /// Command failed to run.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+    }
+
+    impl From<parsing::macros::ToCommandDataError> for ApplyMacroError {
+        fn from(err: parsing::macros::ToCommandDataError) -> Self {
+            match err {
+                parsing::macros::ToCommandDataError::TooManyMacros(err) => Self::TooManyMacros(err),
+                parsing::macros::ToCommandDataError::KeyCodeTooLarge(err) => {
+                    Self::KeyCodeTooLarge(err)
+                }
+            }
+        }
     }
 
     /// Possible errors when clearing a [`DefyKeymap`] layer.
@@ -135,9 +175,13 @@ impl DefyKeyboard {
 
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
+    const MACRO_MAP_COMMAND_NAME: &str = "macros.map";
 
     /// The memory size of the superkey map.
     pub const SUPERKEY_MEMORY_SIZE: usize = 512;
+
+    /// The memory size of the macro map.
+    pub const MACRO_MEMORY_SIZE: usize = 2048;
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
@@ -194,6 +238,27 @@ impl DefyKeyboard {
             .parse::<SuperkeyMap>()?;
 
         Ok(map)
+    }
+
+    /// Get the macros from the keyboard.
+    pub async fn get_macros(&mut self) -> Result<MacroMap, GetMacroMapError> {
+        let map = self
+            .run_command(Self::MACRO_MAP_COMMAND_NAME, None)
+            .await?
+            .parse::<MacroMap>()?;
+
+        Ok(map)
+    }
+
+    /// Apply the macros to the keyboard.
+    pub async fn apply_macros(&mut self, macros: &MacroMap) -> Result<(), ApplyMacroError> {
+        let data = parsing::macros::MacroMap::from(macros)
+            .to_command_data::<{ Self::MACRO_MEMORY_SIZE }>()?;
+
+        self.run_command(Self::MACRO_MAP_COMMAND_NAME, Some(&data))
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -674,6 +739,137 @@ impl From<Superkey> for parsing::superkeys::Superkey {
     }
 }
 
+/// Holds a macro map.
+#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, Deserialize)]
+pub struct MacroMap(pub Vec<Macro>);
+
+impl serde::Serialize for MacroMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, m)| Macro {
+                macro_number: i as u8 + 1,
+                actions: m.actions.clone(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+}
+
+impl FromStr for MacroMap {
+    type Err = ParseMacroMapError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let map = s
+            .parse::<parsing::macros::MacroMap>()?
+            .0
+            .into_iter()
+            .enumerate()
+            .map(|(i, macro_data)| Macro {
+                macro_number: i as u8 + 1,
+                actions: macro_data.actions.into_iter().map(Into::into).collect(),
+            })
+            .collect();
+
+        Ok(Self(map))
+    }
+}
+
+impl From<&MacroMap> for parsing::macros::MacroMap {
+    fn from(map: &MacroMap) -> Self {
+        Self(
+            map.0
+                .iter()
+                .map(|m| parsing::macros::Macro {
+                    actions: m.actions.iter().copied().map(Into::into).collect(),
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Represents a single macro.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Macro {
+    /// User-facing ID used to make reading the macro map easier.
+    ///
+    /// **Note**: This is purely for UX. When deserializing, the ID the user
+    /// writes is entirely ignored. The idea is that you define the macros
+    /// you want, and use this number to know what [`KeyKind`] to use to
+    /// assign the particular macro to a key.
+    #[serde(skip_deserializing)]
+    pub macro_number: u8,
+    /// The actions this macro will perform.
+    pub actions: Vec<MacroAction>,
+}
+
+/// The possible actions a macro can perform.
+///
+/// The firmware has two flavors of key actions: ones carrying a full u16
+/// key code, and ones carrying the key code in a single byte, which can
+/// only refer to keys without modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MacroAction {
+    /// Applies a random delay between the min and max range, in ms.
+    Interval {
+        /// The minimum delay amount in ms.
+        min: u16,
+        /// The maximum delay amount in ms.
+        max: u16,
+    },
+    /// Waits for a fixed amount of ms.
+    Wait(u16),
+    /// Holds down the key. Carries a full u16 key code.
+    KeyDown(KeyKind),
+    /// Releases the held key. Carries a full u16 key code.
+    KeyUp(KeyKind),
+    /// Taps the key. Carries a full u16 key code.
+    Tap(KeyKind),
+    /// Holds down the key. Carries the key code in a single byte, so only
+    /// keys without modifiers can be used.
+    KeyCodeDown(KeyKind),
+    /// Releases the held key. Carries the key code in a single byte, so
+    /// only keys without modifiers can be used.
+    KeyCodeUp(KeyKind),
+    /// Taps the key. Carries the key code in a single byte, so only keys
+    /// without modifiers can be used.
+    TapCode(KeyKind),
+}
+
+impl From<parsing::macros::MacroAction> for MacroAction {
+    fn from(action: parsing::macros::MacroAction) -> Self {
+        match action {
+            parsing::macros::MacroAction::Interval { min, max } => Self::Interval { min, max },
+            parsing::macros::MacroAction::Wait(delay) => Self::Wait(delay),
+            parsing::macros::MacroAction::KeyDown(key) => Self::KeyDown(key),
+            parsing::macros::MacroAction::KeyUp(key) => Self::KeyUp(key),
+            parsing::macros::MacroAction::Tap(key) => Self::Tap(key),
+            parsing::macros::MacroAction::KeyCodeDown(key) => Self::KeyCodeDown(key),
+            parsing::macros::MacroAction::KeyCodeUp(key) => Self::KeyCodeUp(key),
+            parsing::macros::MacroAction::TapCode(key) => Self::TapCode(key),
+        }
+    }
+}
+
+impl From<MacroAction> for parsing::macros::MacroAction {
+    fn from(action: MacroAction) -> Self {
+        match action {
+            MacroAction::Interval { min, max } => Self::Interval { min, max },
+            MacroAction::Wait(delay) => Self::Wait(delay),
+            MacroAction::KeyDown(key) => Self::KeyDown(key),
+            MacroAction::KeyUp(key) => Self::KeyUp(key),
+            MacroAction::Tap(key) => Self::Tap(key),
+            MacroAction::KeyCodeDown(key) => Self::KeyCodeDown(key),
+            MacroAction::KeyCodeUp(key) => Self::KeyCodeUp(key),
+            MacroAction::TapCode(key) => Self::TapCode(key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -754,5 +950,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(format!("{str_data} "), SUPERKEY_DATA);
+    }
+
+    #[test]
+    fn macros_round_trips_from_str() {
+        // A real-shaped map exercising both key action flavors: a
+        // single-byte key down of `A` and a 300 ms wait, followed by a
+        // full u16 key down of the mute key, a full u16 tap of `A`, and a
+        // random interval of 100 to 300 ms.
+        let data = "6 4 2 1 44 0 3 76 226 5 0 4 1 0 100 1 44 0 0 ";
+
+        let map = data.parse::<MacroMap>().unwrap();
+
+        assert_eq!(map.0[0].macro_number, 1);
+        assert_eq!(map.0[1].macro_number, 2);
+
+        let str_data = parsing::macros::MacroMap::from(&map)
+            .to_command_data::<19>()
+            .unwrap();
+
+        assert_eq!(format!("{str_data} "), data);
+    }
+
+    #[test]
+    fn macros_json_round_trips() {
+        let map = "6 4 0 8 44 0 0 ".parse::<MacroMap>().unwrap();
+
+        let json = serde_json::to_string(&map).unwrap();
+
+        assert!(json.contains(r#""macro_number":1"#));
+        assert!(json.contains(r#""macro_number":2"#));
+
+        let parsed: MacroMap = serde_json::from_str(&json).unwrap();
+
+        let actions: Vec<_> = parsed.0.iter().map(|m| m.actions.clone()).collect();
+        let expected: Vec<_> = map.0.iter().map(|m| m.actions.clone()).collect();
+
+        assert_eq!(actions, expected);
     }
 }

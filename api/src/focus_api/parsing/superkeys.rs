@@ -6,7 +6,7 @@ use std::str::FromStr;
 use winnow::{
     ModalResult, Parser,
     ascii::{dec_uint, space1},
-    combinator::{repeat, repeat_till, terminated},
+    combinator::{repeat_till, terminated},
     token::rest,
 };
 

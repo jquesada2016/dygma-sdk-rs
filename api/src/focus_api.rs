@@ -107,7 +107,7 @@ pub struct CreateSerialPortFocusApiError(OpenSerialPortError);
 
 /// Error returned when creating a [`HidFocusApi`].
 #[derive(Debug, Display, Error)]
-pub enum CreateHidFoducApiError {
+pub enum CreateHidFocusApiError {
     #[display("failed to enumerate HID devices: [_0]")]
     /// Something went wrong enumerating available HID devices.
     EnumeratingFailure(async_hid::HidError),
@@ -239,13 +239,13 @@ impl HidFocusApi {
     const MAX_SEND_SIZE: usize = 200;
 
     /// Opens a connection to the requested Dygma device.
-    pub async fn new(product_id: u16) -> Result<Self, CreateHidFoducApiError> {
+    pub async fn new(product_id: u16) -> Result<Self, CreateHidFocusApiError> {
         let backend = async_hid::HidBackend::default();
 
         let device_stream = backend
             .enumerate()
             .await
-            .map_err(CreateHidFoducApiError::EnumeratingFailure)?
+            .map_err(CreateHidFocusApiError::EnumeratingFailure)?
             .filter(|device| {
                 device.matches(
                     Self::USAGE_PAGE,
@@ -260,12 +260,12 @@ impl HidFocusApi {
         let device = device_stream
             .next()
             .await
-            .ok_or(CreateHidFoducApiError::DeviceNotFound)?;
+            .ok_or(CreateHidFocusApiError::DeviceNotFound)?;
 
         let (reader, writer) = device
             .open()
             .await
-            .map_err(CreateHidFoducApiError::ConnectingToDevice)?;
+            .map_err(CreateHidFocusApiError::ConnectingToDevice)?;
 
         eprintln!(
             "Warning:\n\

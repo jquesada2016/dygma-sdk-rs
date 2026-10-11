@@ -239,6 +239,41 @@ macros::generate_keycode_tables! {
     F23,
     F24,
   },
+  // [`Symbols`] keys with the `Shift` key applied.
+  //
+  // Declared BEFORE `symbols`: their codes are the `Shift` modifier
+  // variants of `symbols` keys (e.g. `Underscore = 2093` is
+  // `Shift + -`), and the generated `From<u16>` match resolves
+  // first-match-wins in DSL order. Declared first, these named keys win
+  // and render like Bazecor's (its DB substitutes shifted punctuation,
+  // rendering 2093 as "_").
+  /// Shift symbols.
+  shift_symbols: {
+    /// _
+    Underscore = 2093,
+    /// +
+    Plus,
+    /// {
+    BraceLeft,
+    /// }
+    BraceRight,
+    /// |
+    Pipe,
+    /// :
+    Colon = 2099,
+    /// "
+    DoubleQuote,
+    /// ~
+    Tilde,
+    /// <
+    LT,
+    /// >
+    GT,
+    /// ?
+    QuestionMark,
+    /// Non-U.S. |
+    AltPipe = 2148,
+  },
   /// Keyboard symbols, like `!`, `(`, `[`, etc.
   #[with_modifiers]
   #[with_dual_functions]
@@ -269,33 +304,6 @@ macros::generate_keycode_tables! {
     CapsLock,
     /// ISO <>
     IsoGTLT = 100,
-  },
-  /// [`Symbols`] keys with the `Shift` key applied.
-  shift_symbols: {
-    /// _
-    Underscore = 2093,
-    /// +
-    Plus,
-    /// {
-    BraceLeft,
-    /// }
-    BraceRight,
-    /// |
-    Pipe,
-    /// :
-    Colon = 2099,
-    /// "
-    DoubleQuote,
-    /// ~
-    Tilde,
-    /// <
-    LT,
-    /// >
-    GT,
-    /// ?
-    QuestionMark,
-    /// Non-U.S. |
-    AltPipe = 2148,
   },
   /// Modifier keys.
   #[with_modifiers]
@@ -1072,4 +1080,64 @@ macros::generate_keycode_tables! {
     /// Super Key 128
     Super128,
       },
+  /// Leader keys.
+  leader: {
+    /// Leader 0
+    Leader0 = 53283,
+    /// Leader 1
+    Leader1,
+    /// Leader 2
+    Leader2,
+    /// Leader 3
+    Leader3,
+    /// Leader 4
+    Leader4,
+    /// Leader 5
+    Leader5,
+    /// Leader 6
+    Leader6,
+    /// Leader 7
+    Leader7,
+  },
+  // Only 16 tap dance slots exist on the firmware (53267-53282): the
+  // codes right after them are the leader keys above, followed by CYCLE
+  // (53291) and SYSTER (53292), which are commented out (disabled) in
+  // Bazecor's DB. Bazecor's own DB carries 64 Chrysalis-inherited
+  // tapdance slots that collide with the leader keys, resolved there by
+  // last-write-wins toward Leader; we only model the non-colliding range.
+  /// Tap dance keys.
+  tap_dance: {
+    /// TapDance 0
+    TapDance0 = 53267,
+    /// TapDance 1
+    TapDance1,
+    /// TapDance 2
+    TapDance2,
+    /// TapDance 3
+    TapDance3,
+    /// TapDance 4
+    TapDance4,
+    /// TapDance 5
+    TapDance5,
+    /// TapDance 6
+    TapDance6,
+    /// TapDance 7
+    TapDance7,
+    /// TapDance 8
+    TapDance8,
+    /// TapDance 9
+    TapDance9,
+    /// TapDance 10
+    TapDance10,
+    /// TapDance 11
+    TapDance11,
+    /// TapDance 12
+    TapDance12,
+    /// TapDance 13
+    TapDance13,
+    /// TapDance 14
+    TapDance14,
+    /// TapDance 15
+    TapDance15,
+  },
 }

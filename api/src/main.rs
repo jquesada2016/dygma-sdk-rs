@@ -2,7 +2,7 @@
 extern crate derive_more;
 
 use clap::{Parser, Subcommand};
-use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, SuperkeyMap};
+use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
 use error_stack::{IntoReport, ResultExt};
@@ -32,6 +32,9 @@ enum Cli {
     /// Commands for working with superkeys.
     #[command(subcommand)]
     Superkeys(SuperkeyCommands),
+    /// Commands for working with macros.
+    #[command(subcommand)]
+    Macros(MacroCommands),
     /// Commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCode(KeyCodeCommands),
@@ -43,6 +46,7 @@ impl Cli {
             Self::Command(cmd) => cmd.perform().await,
             Self::Keymap(cmd) => cmd.perform().await,
             Self::Superkeys(cmd) => cmd.perform().await,
+            Self::Macros(cmd) => cmd.perform().await,
             Self::KeyCode(cmd) => cmd.perform(),
         }
     }
@@ -167,6 +171,13 @@ enum KeymapCommands {
     Apply {
         /// The path of the keymap file.
         path: PathBuf,
+        /// Do not rewrite the keymap file after applying.
+        ///
+        /// By default, the file is rewritten canonically after a
+        /// successful apply, keeping it prettified and its layer numbers
+        /// up to date. This flag leaves your file untouched.
+        #[clap(long, default_value_t = false)]
+        no_write: bool,
     },
     /// Clears an entire layer, optionally with the specified key.
     ///
@@ -224,7 +235,7 @@ impl KeymapCommands {
 
                 Ok(())
             }
-            Self::Apply { path } => {
+            Self::Apply { path, no_write } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
                 let mut defy = DefyKeyboard::new()
@@ -237,9 +248,10 @@ impl KeymapCommands {
                     .change_context(Error)
                     .attach("applying the keymap to the Defy")?;
 
-                // TODO: make this configurable
-                // Overwrite the keymap file to ensure file remains prettified
-                safe_pretty_json_file(&keymap, &path).await?;
+                if !no_write {
+                    // Overwrite the keymap file to ensure file remains prettified
+                    safe_pretty_json_file(&keymap, &path).await?;
+                }
 
                 Ok(())
             }
@@ -290,10 +302,17 @@ enum SuperkeyCommands {
         /// The path of the keymap JSON file.
         path: PathBuf,
     },
-    /// Apply the keymap to the keyboard.
+    /// Apply the superkeys to the keyboard.
     Apply {
-        /// The path of the keymap file.
+        /// The path of the superkeys file.
         path: PathBuf,
+        /// Do not rewrite the superkeys file after applying.
+        ///
+        /// By default, the file is rewritten canonically after a
+        /// successful apply, keeping it prettified and its superkey
+        /// numbers up to date. This flag leaves your file untouched.
+        #[clap(long, default_value_t = false)]
+        no_write: bool,
     },
 }
 
@@ -334,7 +353,7 @@ impl SuperkeyCommands {
 
                 Ok(())
             }
-            Self::Apply { path } => {
+            Self::Apply { path, no_write } => {
                 let map = read_json_file::<SuperkeyMap>(&path).await?;
 
                 let mut defy = DefyKeyboard::new()
@@ -347,15 +366,126 @@ impl SuperkeyCommands {
                     .change_context(Error)
                     .attach("applying superkeys to the Defy")?;
 
-                // TODO: Make this configurable
-                // We override the original config file to make sure everything stays
-                // nice and prettified
-                safe_pretty_json_file(&map, &path).await?;
+                if !no_write {
+                    // We override the original config file to make sure everything
+                    // stays nice and prettified
+                    safe_pretty_json_file(&map, &path).await?;
+                }
 
                 Ok(())
             }
             Self::Format { path } => {
                 let map = read_json_file::<SuperkeyMap>(&path).await?;
+
+                safe_pretty_json_file(&map, &path).await?;
+
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum MacroCommands {
+    /// Create a new macros config file.
+    New {
+        /// The raw macros string found in the bazecor config file.
+        ///
+        /// If omitted, will attempt to read it from the keyboard.
+        #[clap(short, long)]
+        macros: Option<String>,
+        /// The path the macros will be saved to.
+        #[clap(default_value = "macros.json")]
+        path: PathBuf,
+    },
+    /// Formats the macros JSON file.
+    Format {
+        /// The path of the macros JSON file.
+        #[clap(default_value = "macros.json")]
+        path: PathBuf,
+    },
+    /// Reads a macros file and outputs it as a raw macros data string that
+    /// can be used to send to the keyboard.
+    ToCommandData {
+        /// The path of the macros JSON file.
+        #[clap(default_value = "macros.json")]
+        path: PathBuf,
+    },
+    /// Apply the macros to the keyboard.
+    Apply {
+        /// The path of the macros file.
+        #[clap(default_value = "macros.json")]
+        path: PathBuf,
+        /// Do not rewrite the macros file after applying.
+        ///
+        /// By default, the file is rewritten canonically after a
+        /// successful apply, keeping it prettified and its macro numbers
+        /// up to date. This flag leaves your file untouched.
+        #[clap(long, default_value_t = false)]
+        no_write: bool,
+    },
+}
+
+impl MacroCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::New { macros, path } => {
+                let map = if let Some(macros) = macros {
+                    macros
+                        .parse::<MacroMap>()
+                        .change_context(Error)
+                        .attach("parsing macros string")?
+                } else {
+                    let mut defy = DefyKeyboard::new()
+                        .await
+                        .change_context(Error)
+                        .attach("connecting to the Defy keyboard")?;
+
+                    defy.get_macros()
+                        .await
+                        .change_context(Error)
+                        .attach("getting macros from the Defy")?
+                };
+
+                safe_pretty_json_file(&map, &path).await?;
+
+                Ok(())
+            }
+            Self::ToCommandData { path } => {
+                let map = read_json_file::<MacroMap>(&path).await?;
+
+                let str_data = parsing::macros::MacroMap::from(&map)
+                    .to_command_data::<{ DefyKeyboard::MACRO_MEMORY_SIZE }>()
+                    .change_context(Error)
+                    .attach("serializing macros to command data")?;
+
+                println!("{str_data}");
+
+                Ok(())
+            }
+            Self::Apply { path, no_write } => {
+                let map = read_json_file::<MacroMap>(&path).await?;
+
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                defy.apply_macros(&map)
+                    .await
+                    .change_context(Error)
+                    .attach("applying macros to the Defy")?;
+
+                if !no_write {
+                    // We override the original config file to make sure everything
+                    // stays nice and prettified
+                    safe_pretty_json_file(&map, &path).await?;
+                }
+
+                Ok(())
+            }
+            Self::Format { path } => {
+                let map = read_json_file::<MacroMap>(&path).await?;
 
                 safe_pretty_json_file(&map, &path).await?;
 
@@ -406,10 +536,27 @@ impl KeyCodeCommands {
                 Ok(())
             }
             Self::DescribeSequence { keys } => {
-                let keys = keys
+                let parsed = keys
                     .split(' ')
                     .filter(|seq| !seq.is_empty())
-                    .map(|seq| seq.parse::<u16>().unwrap())
+                    .map(|seq| {
+                        seq.parse::<u16>()
+                            .map_err(|_| InvalidKeyCodeError(seq.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+
+                let keys = match parsed {
+                    Ok(keys) => keys,
+                    Err(err) => {
+                        return Err(err
+                            .into_report()
+                            .change_context(Error)
+                            .attach("describing the key code sequence; each key must be a u16"));
+                    }
+                };
+
+                let keys = keys
+                    .into_iter()
                     .map(KeyKind::from)
                     .map(|key| key.to_string())
                     .join(" ");
@@ -455,6 +602,10 @@ struct RunCommandError {
     cmd: String,
     suggestions: Vec<String>,
 }
+
+#[derive(Clone, Debug, Display, Error)]
+#[display("`{_0}` is not a valid u16 key code")]
+struct InvalidKeyCodeError(#[error(not(source))] String);
 
 /// Utility function for getting possible commands the user might
 /// have intended to write, but did not.
