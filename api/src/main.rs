@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate derive_more;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
@@ -35,6 +35,9 @@ enum Cli {
     /// Commands for working with macros.
     #[command(subcommand)]
     Macros(MacroCommands),
+    /// Commands for working with device settings and identity.
+    #[command(subcommand)]
+    Settings(SettingsCommands),
     /// Commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCode(KeyCodeCommands),
@@ -47,6 +50,7 @@ impl Cli {
             Self::Keymap(cmd) => cmd.perform().await,
             Self::Superkeys(cmd) => cmd.perform().await,
             Self::Macros(cmd) => cmd.perform().await,
+            Self::Settings(cmd) => cmd.perform().await,
             Self::KeyCode(cmd) => cmd.perform(),
         }
     }
@@ -410,6 +414,13 @@ enum MacroCommands {
         /// The path of the macros JSON file.
         #[clap(default_value = "macros.json")]
         path: PathBuf,
+        /// The device's macro map memory size.
+        ///
+        /// The real value is probed from the device with the
+        /// `macros.memory` command when applying; when serializing
+        /// offline, this defaults to the stock 2048.
+        #[clap(long, default_value_t = DefyKeyboard::MACRO_MEMORY_SIZE as u16)]
+        memory: u16,
     },
     /// Apply the macros to the keyboard.
     Apply {
@@ -451,11 +462,11 @@ impl MacroCommands {
 
                 Ok(())
             }
-            Self::ToCommandData { path } => {
+            Self::ToCommandData { path, memory } => {
                 let map = read_json_file::<MacroMap>(&path).await?;
 
                 let str_data = parsing::macros::MacroMap::from(&map)
-                    .to_command_data::<{ DefyKeyboard::MACRO_MEMORY_SIZE }>()
+                    .to_command_data(usize::from(memory))
                     .change_context(Error)
                     .attach("serializing macros to command data")?;
 
@@ -493,6 +504,652 @@ impl MacroCommands {
             }
         }
     }
+}
+
+/// A single setting that can be read from the device.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReadableSetting {
+    /// The firmware version triple (Bazecor, Kaleidoscope, firmware).
+    Version,
+    /// The Neuron identity string.
+    ChipId,
+    /// Whether this keyboard is the wireless variant.
+    Wireless,
+    /// The physical key layout.
+    Layout,
+    /// Whether only the layers in `keymap.custom` are used.
+    OnlyCustom,
+    /// The layer the keyboard boots into.
+    DefaultLayer,
+    /// The qukeys hold timeout, in ms.
+    QukeysHoldTimeout,
+    /// The qukeys overlap threshold, as a percentage.
+    QukeysOverlapThreshold,
+    /// The minimum time a qukey must be held to count as a hold, in ms.
+    QukeysMinimumHoldTime,
+    /// The minimum interval since the previous press for a qukey hold, in ms.
+    QukeysMinimumPriorInterval,
+    /// The superkey tap-hold timeout, in ms.
+    SuperkeysTimeout,
+    /// The superkey auto-repeat interval, in ms.
+    SuperkeysRepeat,
+    /// The superkey double-tap wait window, in ms.
+    SuperkeysWaitFor,
+    /// The superkey hold start time, in ms.
+    SuperkeysHoldStart,
+    /// The superkey overlap threshold, as a percentage.
+    SuperkeysOverlap,
+    /// The base mouse cursor speed.
+    MouseSpeed,
+    /// The mouse cursor start-up delay, in ms.
+    MouseSpeedDelay,
+    /// The mouse acceleration speed.
+    MouseAccelSpeed,
+    /// The mouse acceleration delay, in ms.
+    MouseAccelDelay,
+    /// The mouse wheel speed.
+    MouseWheelSpeed,
+    /// The mouse wheel delay, in ms.
+    MouseWheelDelay,
+    /// The mouse cursor speed limit.
+    MouseSpeedLimit,
+    /// The macro map memory size (probed and sanitized).
+    MacrosMemory,
+}
+
+/// A single setting that can be written to the device.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum WritableSetting {
+    /// Whether only the layers in `keymap.custom` are used.
+    OnlyCustom,
+    /// The layer the keyboard boots into.
+    DefaultLayer,
+    /// The qukeys hold timeout, in ms.
+    QukeysHoldTimeout,
+    /// The qukeys overlap threshold, as a percentage.
+    QukeysOverlapThreshold,
+    /// The minimum time a qukey must be held to count as a hold, in ms.
+    QukeysMinimumHoldTime,
+    /// The minimum interval since the previous press for a qukey hold, in ms.
+    QukeysMinimumPriorInterval,
+    /// The superkey tap-hold timeout, in ms.
+    SuperkeysTimeout,
+    /// The superkey auto-repeat interval, in ms.
+    SuperkeysRepeat,
+    /// The superkey double-tap wait window, in ms.
+    SuperkeysWaitFor,
+    /// The superkey hold start time, in ms.
+    SuperkeysHoldStart,
+    /// The superkey overlap threshold, as a percentage.
+    SuperkeysOverlap,
+    /// The base mouse cursor speed.
+    MouseSpeed,
+    /// The mouse cursor start-up delay, in ms.
+    MouseSpeedDelay,
+    /// The mouse acceleration speed.
+    MouseAccelSpeed,
+    /// The mouse acceleration delay, in ms.
+    MouseAccelDelay,
+    /// The mouse wheel speed.
+    MouseWheelSpeed,
+    /// The mouse wheel delay, in ms.
+    MouseWheelDelay,
+    /// The mouse cursor speed limit.
+    MouseSpeedLimit,
+}
+
+#[derive(Subcommand)]
+enum SettingsCommands {
+    /// Reads the device's identity: version, chip id, wireless, layout.
+    Identity,
+    /// Reads a single setting from the device.
+    Get {
+        /// The setting to read.
+        setting: ReadableSetting,
+    },
+    /// Writes a single setting to the device.
+    Set {
+        /// The setting to write.
+        setting: WritableSetting,
+        /// The value to write.
+        ///
+        /// Numbers are plain decimals. `only-custom` accepts
+        /// `1`/`0`/`true`/`false`. `default-layer` accepts a layer
+        /// number or `none`.
+        value: String,
+    },
+    /// Resets every plugin setting stored in the device's EEPROM.
+    ///
+    /// This wipes qukeys, superkeys timings, mouse settings, LED
+    /// settings, and everything else plugins keep in the EEPROM. It
+    /// cannot be undone.
+    ResetEeprom {
+        /// Actually perform the reset.
+        ///
+        /// Without this flag, the command prints a warning and exits
+        /// without opening a connection to the device.
+        #[clap(long, default_value_t = false)]
+        yes: bool,
+    },
+}
+
+/// Parses a boolean from a `1`/`0`/`true`/`false` value string.
+fn parse_bool_value(value: &str) -> Result<bool, Error> {
+    match value {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(Error),
+    }
+}
+
+/// Parses a default layer from a `none`/layer-number value string.
+fn parse_default_layer_value(value: &str) -> Result<parsing::settings::DefaultLayer, Error> {
+    if value == "none" {
+        return Ok(parsing::settings::DefaultLayer::none());
+    }
+
+    value
+        .parse::<u8>()
+        .ok()
+        .and_then(parsing::settings::DefaultLayer::layer)
+        .ok_or(Error)
+}
+
+impl SettingsCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Identity => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                let version = defy
+                    .get_version()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `version` from the Defy")?;
+                let chip_id = defy
+                    .get_chip_id()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `hardware.chip_id` from the Defy")?;
+                let wireless = defy
+                    .is_wireless()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `hardware.wireless` from the Defy")?;
+                let layout = defy
+                    .get_layout()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `hardware.layout` from the Defy")?;
+
+                println!("version: {version}");
+                println!("chip id: {chip_id}");
+                println!("wireless: {wireless}");
+                println!("layout: {layout}");
+
+                Ok(())
+            }
+            Self::Get { setting } => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                let value = match setting {
+                    ReadableSetting::Version => defy
+                        .get_version()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `version` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::ChipId => defy
+                        .get_chip_id()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `hardware.chip_id` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::Wireless => defy
+                        .is_wireless()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `hardware.wireless` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::Layout => defy
+                        .get_layout()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `hardware.layout` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::OnlyCustom => defy
+                        .get_only_custom()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `keymap.onlyCustom` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::DefaultLayer => defy
+                        .get_default_layer()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `settings.defaultLayer` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::QukeysHoldTimeout => defy
+                        .get_qukeys_hold_timeout()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `qukeys.holdTimeout` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::QukeysOverlapThreshold => defy
+                        .get_qukeys_overlap_threshold()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `qukeys.overlapThreshold` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::QukeysMinimumHoldTime => defy
+                        .get_qukeys_minimum_hold_time()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `qukeys.minimumHoldTime` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::QukeysMinimumPriorInterval => defy
+                        .get_qukeys_minimum_prior_interval()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `qukeys.minimumPriorInterval` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::SuperkeysTimeout => defy
+                        .get_superkeys_timeout()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `superkeys.timeout` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::SuperkeysRepeat => defy
+                        .get_superkeys_repeat()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `superkeys.repeat` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::SuperkeysWaitFor => defy
+                        .get_superkeys_wait_for()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `superkeys.waitfor` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::SuperkeysHoldStart => defy
+                        .get_superkeys_hold_start()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `superkeys.holdstart` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::SuperkeysOverlap => defy
+                        .get_superkeys_overlap()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `superkeys.overlap` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseSpeed => defy
+                        .get_mouse_speed()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.speed` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseSpeedDelay => defy
+                        .get_mouse_speed_delay()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.speedDelay` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseAccelSpeed => defy
+                        .get_mouse_accel_speed()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.accelSpeed` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseAccelDelay => defy
+                        .get_mouse_accel_delay()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.accelDelay` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseWheelSpeed => defy
+                        .get_mouse_wheel_speed()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.wheelSpeed` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseWheelDelay => defy
+                        .get_mouse_wheel_delay()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.wheelDelay` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MouseSpeedLimit => defy
+                        .get_mouse_speed_limit()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `mouse.speedLimit` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::MacrosMemory => defy
+                        .macro_memory_size()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `macros.memory` from the Defy")?
+                        .to_string(),
+                };
+
+                println!("{value}");
+
+                Ok(())
+            }
+            Self::Set { setting, value } => {
+                // Parse the value into its typed write BEFORE touching
+                // the device, so a bad value fails without ever
+                // opening a connection.
+                let write = parse_setting_write(setting, &value)?;
+
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                write
+                    .apply(&mut defy)
+                    .await
+                    .change_context(Error)
+                    .attach("writing the setting to the Defy")?;
+
+                println!("Wrote `{}` to the Defy.", write.command_name());
+
+                Ok(())
+            }
+            Self::ResetEeprom { yes } => {
+                if !yes {
+                    eprintln!(
+                        "This wipes every plugin setting stored in the keyboard's EEPROM \
+                        (qukeys, superkeys timings, mouse and LED settings, and more). \
+                        It cannot be undone. Re-run with `--yes` to actually reset it."
+                    );
+
+                    // No device connection is opened without `--yes`.
+                    return Ok(());
+                }
+
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                defy.reset_eeprom()
+                    .await
+                    .change_context(Error)
+                    .attach("resetting the Defy's EEPROM")?;
+
+                println!("The Defy's EEPROM has been reset.");
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A parsed setting write: the value has been validated from its
+/// command-line string, and only the device round-trip remains.
+#[derive(Clone, Copy, Debug)]
+enum SettingWrite {
+    OnlyCustom(bool),
+    DefaultLayer(parsing::settings::DefaultLayer),
+    QukeysHoldTimeout(u16),
+    QukeysOverlapThreshold(u8),
+    QukeysMinimumHoldTime(u8),
+    QukeysMinimumPriorInterval(u8),
+    SuperkeysTimeout(u16),
+    SuperkeysRepeat(u8),
+    SuperkeysWaitFor(u16),
+    SuperkeysHoldStart(u16),
+    SuperkeysOverlap(u8),
+    MouseSpeed(u8),
+    MouseSpeedDelay(u16),
+    MouseAccelSpeed(u8),
+    MouseAccelDelay(u16),
+    MouseWheelSpeed(u8),
+    MouseWheelDelay(u16),
+    MouseSpeedLimit(u8),
+}
+
+/// Parses a setting write from its command-line value string. This
+/// never talks to the device.
+fn parse_setting_write(
+    setting: WritableSetting,
+    value: &str,
+) -> Result<SettingWrite, error_stack::Report<Error>> {
+    let write = match setting {
+        WritableSetting::OnlyCustom => SettingWrite::OnlyCustom(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::DefaultLayer => SettingWrite::DefaultLayer(
+            parse_default_layer_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a layer number or `none`")?,
+        ),
+        WritableSetting::QukeysHoldTimeout => SettingWrite::QukeysHoldTimeout(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::QukeysOverlapThreshold => SettingWrite::QukeysOverlapThreshold(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::QukeysMinimumHoldTime => SettingWrite::QukeysMinimumHoldTime(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::QukeysMinimumPriorInterval => SettingWrite::QukeysMinimumPriorInterval(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::SuperkeysTimeout => SettingWrite::SuperkeysTimeout(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::SuperkeysRepeat => SettingWrite::SuperkeysRepeat(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::SuperkeysWaitFor => SettingWrite::SuperkeysWaitFor(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::SuperkeysHoldStart => SettingWrite::SuperkeysHoldStart(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::SuperkeysOverlap => SettingWrite::SuperkeysOverlap(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseSpeed => SettingWrite::MouseSpeed(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseSpeedDelay => SettingWrite::MouseSpeedDelay(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseAccelSpeed => SettingWrite::MouseAccelSpeed(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseAccelDelay => SettingWrite::MouseAccelDelay(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseWheelSpeed => SettingWrite::MouseWheelSpeed(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseWheelDelay => SettingWrite::MouseWheelDelay(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+        WritableSetting::MouseSpeedLimit => SettingWrite::MouseSpeedLimit(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number")?,
+        ),
+    };
+
+    Ok(write)
+}
+
+impl SettingWrite {
+    /// The Focus command this write maps to, for user-facing messages.
+    fn command_name(&self) -> &'static str {
+        match self {
+            Self::OnlyCustom(_) => "keymap.onlyCustom",
+            Self::DefaultLayer(_) => "settings.defaultLayer",
+            Self::QukeysHoldTimeout(_) => "qukeys.holdTimeout",
+            Self::QukeysOverlapThreshold(_) => "qukeys.overlapThreshold",
+            Self::QukeysMinimumHoldTime(_) => "qukeys.minimumHoldTime",
+            Self::QukeysMinimumPriorInterval(_) => "qukeys.minimumPriorInterval",
+            Self::SuperkeysTimeout(_) => "superkeys.timeout",
+            Self::SuperkeysRepeat(_) => "superkeys.repeat",
+            Self::SuperkeysWaitFor(_) => "superkeys.waitfor",
+            Self::SuperkeysHoldStart(_) => "superkeys.holdstart",
+            Self::SuperkeysOverlap(_) => "superkeys.overlap",
+            Self::MouseSpeed(_) => "mouse.speed",
+            Self::MouseSpeedDelay(_) => "mouse.speedDelay",
+            Self::MouseAccelSpeed(_) => "mouse.accelSpeed",
+            Self::MouseAccelDelay(_) => "mouse.accelDelay",
+            Self::MouseWheelSpeed(_) => "mouse.wheelSpeed",
+            Self::MouseWheelDelay(_) => "mouse.wheelDelay",
+            Self::MouseSpeedLimit(_) => "mouse.speedLimit",
+        }
+    }
+
+    /// Sends the write to the device.
+    async fn apply(self, defy: &mut DefyKeyboard) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::OnlyCustom(value) => defy
+                .set_only_custom(value)
+                .await
+                .change_context(Error)
+                .attach("writing `keymap.onlyCustom` to the Defy"),
+            Self::DefaultLayer(value) => defy
+                .set_default_layer(value)
+                .await
+                .change_context(Error)
+                .attach("writing `settings.defaultLayer` to the Defy"),
+            Self::QukeysHoldTimeout(value) => defy
+                .set_qukeys_hold_timeout(value)
+                .await
+                .change_context(Error)
+                .attach("writing `qukeys.holdTimeout` to the Defy"),
+            Self::QukeysOverlapThreshold(value) => defy
+                .set_qukeys_overlap_threshold(value)
+                .await
+                .change_context(Error)
+                .attach("writing `qukeys.overlapThreshold` to the Defy"),
+            Self::QukeysMinimumHoldTime(value) => defy
+                .set_qukeys_minimum_hold_time(value)
+                .await
+                .change_context(Error)
+                .attach("writing `qukeys.minimumHoldTime` to the Defy"),
+            Self::QukeysMinimumPriorInterval(value) => defy
+                .set_qukeys_minimum_prior_interval(value)
+                .await
+                .change_context(Error)
+                .attach("writing `qukeys.minimumPriorInterval` to the Defy"),
+            Self::SuperkeysTimeout(value) => defy
+                .set_superkeys_timeout(value)
+                .await
+                .change_context(Error)
+                .attach("writing `superkeys.timeout` to the Defy"),
+            Self::SuperkeysRepeat(value) => defy
+                .set_superkeys_repeat(value)
+                .await
+                .change_context(Error)
+                .attach("writing `superkeys.repeat` to the Defy"),
+            Self::SuperkeysWaitFor(value) => defy
+                .set_superkeys_wait_for(value)
+                .await
+                .change_context(Error)
+                .attach("writing `superkeys.waitfor` to the Defy"),
+            Self::SuperkeysHoldStart(value) => defy
+                .set_superkeys_hold_start(value)
+                .await
+                .change_context(Error)
+                .attach("writing `superkeys.holdstart` to the Defy"),
+            Self::SuperkeysOverlap(value) => defy
+                .set_superkeys_overlap(value)
+                .await
+                .change_context(Error)
+                .attach("writing `superkeys.overlap` to the Defy"),
+            Self::MouseSpeed(value) => defy
+                .set_mouse_speed(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.speed` to the Defy"),
+            Self::MouseSpeedDelay(value) => defy
+                .set_mouse_speed_delay(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.speedDelay` to the Defy"),
+            Self::MouseAccelSpeed(value) => defy
+                .set_mouse_accel_speed(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.accelSpeed` to the Defy"),
+            Self::MouseAccelDelay(value) => defy
+                .set_mouse_accel_delay(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.accelDelay` to the Defy"),
+            Self::MouseWheelSpeed(value) => defy
+                .set_mouse_wheel_speed(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.wheelSpeed` to the Defy"),
+            Self::MouseWheelDelay(value) => defy
+                .set_mouse_wheel_delay(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.wheelDelay` to the Defy"),
+            Self::MouseSpeedLimit(value) => defy
+                .set_mouse_speed_limit(value)
+                .await
+                .change_context(Error)
+                .attach("writing `mouse.speedLimit` to the Defy"),
+        }
+    }
+}
+
+/// Parses a u8 from a value string.
+fn parse_u8_value(value: &str) -> Result<u8, Error> {
+    value.parse().map_err(|_| Error)
+}
+
+/// Parses a u16 from a value string.
+fn parse_u16_value(value: &str) -> Result<u16, Error> {
+    value.parse().map_err(|_| Error)
 }
 
 #[derive(Subcommand)]

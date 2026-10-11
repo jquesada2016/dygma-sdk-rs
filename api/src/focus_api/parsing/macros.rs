@@ -80,11 +80,16 @@ impl MacroMap {
     /// Converts the macro map into a form suitable for sending to the
     /// keyboard as command data.
     ///
-    /// An empty map is converted into an eraser payload of `MEMORY_SIZE`
-    /// `255` bytes, and thus, erases all macros on the keyboard.
-    pub fn to_command_data<const MEMORY_SIZE: usize>(&self) -> Result<String, ToCommandDataError> {
+    /// `memory_size` is the device's macro map memory, as reported by
+    /// the `macros.memory` command (see
+    /// [`MacroMemorySize`](crate::focus_api::parsing::settings::MacroMemorySize)).
+    ///
+    /// An empty map is converted into an eraser payload of
+    /// `memory_size` `255` bytes, and thus, erases all macros on the
+    /// keyboard.
+    pub fn to_command_data(&self, memory_size: usize) -> Result<String, ToCommandDataError> {
         if self.0.is_empty() {
-            return Ok([255; MEMORY_SIZE].iter().join(" "));
+            return Ok(std::iter::repeat_n("255", memory_size).join(" "));
         }
 
         let macros = self
@@ -99,11 +104,11 @@ impl MacroMap {
             .chain([0])
             .collect::<Vec<_>>();
 
-        if macros.len() > MEMORY_SIZE {
+        if macros.len() > memory_size {
             return Err(TooManyMacrosError.into());
         }
 
-        let mut res = [255; MEMORY_SIZE];
+        let mut res = vec![255; memory_size];
 
         res.iter_mut()
             .zip(macros)
@@ -495,7 +500,7 @@ mod tests {
             MacroAction::KeyCodeDown(KeyKind::from(229))
         );
 
-        let str_data = macros.to_command_data::<2048>().unwrap();
+        let str_data = macros.to_command_data(2048).unwrap();
 
         // Serializing reproduces the live bytes, followed by padding.
         assert!(str_data.starts_with(BAZECOR_BACKUP_MACRO_DATA));
@@ -523,7 +528,7 @@ mod tests {
     fn macros_round_trip_from_str() {
         let map = MACRO_DATA.parse::<MacroMap>().unwrap();
 
-        let str_data = map.to_command_data::<2048>().unwrap();
+        let str_data = map.to_command_data(2048).unwrap();
 
         // The serialized map reproduces the live part of the capture (the
         // stale data after the first `0 0` is gone).
@@ -536,7 +541,7 @@ mod tests {
         let str_data_again = str_data
             .parse::<MacroMap>()
             .unwrap()
-            .to_command_data::<2048>()
+            .to_command_data(2048)
             .unwrap();
 
         assert_eq!(str_data, str_data_again);
@@ -552,14 +557,14 @@ mod tests {
 
         let map = data.parse::<MacroMap>().unwrap();
 
-        let str_data = map.to_command_data::<19>().unwrap();
+        let str_data = map.to_command_data(19).unwrap();
 
         assert_eq!(format!("{str_data} "), data);
     }
 
     #[test]
     fn empty_map_erases() {
-        let str_data = MacroMap(Vec::new()).to_command_data::<8>().unwrap();
+        let str_data = MacroMap(Vec::new()).to_command_data(8).unwrap();
 
         assert_eq!(str_data, "255 255 255 255 255 255 255 255");
     }
@@ -571,7 +576,7 @@ mod tests {
         }]);
 
         assert!(matches!(
-            map.to_command_data::<2048>(),
+            map.to_command_data(2048),
             Err(ToCommandDataError::KeyCodeTooLarge(_))
         ));
     }
@@ -588,7 +593,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            map.to_command_data::<16>(),
+            map.to_command_data(16),
             Err(ToCommandDataError::TooManyMacros(_))
         ));
 
@@ -602,7 +607,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            exact_fit.to_command_data::<13>().unwrap(),
+            exact_fit.to_command_data(13).unwrap(),
             "2 3 232 0 2 3 232 0 2 3 232 0 0"
         );
     }

@@ -93,7 +93,7 @@ mod error {
     }
 
     /// Error returned from [`DefyKeyboard::apply_macros`].
-    #[derive(Debug, Display, From, Error)]
+    #[derive(Debug, Display, Error)]
     pub enum ApplyMacroError {
         /// Too many macros were in the map to fit in the macro memory.
         #[display("{_0}")]
@@ -101,9 +101,50 @@ mod error {
         /// A key code was too large for a single-byte macro action.
         #[display("{_0}")]
         KeyCodeTooLarge(parsing::macros::KeyCodeTooLargeError),
+        /// Probing the macro memory with the `macros.memory` command
+        /// failed.
+        #[display("{_0}")]
+        MemoryProbe(RunCommandError),
         /// Command failed to run.
         #[display("{_0}")]
         CommandFailed(RunCommandError),
+    }
+
+    /// Error returned when reading one of the single-value identity or
+    /// settings commands (`version`, `hardware.*`, `keymap.onlyCustom`,
+    /// `settings.defaultLayer`, `qukeys.*`, `superkeys.*` timings,
+    /// `mouse.*`, `macros.memory`, `eeprom.contents`).
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetSettingError {
+        /// Failed to run the command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// The response could not be parsed.
+        #[display("{_0}")]
+        ParsingFailure(parsing::settings::ParseSettingsError),
+    }
+
+    /// Error returned when writing one of the single-value settings
+    /// commands.
+    #[derive(Debug, Display, From, Error)]
+    #[display("failed to write the setting: {_0}")]
+    pub struct SetSettingError(RunCommandError);
+
+    /// Error returned from [`DefyKeyboard::reset_eeprom`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum ResetEepromError {
+        /// Reading the current `eeprom.contents` failed, so the number
+        /// of bytes to erase is unknown.
+        #[display("{_0}")]
+        ReadContents(GetSettingError),
+        /// The device reported an empty EEPROM, so there is nothing to
+        /// erase (an empty write would be treated as a read by the
+        /// firmware).
+        #[display("{_0}")]
+        EmptyEeprom(parsing::settings::EmptyEepromError),
+        /// Writing the erase payload failed.
+        #[display("{_0}")]
+        Erase(SetSettingError),
     }
 
     impl From<parsing::macros::ToCommandDataError> for ApplyMacroError {
@@ -114,6 +155,12 @@ mod error {
                     Self::KeyCodeTooLarge(err)
                 }
             }
+        }
+    }
+
+    impl From<RunCommandError> for ApplyMacroError {
+        fn from(err: RunCommandError) -> Self {
+            Self::CommandFailed(err)
         }
     }
 
@@ -176,12 +223,39 @@ impl DefyKeyboard {
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
     const MACRO_MAP_COMMAND_NAME: &str = "macros.map";
+    const VERSION_COMMAND_NAME: &str = "version";
+    const HARDWARE_CHIP_ID_COMMAND_NAME: &str = "hardware.chip_id";
+    const HARDWARE_WIRELESS_COMMAND_NAME: &str = "hardware.wireless";
+    const HARDWARE_LAYOUT_COMMAND_NAME: &str = "hardware.layout";
+    const KEYMAP_ONLY_CUSTOM_COMMAND_NAME: &str = "keymap.onlyCustom";
+    const SETTINGS_DEFAULT_LAYER_COMMAND_NAME: &str = "settings.defaultLayer";
+    const QUKEYS_HOLD_TIMEOUT_COMMAND_NAME: &str = "qukeys.holdTimeout";
+    const QUKEYS_OVERLAP_THRESHOLD_COMMAND_NAME: &str = "qukeys.overlapThreshold";
+    const QUKEYS_MINIMUM_HOLD_TIME_COMMAND_NAME: &str = "qukeys.minimumHoldTime";
+    const QUKEYS_MINIMUM_PRIOR_INTERVAL_COMMAND_NAME: &str = "qukeys.minimumPriorInterval";
+    const SUPERKEYS_TIMEOUT_COMMAND_NAME: &str = "superkeys.timeout";
+    const SUPERKEYS_REPEAT_COMMAND_NAME: &str = "superkeys.repeat";
+    const SUPERKEYS_WAIT_FOR_COMMAND_NAME: &str = "superkeys.waitfor";
+    const SUPERKEYS_HOLD_START_COMMAND_NAME: &str = "superkeys.holdstart";
+    const SUPERKEYS_OVERLAP_COMMAND_NAME: &str = "superkeys.overlap";
+    const MOUSE_SPEED_COMMAND_NAME: &str = "mouse.speed";
+    const MOUSE_SPEED_DELAY_COMMAND_NAME: &str = "mouse.speedDelay";
+    const MOUSE_ACCEL_SPEED_COMMAND_NAME: &str = "mouse.accelSpeed";
+    const MOUSE_ACCEL_DELAY_COMMAND_NAME: &str = "mouse.accelDelay";
+    const MOUSE_WHEEL_SPEED_COMMAND_NAME: &str = "mouse.wheelSpeed";
+    const MOUSE_WHEEL_DELAY_COMMAND_NAME: &str = "mouse.wheelDelay";
+    const MOUSE_SPEED_LIMIT_COMMAND_NAME: &str = "mouse.speedLimit";
+    const MACROS_MEMORY_COMMAND_NAME: &str = "macros.memory";
+    const EEPROM_CONTENTS_COMMAND_NAME: &str = "eeprom.contents";
 
     /// The memory size of the superkey map.
     pub const SUPERKEY_MEMORY_SIZE: usize = 512;
 
-    /// The memory size of the macro map.
-    pub const MACRO_MEMORY_SIZE: usize = 2048;
+    /// The fallback memory size of the macro map, used when the
+    /// `macros.memory` probe is missing or untrustworthy. Use
+    /// [`DefyKeyboard::macro_memory_size`] for the real per-device
+    /// value.
+    pub const MACRO_MEMORY_SIZE: usize = parsing::settings::MacroMemorySize::FALLBACK as usize;
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
@@ -251,12 +325,472 @@ impl DefyKeyboard {
     }
 
     /// Apply the macros to the keyboard.
+    ///
+    /// The macro map memory is probed per device with the
+    /// `macros.memory` command first, so the map is serialized with the
+    /// correct padding and erase semantics for this specific keyboard.
     pub async fn apply_macros(&mut self, macros: &MacroMap) -> Result<(), ApplyMacroError> {
-        let data = parsing::macros::MacroMap::from(macros)
-            .to_command_data::<{ Self::MACRO_MEMORY_SIZE }>()?;
+        let memory_size = self
+            .macro_memory_size()
+            .await
+            .map_err(ApplyMacroError::MemoryProbe)?;
+
+        let data = parsing::macros::MacroMap::from(macros).to_command_data(memory_size.into())?;
 
         self.run_command(Self::MACRO_MAP_COMMAND_NAME, Some(&data))
             .await?;
+
+        Ok(())
+    }
+
+    /// Probes the size of the device's macro map memory with the
+    /// `macros.memory` command.
+    ///
+    /// The result is sanitized like Bazecor does: a missing probe (the
+    /// command is not served by older firmwares) or a value below
+    /// [`MacroMemorySize::MIN`](parsing::settings::MacroMemorySize::MIN)
+    /// falls back to 2048.
+    pub async fn macro_memory_size(
+        &mut self,
+    ) -> Result<parsing::settings::MacroMemorySize, RunCommandError> {
+        let res = self
+            .run_command(Self::MACROS_MEMORY_COMMAND_NAME, None)
+            .await?;
+
+        // An unparsable response means the firmware does not really
+        // serve the command; treat it like Bazecor treats a missing
+        // probe instead of failing.
+        let value = res
+            .parse::<parsing::settings::DecimalU16>()
+            .ok()
+            .map(|value| value.0);
+
+        Ok(parsing::settings::MacroMemorySize::sanitize(value))
+    }
+
+    /// Get the firmware version triple (`version` command): the
+    /// Bazecor, Kaleidoscope, and firmware versions.
+    pub async fn get_version(
+        &mut self,
+    ) -> Result<parsing::settings::FirmwareVersion, GetSettingError> {
+        self.get_setting(Self::VERSION_COMMAND_NAME).await
+    }
+
+    /// Get the Neuron identity string (`hardware.chip_id` command),
+    /// which Bazecor keys its per-device name stores by.
+    pub async fn get_chip_id(&mut self) -> Result<parsing::settings::ChipId, GetSettingError> {
+        self.get_setting(Self::HARDWARE_CHIP_ID_COMMAND_NAME).await
+    }
+
+    /// Get whether this keyboard is the wireless (RF/BT) variant
+    /// (`hardware.wireless` command).
+    pub async fn is_wireless(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::BoolWord>(Self::HARDWARE_WIRELESS_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Get the physical key layout (`hardware.layout` command).
+    pub async fn get_layout(
+        &mut self,
+    ) -> Result<parsing::settings::KeyboardLayout, GetSettingError> {
+        self.get_setting(Self::HARDWARE_LAYOUT_COMMAND_NAME).await
+    }
+
+    /// Get whether the keyboard only uses the layers stored in
+    /// `keymap.custom`, ignoring its hardcoded default layers
+    /// (`keymap.onlyCustom` command).
+    pub async fn get_only_custom(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::OnlyCustom>(Self::KEYMAP_ONLY_CUSTOM_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set whether the keyboard only uses the layers stored in
+    /// `keymap.custom` (`keymap.onlyCustom` command).
+    pub async fn set_only_custom(&mut self, only_custom: bool) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::KEYMAP_ONLY_CUSTOM_COMMAND_NAME,
+            parsing::settings::only_custom_command_data(only_custom),
+        )
+        .await
+    }
+
+    /// Get the layer the keyboard boots into (`settings.defaultLayer`
+    /// command).
+    pub async fn get_default_layer(
+        &mut self,
+    ) -> Result<parsing::settings::DefaultLayer, GetSettingError> {
+        self.get_setting(Self::SETTINGS_DEFAULT_LAYER_COMMAND_NAME)
+            .await
+    }
+
+    /// Set the layer the keyboard boots into
+    /// (`settings.defaultLayer` command).
+    ///
+    /// The type admits layers 0 to
+    /// [`DEFAULT_LAYER_MAX`](parsing::settings::DEFAULT_LAYER_MAX), but
+    /// the device only honors layers below its own layer count: the
+    /// firmware silently ignores an out-of-range write, so a successful
+    /// send does not guarantee the layer took effect.
+    pub async fn set_default_layer(
+        &mut self,
+        layer: parsing::settings::DefaultLayer,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::SETTINGS_DEFAULT_LAYER_COMMAND_NAME,
+            &layer.to_command_data(),
+        )
+        .await
+    }
+
+    /// Get the qukeys hold timeout in ms (`qukeys.holdTimeout`
+    /// command).
+    pub async fn get_qukeys_hold_timeout(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::QUKEYS_HOLD_TIMEOUT_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the qukeys hold timeout in ms (`qukeys.holdTimeout`
+    /// command).
+    ///
+    /// The firmware's write path composes the value from a
+    /// low-byte-then-high-byte decimal pair, which is what gets sent;
+    /// a single decimal could only ever address values up to 255.
+    pub async fn set_qukeys_hold_timeout(&mut self, timeout: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::QUKEYS_HOLD_TIMEOUT_COMMAND_NAME,
+            &parsing::settings::split_u16_command_data(timeout),
+        )
+        .await
+    }
+
+    /// Get the qukeys overlap threshold as a percentage
+    /// (`qukeys.overlapThreshold` command).
+    pub async fn get_qukeys_overlap_threshold(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(
+            Self::QUKEYS_OVERLAP_THRESHOLD_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the qukeys overlap threshold as a percentage
+    /// (`qukeys.overlapThreshold` command).
+    pub async fn set_qukeys_overlap_threshold(
+        &mut self,
+        threshold: u8,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::QUKEYS_OVERLAP_THRESHOLD_COMMAND_NAME,
+            &threshold.to_string(),
+        )
+        .await
+    }
+
+    /// Get the minimum time a qukey must be held in ms to count as a
+    /// hold (`qukeys.minimumHoldTime` command).
+    ///
+    /// The wire value is a single byte, so the 0-255 range of the
+    /// `u8` parameter *is* the clamp Bazecor applies on top of it;
+    /// larger values are unrepresentable here.
+    pub async fn get_qukeys_minimum_hold_time(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(
+            Self::QUKEYS_MINIMUM_HOLD_TIME_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the minimum time a qukey must be held in ms to count as a
+    /// hold (`qukeys.minimumHoldTime` command).
+    ///
+    /// The wire value is a single byte, so the 0-255 range of the
+    /// `u8` parameter *is* the clamp Bazecor applies on top of it;
+    /// larger values are unrepresentable here.
+    pub async fn set_qukeys_minimum_hold_time(&mut self, time: u8) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::QUKEYS_MINIMUM_HOLD_TIME_COMMAND_NAME,
+            &time.to_string(),
+        )
+        .await
+    }
+
+    /// Get the minimum interval since the previous key press in ms for
+    /// a qukey to be considered a hold (`qukeys.minimumPriorInterval`
+    /// command).
+    pub async fn get_qukeys_minimum_prior_interval(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(
+            Self::QUKEYS_MINIMUM_PRIOR_INTERVAL_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the minimum interval since the previous key press in ms for
+    /// a qukey to be considered a hold
+    /// (`qukeys.minimumPriorInterval` command).
+    ///
+    /// Note that Bazecor, when its stored value for this setting is
+    /// unset, sends the command with an *empty* payload. The firmware
+    /// treats an empty payload as a read, so that write is a no-op;
+    /// this API does not replicate it and always writes an actual
+    /// value.
+    pub async fn set_qukeys_minimum_prior_interval(
+        &mut self,
+        interval: u8,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::QUKEYS_MINIMUM_PRIOR_INTERVAL_COMMAND_NAME,
+            &interval.to_string(),
+        )
+        .await
+    }
+
+    /// Get the superkey tap-hold timeout in ms (`superkeys.timeout`
+    /// command).
+    pub async fn get_superkeys_timeout(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::SUPERKEYS_TIMEOUT_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the superkey tap-hold timeout in ms (`superkeys.timeout`
+    /// command).
+    pub async fn set_superkeys_timeout(&mut self, timeout: u16) -> Result<(), SetSettingError> {
+        self.set_setting(Self::SUPERKEYS_TIMEOUT_COMMAND_NAME, &timeout.to_string())
+            .await
+    }
+
+    /// Get the superkey auto-repeat interval in ms
+    /// (`superkeys.repeat` command).
+    pub async fn get_superkeys_repeat(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::SUPERKEYS_REPEAT_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the superkey auto-repeat interval in ms
+    /// (`superkeys.repeat` command).
+    pub async fn set_superkeys_repeat(&mut self, interval: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::SUPERKEYS_REPEAT_COMMAND_NAME, &interval.to_string())
+            .await
+    }
+
+    /// Get the superkey double-tap wait window in ms
+    /// (`superkeys.waitfor` command).
+    pub async fn get_superkeys_wait_for(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::SUPERKEYS_WAIT_FOR_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the superkey double-tap wait window in ms
+    /// (`superkeys.waitfor` command).
+    pub async fn set_superkeys_wait_for(&mut self, wait: u16) -> Result<(), SetSettingError> {
+        self.set_setting(Self::SUPERKEYS_WAIT_FOR_COMMAND_NAME, &wait.to_string())
+            .await
+    }
+
+    /// Get the superkey hold start time in ms
+    /// (`superkeys.holdstart` command).
+    pub async fn get_superkeys_hold_start(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::SUPERKEYS_HOLD_START_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the superkey hold start time in ms
+    /// (`superkeys.holdstart` command).
+    pub async fn set_superkeys_hold_start(
+        &mut self,
+        hold_start: u16,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::SUPERKEYS_HOLD_START_COMMAND_NAME,
+            &hold_start.to_string(),
+        )
+        .await
+    }
+
+    /// Get the superkey overlap threshold as a percentage
+    /// (`superkeys.overlap` command).
+    pub async fn get_superkeys_overlap(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::SUPERKEYS_OVERLAP_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the superkey overlap threshold as a percentage
+    /// (`superkeys.overlap` command).
+    pub async fn set_superkeys_overlap(&mut self, threshold: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::SUPERKEYS_OVERLAP_COMMAND_NAME, &threshold.to_string())
+            .await
+    }
+
+    /// Get the base mouse cursor speed (`mouse.speed` command).
+    pub async fn get_mouse_speed(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::MOUSE_SPEED_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the base mouse cursor speed (`mouse.speed` command).
+    pub async fn set_mouse_speed(&mut self, speed: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::MOUSE_SPEED_COMMAND_NAME, &speed.to_string())
+            .await
+    }
+
+    /// Get the mouse cursor start-up delay in ms
+    /// (`mouse.speedDelay` command).
+    pub async fn get_mouse_speed_delay(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::MOUSE_SPEED_DELAY_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse cursor start-up delay in ms
+    /// (`mouse.speedDelay` command).
+    ///
+    /// The firmware's write path composes the value from a
+    /// low-byte-then-high-byte decimal pair, which is what gets sent;
+    /// a single decimal could only ever address values up to 255.
+    pub async fn set_mouse_speed_delay(&mut self, delay: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::MOUSE_SPEED_DELAY_COMMAND_NAME,
+            &parsing::settings::split_u16_command_data(delay),
+        )
+        .await
+    }
+
+    /// Get the mouse acceleration speed (`mouse.accelSpeed` command).
+    pub async fn get_mouse_accel_speed(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::MOUSE_ACCEL_SPEED_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse acceleration speed (`mouse.accelSpeed` command).
+    pub async fn set_mouse_accel_speed(&mut self, speed: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::MOUSE_ACCEL_SPEED_COMMAND_NAME, &speed.to_string())
+            .await
+    }
+
+    /// Get the mouse acceleration delay in ms
+    /// (`mouse.accelDelay` command).
+    pub async fn get_mouse_accel_delay(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::MOUSE_ACCEL_DELAY_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse acceleration delay in ms
+    /// (`mouse.accelDelay` command).
+    ///
+    /// The firmware's write path composes the value from a
+    /// low-byte-then-high-byte decimal pair, which is what gets sent;
+    /// a single decimal could only ever address values up to 255.
+    pub async fn set_mouse_accel_delay(&mut self, delay: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::MOUSE_ACCEL_DELAY_COMMAND_NAME,
+            &parsing::settings::split_u16_command_data(delay),
+        )
+        .await
+    }
+
+    /// Get the mouse wheel speed (`mouse.wheelSpeed` command).
+    pub async fn get_mouse_wheel_speed(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::MOUSE_WHEEL_SPEED_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse wheel speed (`mouse.wheelSpeed` command).
+    pub async fn set_mouse_wheel_speed(&mut self, speed: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::MOUSE_WHEEL_SPEED_COMMAND_NAME, &speed.to_string())
+            .await
+    }
+
+    /// Get the mouse wheel delay in ms (`mouse.wheelDelay` command).
+    pub async fn get_mouse_wheel_delay(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::MOUSE_WHEEL_DELAY_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse wheel delay in ms (`mouse.wheelDelay` command).
+    ///
+    /// The firmware's write path composes the value from a
+    /// low-byte-then-high-byte decimal pair, which is what gets sent;
+    /// a single decimal could only ever address values up to 255.
+    pub async fn set_mouse_wheel_delay(&mut self, delay: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::MOUSE_WHEEL_DELAY_COMMAND_NAME,
+            &parsing::settings::split_u16_command_data(delay),
+        )
+        .await
+    }
+
+    /// Get the mouse cursor speed limit (`mouse.speedLimit` command).
+    pub async fn get_mouse_speed_limit(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::MOUSE_SPEED_LIMIT_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the mouse cursor speed limit (`mouse.speedLimit` command).
+    pub async fn set_mouse_speed_limit(&mut self, limit: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::MOUSE_SPEED_LIMIT_COMMAND_NAME, &limit.to_string())
+            .await
+    }
+
+    /// Reset every plugin setting stored in the device's EEPROM to the
+    /// erased state.
+    ///
+    /// This reads `eeprom.contents` to learn how many bytes the device
+    /// stores, then writes back the same number of `255` bytes. It
+    /// wipes **all** of them: qukeys, superkeys timings, mouse
+    /// settings, LED settings, and everything else plugins keep there.
+    /// Keymaps, superkey maps, and macro maps live in their own EEPROM
+    /// slices and are wiped too. This cannot be undone.
+    ///
+    /// Fails with [`ResetEepromError::EmptyEeprom`] when the device
+    /// reports an empty EEPROM: there would be nothing to erase, and
+    /// the empty write would be answered as a read by the firmware.
+    pub async fn reset_eeprom(&mut self) -> Result<(), ResetEepromError> {
+        let contents = self
+            .get_setting::<parsing::settings::EepromContents>(Self::EEPROM_CONTENTS_COMMAND_NAME)
+            .await
+            .map_err(ResetEepromError::ReadContents)?;
+
+        let data = contents
+            .erase_command_data()
+            .map_err(ResetEepromError::EmptyEeprom)?;
+
+        self.set_setting(Self::EEPROM_CONTENTS_COMMAND_NAME, &data)
+            .await
+            .map_err(ResetEepromError::Erase)?;
+
+        Ok(())
+    }
+
+    /// Runs a single-value settings command and parses its response.
+    async fn get_setting<T>(&mut self, command: &str) -> Result<T, GetSettingError>
+    where
+        T: std::str::FromStr<Err = parsing::settings::ParseSettingsError>,
+    {
+        let res = self
+            .run_command(command, None)
+            .await
+            .map_err(GetSettingError::CommandFailed)?;
+
+        T::from_str(&res).map_err(GetSettingError::ParsingFailure)
+    }
+
+    /// Runs a settings command with the given write data.
+    async fn set_setting(&mut self, command: &str, data: &str) -> Result<(), SetSettingError> {
+        self.run_command(command, Some(data)).await?;
 
         Ok(())
     }
@@ -966,7 +1500,7 @@ mod tests {
         assert_eq!(map.0[1].macro_number, 2);
 
         let str_data = parsing::macros::MacroMap::from(&map)
-            .to_command_data::<19>()
+            .to_command_data(19)
             .unwrap();
 
         assert_eq!(format!("{str_data} "), data);
