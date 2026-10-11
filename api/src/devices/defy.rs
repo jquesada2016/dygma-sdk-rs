@@ -26,8 +26,14 @@ mod error {
 
     /// Error when parsing a superkey map from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
-    #[display("failed to parse superkeys map: {_0}")]
-    pub struct ParseSuperkeyMapError(parsing::superkeys::ParseSuperkeyMapError);
+    pub enum ParseSuperkeyMapError {
+        /// The superkey map data is not valid wire data.
+        #[display("failed to parse superkeys map: {_0}")]
+        MalformedData(parsing::superkeys::ParseSuperkeyMapError),
+        /// The map holds more superkeys than the firmware can address.
+        #[display("{_0}")]
+        TooManySuperkeys(SuperkeyMapTooLargeError),
+    }
 
     /// Error when parsing a macro map from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
@@ -51,10 +57,24 @@ mod error {
     /// `u8`, so an oversized map corrupts it well before the `u8` wraps.
     #[derive(Clone, Copy, Debug, Display, Error)]
     #[display(
-        "the macro map holds more than {} macros, which is more than the firmware can address",
+        "the macro map holds more than {} macros — beyond what the firmware can address",
         MacroMap::MAX_MACROS
     )]
     pub struct MacroMapTooLargeError;
+
+    /// Error returned when a [`SuperkeyMap`] holds more superkeys than
+    /// the firmware can address.
+    ///
+    /// The firmware triggers superkeys through a keycode range exactly
+    /// 128 codes wide (`DYNAMIC_SUPER_FIRST` to `DYNAMIC_SUPER_LAST` in
+    /// the firmware's `Kaleidoscope-Ranges.h`), so superkeys past that
+    /// count could never be triggered.
+    #[derive(Clone, Copy, Debug, Display, Error)]
+    #[display(
+        "the superkey map holds more than {} superkeys — beyond what the firmware can address",
+        SuperkeyMap::MAX_SUPERKEYS
+    )]
+    pub struct SuperkeyMapTooLargeError;
 
     /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
     /// creating the command data.
@@ -1211,19 +1231,52 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
 }
 
 /// Holds a superkey map.
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, Deserialize)]
+///
+/// A map holds at most [`SuperkeyMap::MAX_SUPERKEYS`] superkeys. The
+/// invariant is enforced wherever a map comes into existence: parsing
+/// from wire data, deserializing from JSON, and serializing all reject
+/// oversized maps, so converting a [`SuperkeyMap`] to command data
+/// (offline or on [`DefyKeyboard::apply_superkeys`]) can never emit a
+/// map the firmware could not address.
+#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq)]
 pub struct SuperkeyMap(pub Vec<Superkey>);
+
+impl SuperkeyMap {
+    /// The maximum number of superkeys a [`SuperkeyMap`] can hold.
+    ///
+    /// The firmware triggers superkeys through a keycode range exactly
+    /// 128 codes wide (`DYNAMIC_SUPER_FIRST` to `DYNAMIC_SUPER_LAST` in
+    /// the firmware's `Kaleidoscope-Ranges.h`), so superkeys beyond that
+    /// count could never be triggered.
+    pub const MAX_SUPERKEYS: usize = 128;
+
+    /// Checks that a map holding `superkeys` superkeys does not hold
+    /// more than [`MAX_SUPERKEYS`](Self::MAX_SUPERKEYS).
+    fn check_size(superkeys: usize) -> Result<(), SuperkeyMapTooLargeError> {
+        if superkeys > Self::MAX_SUPERKEYS {
+            return Err(SuperkeyMapTooLargeError);
+        }
+
+        Ok(())
+    }
+}
 
 impl serde::Serialize for SuperkeyMap {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
+        // Checked before the numbering below: an unchecked position past
+        // 255 would overflow the 1-based `u8` numbering.
+        Self::check_size(self.0.len()).map_err(serde::ser::Error::custom)?;
+
         self.0
             .iter()
             .copied()
             .enumerate()
             .map(|(i, key)| Superkey {
+                // Cannot wrap: the size check bounds the position to
+                // `MAX_SUPERKEYS` (128), well within `u8`.
                 superkey_number: i as u8 + 1,
                 ..key
             })
@@ -1232,26 +1285,57 @@ impl serde::Serialize for SuperkeyMap {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for SuperkeyMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let map = Self(<Vec<Superkey> as serde::Deserialize>::deserialize(
+            deserializer,
+        )?);
+
+        // Checked at the JSON boundary like `FromStr` checks it at the
+        // wire boundary: an oversized map cannot come into existence
+        // from a config file either, so the CLI's offline
+        // `superkeys to-command-data` path fails at read time instead of
+        // emitting apply-ready command data for a map the firmware
+        // could never address.
+        Self::check_size(map.0.len()).map_err(serde::de::Error::custom)?;
+
+        Ok(map)
+    }
+}
+
 impl FromStr for SuperkeyMap {
     type Err = ParseSuperkeyMapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let map = s
-            .parse::<parsing::superkeys::SuperkeyMap>()?
-            .0
-            .into_iter()
-            .enumerate()
-            .map(|(i, key)| Superkey {
-                superkey_number: i as u8 + 1,
-                tap: key.tap,
-                hold: key.hold,
-                tap_hold: key.tap_hold,
-                double_tap: key.double_tap,
-                double_tap_hold: key.double_tap_hold,
-            })
-            .collect();
+        let wire_map = s.parse::<parsing::superkeys::SuperkeyMap>()?;
 
-        Ok(Self(map))
+        // Checked before the numbering below: the wire parse itself
+        // imposes no count cap, so an unchecked position past 255 would
+        // overflow the 1-based `u8` numbering.
+        Self::check_size(wire_map.0.len())?;
+
+        let map = Self(
+            wire_map
+                .0
+                .into_iter()
+                .enumerate()
+                .map(|(i, key)| Superkey {
+                    // Cannot wrap: the size check above bounds the
+                    // position to `MAX_SUPERKEYS` (128), well within `u8`.
+                    superkey_number: i as u8 + 1,
+                    tap: key.tap,
+                    hold: key.hold,
+                    tap_hold: key.tap_hold,
+                    double_tap: key.double_tap,
+                    double_tap_hold: key.double_tap_hold,
+                })
+                .collect(),
+        );
+
+        Ok(map)
     }
 }
 
@@ -1270,6 +1354,11 @@ pub struct Superkey {
     /// writes is entirely ignored. The idea is that you define the superkeys
     /// you want, and use this number to know what [`KeyKind`] to use to assign
     /// the particular superkey.
+    ///
+    /// Numbers are assigned from a superkey's position in the map
+    /// (1-based) when parsing or serializing, and a [`SuperkeyMap`] can
+    /// hold at most [`SuperkeyMap::MAX_SUPERKEYS`] superkeys, so the
+    /// number never wraps.
     #[serde(skip_deserializing)]
     pub superkey_number: u8,
     /// Action performed when the key is tapped.
@@ -1306,7 +1395,14 @@ impl From<Superkey> for parsing::superkeys::Superkey {
 }
 
 /// Holds a macro map.
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, Deserialize)]
+///
+/// A map holds at most [`MacroMap::MAX_MACROS`] macros. The invariant is
+/// enforced wherever a map comes into existence: parsing from wire data,
+/// deserializing from JSON, and serializing all reject oversized maps,
+/// so converting a [`MacroMap`] to command data (offline or on
+/// [`DefyKeyboard::apply_macros`]) can never emit a map the firmware
+/// could not address.
+#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq)]
 pub struct MacroMap(pub Vec<Macro>);
 
 impl MacroMap {
@@ -1347,6 +1443,27 @@ impl serde::Serialize for MacroMap {
             })
             .collect::<Vec<_>>()
             .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MacroMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let map = Self(<Vec<Macro> as serde::Deserialize>::deserialize(
+            deserializer,
+        )?);
+
+        // Checked at the JSON boundary like `FromStr` checks it at the
+        // wire boundary: an oversized map cannot come into existence
+        // from a config file either, so the CLI's offline
+        // `macros to-command-data` path fails at read time instead of
+        // emitting apply-ready command data for a map the firmware
+        // could never address.
+        Self::check_size(map.0.len()).map_err(serde::de::Error::custom)?;
+
+        Ok(map)
     }
 }
 
@@ -1602,6 +1719,16 @@ mod tests {
         format!("{macros}0")
     }
 
+    /// Builds the JSON of a macro map holding `count` macros, each a
+    /// single `Wait` action, as a hand-written config file would look.
+    fn macro_map_json(count: usize) -> String {
+        let macros = std::iter::repeat_n(r#"{"actions":[{"Wait":1000}]}"#, count)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("[{macros}]")
+    }
+
     #[test]
     fn macros_number_up_to_the_firmware_limit_without_wrapping() {
         // 128 one-action macros is the firmware's maximum (its macro
@@ -1635,7 +1762,7 @@ mod tests {
 
         assert_eq!(
             res.unwrap_err().to_string(),
-            "the macro map holds more than 128 macros, which is more than the firmware can address"
+            "the macro map holds more than 128 macros — beyond what the firmware can address"
         );
     }
 
@@ -1672,5 +1799,163 @@ mod tests {
         );
 
         assert!(serde_json::to_string(&map).is_err());
+    }
+
+    #[test]
+    fn macros_past_the_firmware_limit_are_rejected_when_deserializing_json() {
+        // One macro past the firmware's 128-macro addressing space: a
+        // hand-written or Bazecor-imported config file like this must
+        // fail at deserialization — the offline
+        // `macros to-command-data` path reads files through this impl,
+        // so it can never emit apply-ready command data for a map the
+        // firmware could never address.
+        let err = serde_json::from_str::<MacroMap>(&macro_map_json(MacroMap::MAX_MACROS + 1))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("more than 128 macros"));
+    }
+
+    #[test]
+    fn macros_at_the_firmware_limit_deserialize_from_json() {
+        // Exactly 128 macros is the firmware's maximum and must keep
+        // deserializing: the guard rejects only oversized maps.
+        let map = serde_json::from_str::<MacroMap>(&macro_map_json(MacroMap::MAX_MACROS)).unwrap();
+
+        assert_eq!(map.0.len(), MacroMap::MAX_MACROS);
+        assert_eq!(map.0.first().unwrap().macro_number, 0);
+        assert_eq!(map.0.last().unwrap().actions, vec![MacroAction::Wait(1000)]);
+
+        // The accepted map round-trips back out through serialization.
+        assert_eq!(
+            serde_json::from_str::<MacroMap>(&serde_json::to_string(&map).unwrap())
+                .unwrap()
+                .0,
+            map.0
+        );
+    }
+
+    /// Builds the wire data for a superkey map of `count` superkeys,
+    /// each with no actions (`1 1 1 1 1 0` — five empty action slots
+    /// and the superkey terminator), followed by the final map
+    /// terminator.
+    fn superkey_map_data(count: usize) -> String {
+        let superkeys: String = std::iter::repeat_n("1 1 1 1 1 0 ", count).collect();
+
+        format!("{superkeys}0")
+    }
+
+    /// Builds the JSON of a superkey map holding `count` superkeys,
+    /// each with no actions, as a hand-written config file would look.
+    fn superkey_map_json(count: usize) -> String {
+        let superkeys = std::iter::repeat_n(
+            r#"{"tap":null,"hold":null,"tap_hold":null,"double_tap":null,"double_tap_hold":null}"#,
+            count,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+
+        format!("[{superkeys}]")
+    }
+
+    #[test]
+    fn superkeys_number_up_to_the_firmware_limit_without_wrapping() {
+        // 128 superkeys is the firmware's maximum (its superkey keycode
+        // range is 128 codes wide): numbering must run 1..=128.
+        let map = superkey_map_data(SuperkeyMap::MAX_SUPERKEYS)
+            .parse::<SuperkeyMap>()
+            .unwrap();
+
+        assert_eq!(map.0.len(), SuperkeyMap::MAX_SUPERKEYS);
+        assert_eq!(map.0.first().unwrap().superkey_number, 1);
+        assert_eq!(map.0.last().unwrap().superkey_number, 128);
+
+        let json = serde_json::to_string(&map).unwrap();
+
+        assert!(json.contains(r#""superkey_number":128"#));
+        assert!(!json.contains(r#""superkey_number":129"#));
+        assert!(!json.contains(r#""superkey_number":0"#));
+    }
+
+    #[test]
+    fn superkeys_past_the_firmware_limit_are_rejected_when_parsing() {
+        // One superkey past the 128-superkey addressing space of the
+        // firmware: rejected instead of parsed, so the 1-based numbering
+        // below can never wrap.
+        let res = superkey_map_data(SuperkeyMap::MAX_SUPERKEYS + 1).parse::<SuperkeyMap>();
+
+        assert!(matches!(
+            res,
+            Err(ParseSuperkeyMapError::TooManySuperkeys(
+                SuperkeyMapTooLargeError
+            ))
+        ));
+
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "the superkey map holds more than 128 superkeys — beyond what the firmware can address"
+        );
+    }
+
+    #[test]
+    fn superkeys_past_the_firmware_limit_are_rejected_when_serializing() {
+        // 257 superkeys is well past both the firmware's 128-superkey
+        // addressing space and the `u8` numbering overflow at position
+        // 256. A hand-written JSON like this must fail to serialize
+        // — before the numbering — not panic or wrap into a
+        // plausible-looking file.
+        let map = SuperkeyMap(
+            std::iter::repeat_n(
+                Superkey {
+                    superkey_number: 0,
+                    tap: None,
+                    hold: None,
+                    tap_hold: None,
+                    double_tap: None,
+                    double_tap_hold: None,
+                },
+                257,
+            )
+            .collect(),
+        );
+
+        assert!(serde_json::to_string(&map).is_err());
+    }
+
+    #[test]
+    fn superkeys_past_the_firmware_limit_are_rejected_when_deserializing_json() {
+        // One superkey past the firmware's 128-superkey addressing
+        // space: a hand-written or Bazecor-imported config file like
+        // this must fail at deserialization — the offline
+        // `superkeys to-command-data` path reads files through this
+        // impl, so it can never emit apply-ready command data for a map
+        // the firmware could never address.
+        let err =
+            serde_json::from_str::<SuperkeyMap>(&superkey_map_json(SuperkeyMap::MAX_SUPERKEYS + 1))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("more than 128 superkeys"));
+    }
+
+    #[test]
+    fn superkeys_at_the_firmware_limit_deserialize_from_json() {
+        // Exactly 128 superkeys is the firmware's maximum and must keep
+        // deserializing: the guard rejects only oversized maps.
+        let map =
+            serde_json::from_str::<SuperkeyMap>(&superkey_map_json(SuperkeyMap::MAX_SUPERKEYS))
+                .unwrap();
+
+        assert_eq!(map.0.len(), SuperkeyMap::MAX_SUPERKEYS);
+        assert_eq!(map.0.first().unwrap().superkey_number, 0);
+        assert_eq!(map.0.last().unwrap().tap, None);
+
+        // Numbering runs to exactly the firmware's limit when the
+        // accepted map is serialized back out.
+        let json = serde_json::to_string(&map).unwrap();
+
+        assert!(json.contains(r#""superkey_number":128"#));
+        assert!(!json.contains(r#""superkey_number":129"#));
+
+        // The accepted map round-trips back out through serialization.
+        assert_eq!(serde_json::from_str::<SuperkeyMap>(&json).unwrap().0, map.0);
     }
 }
