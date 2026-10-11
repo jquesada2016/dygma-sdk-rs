@@ -6,7 +6,8 @@ use std::str::FromStr;
 use winnow::{
     ModalResult, Parser,
     ascii::{dec_uint, space1},
-    combinator::{repeat_till, terminated},
+    combinator::{alt, eof, repeat_till, terminated},
+    error::StrContext,
     token::rest,
 };
 
@@ -27,6 +28,14 @@ impl FromStr for SuperkeyMap {
     type Err = ParseSuperkeyMapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // An empty or whitespace-only map holds no superkeys, and
+        // neither does an erased one: a stream of `65535` bytes — the
+        // eraser payload an empty map serializes to. (Parsing these as
+        // empty maps is user-ratified 2026-10-10.)
+        if s.trim().is_empty() || s.split_whitespace().all(|token| token == "65535") {
+            return Ok(Self(Vec::new()));
+        }
+
         let map = super_keys_parser
             .parse(s)
             .map_err(|err| ParseSuperkeyMapError(err.to_string()))?;
@@ -108,12 +117,37 @@ impl Superkey {
 }
 
 fn super_keys_parser(input: &mut &str) -> ModalResult<Vec<Superkey>> {
-    let (superkey_map, _) =
-        repeat_till(1.., terminated(super_key_parser, "0 "), "0 ").parse_next(input)?;
+    let (superkey_map, _) = repeat_till(
+        1..,
+        terminated(super_key_parser, superkey_end_parser),
+        superkey_end_parser,
+    )
+    .parse_next(input)?;
 
+    // Anything after the map's structural `0 0` terminator is stale
+    // data — the `65535` padding, or bytes left behind by a previous,
+    // larger map — and is intentionally ignored, mirroring the macro
+    // parser and Bazecor, which splits the raw string on the first
+    // `" 0 0"` and discards the tail. Unlike that substring split, the
+    // terminator here is structural, so slot values containing `0 0`
+    // are not cut short. (Trailing-data tolerance adjudicated
+    // intentional 2026-10-10.)
     let _ = rest.parse_next(input)?;
 
     Ok(superkey_map)
+}
+
+/// The `0` that terminates a superkey and the superkey map itself,
+/// followed by an optional separating space (or the end of the data).
+///
+/// Mirrors the macro map's terminator: the device capture ends with a
+/// trailing space, but Bazecor backup entries end `... 0 0` with no
+/// trailing space, so both must parse.
+fn superkey_end_parser(input: &mut &str) -> ModalResult<()> {
+    ("0", alt((space1.void(), eof.void())))
+        .context(StrContext::Label("superkey terminator"))
+        .parse_next(input)
+        .map(|_| ())
 }
 
 fn super_key_parser(input: &mut &str) -> ModalResult<Superkey> {
@@ -136,7 +170,13 @@ fn super_key_parser(input: &mut &str) -> ModalResult<Superkey> {
 }
 
 fn superkey_action_parser(input: &mut &str) -> ModalResult<Option<KeyKind>> {
-    let (action, _) = (dec_uint::<_, u16, _>, space1).parse_next(input)?;
+    let (action, _) = (
+        dec_uint::<_, u16, _>,
+        // The final byte of the data may be at the end of the input, with
+        // no separating space after it.
+        alt((space1.void(), eof.void())),
+    )
+        .parse_next(input)?;
 
     if action == 1 {
         return Ok(None);
@@ -160,5 +200,128 @@ mod tests {
     #[test]
     fn parse_succeeds() {
         let _ = SUPERKEY_DATA.parse::<SuperkeyMap>().unwrap();
+    }
+
+    #[test]
+    fn can_parse_without_trailing_space() {
+        // Mirrors the macro parser: device captures end with a trailing
+        // space (see `SUPERKEY_DATA` above), but Bazecor backup entries
+        // carry none, so we accept both.
+        let map = "44 57 1 1 1 0 0".parse::<SuperkeyMap>().unwrap();
+
+        assert_eq!(map.0.len(), 1);
+        assert_eq!(map.0[0].tap, Some(KeyKind::from(44)));
+        assert_eq!(map.0[0].hold, Some(KeyKind::from(57)));
+        // An action value of `1` means "no action".
+        assert_eq!(map.0[0].tap_hold, None);
+        assert_eq!(map.0[0].double_tap, None);
+        assert_eq!(map.0[0].double_tap_hold, None);
+    }
+
+    #[test]
+    fn can_parse_bazecor_backup_superkeys() {
+        // The real `superkeys.map` entry from Bazecor's
+        // `src/defaultBackups/Defy-wired-backup.json`, byte-identical in
+        // the wireless backup: one superkey, then the superkey and map
+        // terminators. Byte-verified: it ends `... 0 0` with NO trailing
+        // space, and Bazecor stores no `65535` padding — only the live
+        // bytes.
+        const BAZECOR_BACKUP_SUPERKEY_DATA: &str = "262 281 2329 283 1 0 0";
+
+        let map = BAZECOR_BACKUP_SUPERKEY_DATA.parse::<SuperkeyMap>().unwrap();
+
+        assert_eq!(map.0.len(), 1);
+        assert_eq!(map.0[0].tap, Some(KeyKind::from(262)));
+        assert_eq!(map.0[0].hold, Some(KeyKind::from(281)));
+        assert_eq!(map.0[0].tap_hold, Some(KeyKind::from(2329)));
+        assert_eq!(map.0[0].double_tap, Some(KeyKind::from(283)));
+        assert_eq!(map.0[0].double_tap_hold, None);
+
+        // Round-trip: serializing pads the live bytes to the 512-value
+        // superkey memory, and the padded data parses back to the same
+        // superkey.
+        let str_data = map.to_command_data::<512>().unwrap();
+
+        assert!(str_data.starts_with(BAZECOR_BACKUP_SUPERKEY_DATA));
+
+        let reparsed = str_data.parse::<SuperkeyMap>().unwrap();
+
+        assert_eq!(reparsed.0.len(), 1);
+        assert_eq!(reparsed.0[0].tap, Some(KeyKind::from(262)));
+        assert_eq!(reparsed.0[0].double_tap_hold, None);
+    }
+
+    #[test]
+    fn can_parse_sonsei_backup_superkeys() {
+        // The real `superkeys.map` entry from Bazecor's
+        // `src/defaultBackups/Sonsei.json`: four superkeys. Byte-verified
+        // like the Defy backups: no trailing space, no padding.
+        const SONSEI_BACKUP_SUPERKEY_DATA: &str =
+            "42 17452 1 1 1 0 40 17451 1 1 1 0 17154 230 1 1 1 0 57 17452 1 1 1 0 0";
+
+        let map = SONSEI_BACKUP_SUPERKEY_DATA.parse::<SuperkeyMap>().unwrap();
+
+        assert_eq!(map.0.len(), 4);
+        assert_eq!(map.0[0].tap, Some(KeyKind::from(42)));
+        assert_eq!(map.0[3].tap, Some(KeyKind::from(57)));
+        assert_eq!(map.0[3].hold, Some(KeyKind::from(17452)));
+        assert_eq!(map.0[3].double_tap_hold, None);
+
+        let str_data = map.to_command_data::<512>().unwrap();
+
+        assert!(str_data.starts_with(SONSEI_BACKUP_SUPERKEY_DATA));
+    }
+
+    #[test]
+    fn can_parse_erased_superkeys() {
+        // An erased superkey map is the eraser payload: 512 `65535`
+        // bytes, exactly what an empty map serializes to.
+        let eraser_data = vec!["65535"; 512].join(" ");
+
+        let map = eraser_data.parse::<SuperkeyMap>().unwrap();
+
+        assert!(map.0.is_empty());
+
+        // The round trip is a fixed point: serializing the empty map
+        // reproduces the eraser payload byte for byte.
+        assert_eq!(
+            SuperkeyMap(Vec::new()).to_command_data::<512>().unwrap(),
+            eraser_data
+        );
+
+        // The erased state is recognized at any length, symmetric with
+        // the macro parser's all-`255` ruling.
+        assert!(
+            "65535 65535 65535 65535 65535 "
+                .parse::<SuperkeyMap>()
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn can_parse_empty_input() {
+        // An empty or whitespace-only map holds no superkeys, symmetric
+        // with the erased all-`65535` stream above. (Parsing these as
+        // empty maps is user-ratified 2026-10-10.)
+        for data in ["", "   "] {
+            let map = data.parse::<SuperkeyMap>().unwrap();
+
+            assert!(map.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_data_fails_cleanly() {
+        // Garbage instead of superkey data.
+        assert!("garbage".parse::<SuperkeyMap>().is_err());
+
+        // A truncated map: a superkey terminator without the map's final
+        // `0`.
+        assert!("44 57 1 1 1 0".parse::<SuperkeyMap>().is_err());
+
+        // A superkey with fewer than five actions.
+        assert!("44 57 1 1 0".parse::<SuperkeyMap>().is_err());
     }
 }

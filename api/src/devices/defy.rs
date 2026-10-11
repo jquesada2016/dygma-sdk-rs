@@ -31,8 +31,30 @@ mod error {
 
     /// Error when parsing a macro map from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
-    #[display("failed to parse macros map: {_0}")]
-    pub struct ParseMacroMapError(parsing::macros::ParseMacroMapError);
+    pub enum ParseMacroMapError {
+        /// The macro map data is not valid wire data.
+        #[display("failed to parse macros map: {_0}")]
+        MalformedData(parsing::macros::ParseMacroMapError),
+        /// The map holds more macros than the firmware can address.
+        #[display("{_0}")]
+        TooManyMacros(MacroMapTooLargeError),
+    }
+
+    /// Error returned when a [`MacroMap`] holds more macros than the
+    /// firmware can address.
+    ///
+    /// The firmware triggers macros through a keycode range exactly 128
+    /// codes wide (`DYNAMIC_MACRO_FIRST` to `DYNAMIC_MACRO_LAST` in the
+    /// firmware's `Kaleidoscope-Ranges.h`), so macros past that count
+    /// could never be triggered. Its macro position cache is a 127-entry
+    /// array (`map_` in the firmware's `DynamicMacros.h`) indexed by a
+    /// `u8`, so an oversized map corrupts it well before the `u8` wraps.
+    #[derive(Clone, Copy, Debug, Display, Error)]
+    #[display(
+        "the macro map holds more than {} macros, which is more than the firmware can address",
+        MacroMap::MAX_MACROS
+    )]
+    pub struct MacroMapTooLargeError;
 
     /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
     /// creating the command data.
@@ -98,6 +120,9 @@ mod error {
         /// Too many macros were in the map to fit in the macro memory.
         #[display("{_0}")]
         TooManyMacros(parsing::macros::TooManyMacrosError),
+        /// The map holds more macros than the firmware can address.
+        #[display("{_0}")]
+        MacroMapTooLarge(MacroMapTooLargeError),
         /// A key code was too large for a single-byte macro action.
         #[display("{_0}")]
         KeyCodeTooLarge(parsing::macros::KeyCodeTooLargeError),
@@ -329,7 +354,14 @@ impl DefyKeyboard {
     /// The macro map memory is probed per device with the
     /// `macros.memory` command first, so the map is serialized with the
     /// correct padding and erase semantics for this specific keyboard.
+    ///
+    /// Fails with [`ApplyMacroError::MacroMapTooLarge`] before touching
+    /// the device when the map holds more than
+    /// [`MacroMap::MAX_MACROS`] macros, since the firmware could never
+    /// trigger them.
     pub async fn apply_macros(&mut self, macros: &MacroMap) -> Result<(), ApplyMacroError> {
+        MacroMap::check_size(macros.0.len()).map_err(ApplyMacroError::MacroMapTooLarge)?;
+
         let memory_size = self
             .macro_memory_size()
             .await
@@ -1277,15 +1309,39 @@ impl From<Superkey> for parsing::superkeys::Superkey {
 #[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, Deserialize)]
 pub struct MacroMap(pub Vec<Macro>);
 
+impl MacroMap {
+    /// The maximum number of macros a [`MacroMap`] can hold.
+    ///
+    /// The firmware triggers macros through a keycode range exactly 128
+    /// codes wide (`DYNAMIC_MACRO_FIRST` to `DYNAMIC_MACRO_LAST` in the
+    /// firmware's `Kaleidoscope-Ranges.h`), so macros beyond that count
+    /// could never be triggered.
+    pub const MAX_MACROS: usize = 128;
+
+    /// Checks that a map holding `macros` macros does not hold more
+    /// than [`MAX_MACROS`](Self::MAX_MACROS).
+    fn check_size(macros: usize) -> Result<(), MacroMapTooLargeError> {
+        if macros > Self::MAX_MACROS {
+            return Err(MacroMapTooLargeError);
+        }
+
+        Ok(())
+    }
+}
+
 impl serde::Serialize for MacroMap {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
+        Self::check_size(self.0.len()).map_err(serde::ser::Error::custom)?;
+
         self.0
             .iter()
             .enumerate()
             .map(|(i, m)| Macro {
+                // Cannot wrap: the size check bounds the position to
+                // `MAX_MACROS` (128), well within `u8`.
                 macro_number: i as u8 + 1,
                 actions: m.actions.clone(),
             })
@@ -1298,18 +1354,28 @@ impl FromStr for MacroMap {
     type Err = ParseMacroMapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let map = s
-            .parse::<parsing::macros::MacroMap>()?
-            .0
-            .into_iter()
-            .enumerate()
-            .map(|(i, macro_data)| Macro {
-                macro_number: i as u8 + 1,
-                actions: macro_data.actions.into_iter().map(Into::into).collect(),
-            })
-            .collect();
+        let wire_map = s.parse::<parsing::macros::MacroMap>()?;
 
-        Ok(Self(map))
+        // Checked before the numbering below: the wire parse itself
+        // imposes no count cap, so an unchecked position past 255 would
+        // overflow the 1-based `u8` numbering.
+        Self::check_size(wire_map.0.len())?;
+
+        let map = Self(
+            wire_map
+                .0
+                .into_iter()
+                .enumerate()
+                .map(|(i, macro_data)| Macro {
+                    // Cannot wrap: the size check above bounds the
+                    // position to `MAX_MACROS` (128), well within `u8`.
+                    macro_number: i as u8 + 1,
+                    actions: macro_data.actions.into_iter().map(Into::into).collect(),
+                })
+                .collect(),
+        );
+
+        Ok(map)
     }
 }
 
@@ -1335,6 +1401,10 @@ pub struct Macro {
     /// writes is entirely ignored. The idea is that you define the macros
     /// you want, and use this number to know what [`KeyKind`] to use to
     /// assign the particular macro to a key.
+    ///
+    /// Numbers are assigned from a macro's position in the map (1-based)
+    /// when parsing or serializing, and a [`MacroMap`] can hold at most
+    /// [`MacroMap::MAX_MACROS`] macros, so the number never wraps.
     #[serde(skip_deserializing)]
     pub macro_number: u8,
     /// The actions this macro will perform.
@@ -1521,5 +1591,86 @@ mod tests {
         let expected: Vec<_> = map.0.iter().map(|m| m.actions.clone()).collect();
 
         assert_eq!(actions, expected);
+    }
+
+    /// Builds the wire data for a macro map of `count` macros, each a
+    /// single-byte key down of `A` (`6 44 0`), followed by the final
+    /// map terminator.
+    fn macro_map_data(count: usize) -> String {
+        let macros: String = std::iter::repeat_n("6 44 0 ", count).collect();
+
+        format!("{macros}0")
+    }
+
+    #[test]
+    fn macros_number_up_to_the_firmware_limit_without_wrapping() {
+        // 128 one-action macros is the firmware's maximum (its macro
+        // keycode range is 128 codes wide): numbering must run 1..=128.
+        let map = macro_map_data(MacroMap::MAX_MACROS)
+            .parse::<MacroMap>()
+            .unwrap();
+
+        assert_eq!(map.0.len(), MacroMap::MAX_MACROS);
+        assert_eq!(map.0.first().unwrap().macro_number, 1);
+        assert_eq!(map.0.last().unwrap().macro_number, 128);
+
+        let json = serde_json::to_string(&map).unwrap();
+
+        assert!(json.contains(r#""macro_number":128"#));
+        assert!(!json.contains(r#""macro_number":129"#));
+        assert!(!json.contains(r#""macro_number":0"#));
+    }
+
+    #[test]
+    fn macros_past_the_firmware_limit_are_rejected_when_parsing() {
+        // One macro past the 128-macro addressing space of the firmware:
+        // rejected instead of parsed, so the 1-based numbering below can
+        // never wrap.
+        let res = macro_map_data(MacroMap::MAX_MACROS + 1).parse::<MacroMap>();
+
+        assert!(matches!(
+            res,
+            Err(ParseMacroMapError::TooManyMacros(MacroMapTooLargeError))
+        ));
+
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "the macro map holds more than 128 macros, which is more than the firmware can address"
+        );
+    }
+
+    #[test]
+    fn macros_past_the_numbering_range_are_rejected_when_parsing() {
+        // 257 macros drives a naive 1-based `u8` numbering past 255: the
+        // count check must reject the map BEFORE numbering, returning
+        // the typed error rather than overflowing (a debug-build panic
+        // at position 256) or wrapping (...254, 255, 0, 1...).
+        let res = macro_map_data(257).parse::<MacroMap>();
+
+        assert!(matches!(
+            res,
+            Err(ParseMacroMapError::TooManyMacros(MacroMapTooLargeError))
+        ));
+    }
+
+    #[test]
+    fn macros_past_the_firmware_limit_are_rejected_when_serializing() {
+        // 257 macros is well past both the firmware's 128-macro
+        // addressing space and the old `u8` numbering wrap at position
+        // 256 (numbers went ...254, 255, 0, 1...). A hand-written JSON
+        // like this must fail to serialize, not be renumbered into a
+        // plausible-looking file.
+        let map = MacroMap(
+            std::iter::repeat_n(
+                Macro {
+                    macro_number: 0,
+                    actions: vec![MacroAction::Wait(1000)],
+                },
+                257,
+            )
+            .collect(),
+        );
+
+        assert!(serde_json::to_string(&map).is_err());
     }
 }
