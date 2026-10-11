@@ -3,7 +3,7 @@
 
 use crate::{
     focus_api::{
-        CreateHidFocusApiError, FocusApiConnection, HidFocusApi, RunCommandError,
+        CreateHidFocusApiError, FocusApiConnection, GetCommandsError, HidFocusApi, RunCommandError,
         SerialPortFocusApi, parsing,
     },
     keycode_tables::KeyKind,
@@ -190,6 +190,35 @@ mod error {
         /// Writing the erase payload failed.
         #[display("{_0}")]
         Erase(SetSettingError),
+    }
+
+    /// Error returned from [`DefyKeyboard::create_backup`].
+    #[derive(Debug, Display, Error)]
+    pub enum CreateBackupError {
+        /// Querying the device's `help` command list failed, so the
+        /// capture list could not be computed.
+        #[display("failed to list the device's commands: {_0}")]
+        ListCommands(GetCommandsError),
+        /// Capturing the response of one of the backup's commands
+        /// failed.
+        #[display("failed to capture the `{command}` response: {source}")]
+        Command {
+            /// The command whose response could not be captured. The
+            /// capture stopped here; everything listed before it was
+            /// captured and is lost with this error.
+            command: String,
+            /// The error the command failed with.
+            source: RunCommandError,
+        },
+        /// Reading the Neuron's `hardware.chip_id` failed.
+        #[display("failed to read the chip id: {_0}")]
+        ChipId(GetSettingError),
+        /// Reading the `version` response failed.
+        #[display("failed to read the firmware version: {_0}")]
+        Version(RunCommandError),
+        /// Reading `hardware.wireless` failed.
+        #[display("failed to read whether this is the wireless variant: {_0}")]
+        Wireless(GetSettingError),
     }
 
     impl From<parsing::macros::ToCommandDataError> for ApplyMacroError {
@@ -827,6 +856,86 @@ impl DefyKeyboard {
         Ok(())
     }
 
+    /// Captures a full configuration backup from the device, in the
+    /// Bazecor-compatible backup file format
+    /// ([`parsing::backup::DefyBackup`]).
+    ///
+    /// The capture list is the device's `help` output minus the
+    /// deny-list (`parsing::backup::backup_capture_commands`), exactly
+    /// what Bazecor captures; every listed command is sent as a *read*
+    /// and its response stored verbatim, so creating a backup never
+    /// writes to the device and is always safe to run — e.g. before an
+    /// apply. Captured `keymap.custom`/`superkeys.map`/`macros.map`
+    /// data is preserved as the device sent it (padded, with trailing
+    /// separators), not transformed the way Bazecor post-processes its
+    /// captures.
+    ///
+    /// The file's neuron object carries the chip id and the Defy
+    /// device descriptor, but no names yet: layer, macro, and superkey
+    /// names are app-side in Bazecor, and this crate has no name store
+    /// (see [`parsing::backup::BackupNeuron`]).
+    pub async fn create_backup(
+        &mut self,
+    ) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+        let help_commands = self
+            .available_commands()
+            .await
+            .map_err(CreateBackupError::ListCommands)?;
+        let capture_list = parsing::backup::backup_capture_commands(&help_commands);
+
+        // Sequential on purpose: each command is a device round-trip,
+        // and the capture order is the `help` order the format keeps.
+        let mut captured = Vec::with_capacity(capture_list.len());
+        for command in capture_list {
+            let data = self.run_command(&command, None).await.map_err(|source| {
+                CreateBackupError::Command {
+                    command: command.clone(),
+                    source,
+                }
+            })?;
+
+            captured.push(parsing::backup::BackupCommand::new(command, data));
+        }
+
+        let chip_id = self
+            .get_chip_id()
+            .await
+            .map_err(CreateBackupError::ChipId)?;
+        let version_response = self
+            .run_command(Self::VERSION_COMMAND_NAME, None)
+            .await
+            .map_err(CreateBackupError::Version)?;
+        let wireless = self
+            .is_wireless()
+            .await
+            .map_err(CreateBackupError::Wireless)?;
+
+        Ok(parsing::backup::DefyBackup::capture(
+            chip_id.as_str(),
+            parsing::backup::BackupVersions::from_version_response(&version_response),
+            captured,
+            Self::backup_device_descriptor(wireless, chip_id.as_str()),
+        ))
+    }
+
+    /// Builds the Defy device descriptor a backup's neuron object
+    /// carries, as Bazecor ships it in its Defy backups: the static
+    /// descriptor with the per-device `wireless` flag and `chipId`
+    /// filled in.
+    ///
+    /// Bazecor's restore flow reads `neuron.device.info.product` out of
+    /// a backup file, so a backup without a descriptor is not
+    /// restorable there; captures made through
+    /// [`DefyKeyboard::create_backup`] always carry this descriptor.
+    pub fn backup_device_descriptor(wireless: bool, chip_id: &str) -> serde_json::Value {
+        let mut descriptor = backup_device_descriptor_template();
+
+        descriptor["wireless"] = wireless.into();
+        descriptor["chipId"] = chip_id.into();
+
+        descriptor
+    }
+
     /// Runs a single-value settings command and parses its response.
     async fn get_setting<T>(&mut self, command: &str) -> Result<T, GetSettingError>
     where
@@ -846,6 +955,85 @@ impl DefyKeyboard {
 
         Ok(())
     }
+}
+
+/// Builds the static part of the Defy device descriptor a backup
+/// carries: exactly the object Bazecor ships in its Defy backup files
+/// (`src/defaultBackups/Defy-*-backup.json`, `neuron.device`), minus
+/// the per-device `wireless` and `chipId` fields, which
+/// [`DefyKeyboard::backup_device_descriptor`] fills in.
+///
+/// The two shipped Defy backups carry byte-identical descriptors
+/// apart from `wireless`; the key set and every value below are
+/// theirs, and kept in sync with them by
+/// [`backup_device_descriptor_matches_bazecors_shipped_descriptor`].
+fn backup_device_descriptor_template() -> serde_json::Value {
+    serde_json::json!({
+        "info": {
+            "vendor": "Dygma",
+            "product": "Defy",
+            "keyboardType": "wireless",
+            "displayName": "Dygma Defy wireless",
+            "urls": [
+                { "name": "Homepage", "url": "https://www.dygma.com/defy/" }
+            ]
+        },
+        "usb": { "vendorId": 13807, "productId": 18 },
+        "keyboard": {
+            "rows": 5,
+            "columns": 16,
+            "left": [
+                [0, 1, 2, 3, 4, 5, 6],
+                [16, 17, 18, 19, 20, 21, 22],
+                [32, 33, 34, 35, 36, 37, 38],
+                [48, 49, 50, 51, 52, 53],
+                [64, 65, 66, 67, 68, 69, 70, 71]
+            ],
+            "right": [
+                [9, 10, 11, 12, 13, 14, 15],
+                [25, 26, 27, 28, 29, 30, 31],
+                [41, 42, 43, 44, 45, 46, 47],
+                [57, 58, 59, 60, 61, 62, 63],
+                [72, 73, 74, 75, 76, 77, 78, 79]
+            ],
+            "ledsLeft": [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                32, 33, 34
+            ],
+            "ledsRight": [
+                35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+                50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64,
+                65, 66, 67, 68, 69
+            ]
+        },
+        "keyboardUnderglow": {
+            "rows": 2,
+            "columns": 89,
+            "ledsLeft": [
+                70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+                85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+                112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122
+            ],
+            "ledsRight": [
+                123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134,
+                135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146,
+                147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158,
+                159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
+                171, 172, 173, 174, 175
+            ]
+        },
+        "RGBWMode": true,
+        "components": {},
+        "instructions": {
+            "en": {
+                "updateInstructions": "To update the firmware, the keyboard needs a special reset. When the countdown starts, press and hold the Escape key. Soon after the countdown finished, the Neuron's light should start a blue pulsing pattern, and the flashing will proceed. At this point, you should release the Escape key."
+            }
+        },
+        "wireless": true,
+        "chipId": ""
+    })
 }
 
 /// Static dispatch for focus API connections.
@@ -1691,6 +1879,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(format!("{str_data} "), data);
+    }
+
+    /// The exact `neuron.device` object of the shipped Defy wireless
+    /// backup (`bazecor/src/defaultBackups/Defy-wireless-backup.json`),
+    /// byte-faithful. The wired backup's descriptor is identical apart
+    /// from `"wireless": false`.
+    const BAZECOR_SHIPPED_DEFY_DEVICE_JSON: &str = r#"{"info": {"vendor": "Dygma", "product": "Defy", "keyboardType": "wireless", "displayName": "Dygma Defy wireless", "urls": [{"name": "Homepage", "url": "https://www.dygma.com/defy/"}]}, "usb": {"vendorId": 13807, "productId": 18}, "keyboard": {"rows": 5, "columns": 16, "left": [[0, 1, 2, 3, 4, 5, 6], [16, 17, 18, 19, 20, 21, 22], [32, 33, 34, 35, 36, 37, 38], [48, 49, 50, 51, 52, 53], [64, 65, 66, 67, 68, 69, 70, 71]], "right": [[9, 10, 11, 12, 13, 14, 15], [25, 26, 27, 28, 29, 30, 31], [41, 42, 43, 44, 45, 46, 47], [57, 58, 59, 60, 61, 62, 63], [72, 73, 74, 75, 76, 77, 78, 79]], "ledsLeft": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34], "ledsRight": [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69]}, "keyboardUnderglow": {"rows": 2, "columns": 89, "ledsLeft": [70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122], "ledsRight": [123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175]}, "RGBWMode": true, "components": {}, "instructions": {"en": {"updateInstructions": "To update the firmware, the keyboard needs a special reset. When the countdown starts, press and hold the Escape key. Soon after the countdown finished, the Neuron's light should start a blue pulsing pattern, and the flashing will proceed. At this point, you should release the Escape key."}}, "wireless": true, "chipId": "8ed7f33db024a5b5"}"#;
+
+    #[test]
+    fn backup_device_descriptor_matches_bazecors_shipped_descriptor() {
+        let shipped: serde_json::Value =
+            serde_json::from_str(BAZECOR_SHIPPED_DEFY_DEVICE_JSON).unwrap();
+
+        // The wireless variant reproduces the shipped descriptor
+        // exactly, per-device fields included.
+        let wireless = DefyKeyboard::backup_device_descriptor(true, "8ed7f33db024a5b5");
+
+        assert_eq!(wireless, shipped);
+
+        // The wired variant flips only the `wireless` flag — matching
+        // the diff between the two shipped Defy backups.
+        let wired = DefyKeyboard::backup_device_descriptor(false, "another-chip-id");
+
+        assert_eq!(wired, {
+            let mut wired = shipped.clone();
+            wired["wireless"] = false.into();
+            wired["chipId"] = "another-chip-id".into();
+            wired
+        });
     }
 
     #[test]

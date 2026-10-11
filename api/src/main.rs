@@ -3,6 +3,7 @@ extern crate derive_more;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
+use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
 use error_stack::{IntoReport, ResultExt};
@@ -38,6 +39,9 @@ enum Cli {
     /// Commands for working with device settings and identity.
     #[command(subcommand)]
     Settings(SettingsCommands),
+    /// Commands for working with device backups.
+    #[command(subcommand)]
+    Backup(BackupCommands),
     /// Commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCode(KeyCodeCommands),
@@ -51,6 +55,7 @@ impl Cli {
             Self::Superkeys(cmd) => cmd.perform().await,
             Self::Macros(cmd) => cmd.perform().await,
             Self::Settings(cmd) => cmd.perform().await,
+            Self::Backup(cmd) => cmd.perform().await,
             Self::KeyCode(cmd) => cmd.perform(),
         }
     }
@@ -887,6 +892,87 @@ impl SettingsCommands {
                     .attach("resetting the Defy's EEPROM")?;
 
                 println!("The Defy's EEPROM has been reset.");
+
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Capture a full configuration backup from the device and save it
+    /// as a Bazecor-compatible backup JSON file.
+    ///
+    /// The capture list is the device's `help` output minus the same
+    /// deny-list Bazecor applies, with `led.brightnessUG` force-added.
+    /// Every listed command is sent as a read and its response stored
+    /// verbatim — capturing never writes to the keyboard, so it is
+    /// safe to run at any time (e.g. before an apply). The file this
+    /// writes loads into Bazecor's backup flow.
+    Create {
+        /// The path the backup JSON file will be saved to.
+        #[clap(default_value = "backup.json")]
+        path: PathBuf,
+    },
+    /// Summarize a backup JSON file.
+    ///
+    /// This never opens a connection to the device: it only parses the
+    /// file and prints what it holds. Works with files written by
+    /// `backup create` and with Bazecor's own backup files.
+    Show {
+        /// The path of the backup JSON file.
+        path: PathBuf,
+    },
+}
+
+impl BackupCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Create { path } => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                let backup = defy
+                    .create_backup()
+                    .await
+                    .change_context(Error)
+                    .attach("capturing the backup from the Defy")?;
+
+                safe_pretty_json_file(&backup, &path).await?;
+
+                println!(
+                    "Captured {} commands from Neuron {} into {}.",
+                    backup.backup.len(),
+                    backup.neuron_id,
+                    path.display()
+                );
+
+                Ok(())
+            }
+            Self::Show { path } => {
+                let backup = read_json_file::<DefyBackup>(&path).await?;
+
+                println!("neuron id: {}", backup.neuron_id);
+                println!("neuron name: {}", backup.neuron.name);
+
+                for (name, version) in [
+                    ("bazecor", &backup.versions.bazecor),
+                    ("kaleidoscope", &backup.versions.kaleidoscope),
+                    ("firmware", &backup.versions.firmware),
+                ] {
+                    if let Some(version) = version {
+                        println!("version {name}: {version}");
+                    }
+                }
+
+                println!("commands captured: {}", backup.backup.len());
+
+                for entry in &backup.backup {
+                    println!("  {} ({} bytes of data)", entry.command, entry.data.len());
+                }
 
                 Ok(())
             }
