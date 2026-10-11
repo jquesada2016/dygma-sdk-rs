@@ -550,6 +550,88 @@ impl WireFailure {
     }
 }
 
+/// Where in wire data a parse failure renders, decided once for both
+/// failure sites — the direct `--keymap`-style arguments and the
+/// backup entries — so neither can forget a case.
+///
+/// The decision, in the order the parser's own view of the failure
+/// allows:
+///
+/// * No located failure (a layer-count or map-size rejection):
+///   [`WireSite::Unlocated`], pointing at the first token.
+/// * A consumed-offender rejection (the unsupported macro action
+///   kind): the offset marks where parsing stopped, just past the
+///   rejected kind, so scanning forward from it could only
+///   mis-attribute a later bad token — the site is the stop, or the
+///   end of the data when nothing follows.
+/// * Otherwise the keymap parser gives up at the start of the layer
+///   that failed rather than at the token, so the scan looks for the
+///   first token from the offset on that is not a valid value of the
+///   format's width: when it finds one, that token is the failure;
+///   when every token is valid, the site is the stop where parsing
+///   gave up — or the end of the data when nothing follows.
+enum WireSite<'data> {
+    /// The offending token — the failure itself — at its offset.
+    Offender {
+        /// Byte offset of the token within the data.
+        offset: usize,
+        /// The offending token.
+        token: &'data str,
+    },
+    /// Parsing stopped at `offset` with data still ahead: `token` is
+    /// the next token; no single token is the failure, so the span
+    /// marks where parsing stopped.
+    Stop {
+        /// Byte offset of the token within the data.
+        offset: usize,
+        /// The token parsing stopped at.
+        token: &'data str,
+    },
+    /// The data ended where a value was expected.
+    End,
+    /// The parser located no failure; `token` is the data's first
+    /// token, when there is one, for the span to point at.
+    Unlocated {
+        /// The first token and its offset, when the data has one.
+        token: Option<(usize, &'data str)>,
+    },
+}
+
+/// Runs the one wire-failure decision over `text`: `located` is the
+/// parser's view of the failure — the format, the byte offset it
+/// located, and whether it consumed the offending byte before
+/// rejecting it — or `None` when it located nothing.
+fn wire_site<'data>(
+    text: &'data str,
+    located: Option<(WireFormat, usize, bool)>,
+) -> WireSite<'data> {
+    let Some((format, offset, consumed_offender)) = located else {
+        return WireSite::Unlocated {
+            token: token_at(text, 0),
+        };
+    };
+
+    // A consumed-offender rejection (the unsupported macro action
+    // kind): scanning forward from the stop could only mis-attribute a
+    // later bad token, so skip the scan.
+    if !consumed_offender && let Some((token_offset, token)) = wire_offender(text, offset, format) {
+        return WireSite::Offender {
+            offset: token_offset,
+            token,
+        };
+    }
+
+    // No offender at or after the offset: the stop when data follows
+    // it, the end of the data when it does not.
+    match token_at(text, offset) {
+        Some((token_start, token)) => WireSite::Stop {
+            offset: token_start,
+            token,
+        },
+        None => WireSite::End,
+    }
+}
+
 /// Builds the report for a `--keymap`-style wire string that failed to
 /// parse, with the located snippet attached. The label names the wire
 /// data for what it is — these arguments are not JSON files.
@@ -567,74 +649,91 @@ pub(super) fn wire_parse_report(
         .attach_opaque(wire_snippet(format, input, &failure, context))
 }
 
-/// Locates a wire parse failure in the raw input: the library error's
-/// byte offset, refined with the offending token, the layer for keymap
-/// data, and the parser's complaint.
+/// Assembles the diagnostic for a wire parse failure: the failure site
+/// comes from the one shared decision, dressed in this path's
+/// vocabulary — the offending token, the layer for keymap data, and
+/// the parser's complaint.
 fn wire_snippet(
     format: WireFormat,
     input: &str,
     failure: &WireFailure,
     context: Vec<String>,
 ) -> ErrorSnippet {
-    let (span, label, message, source_text) = match failure.offset {
-        // A consumed-offender rejection (the unsupported macro action
-        // kind): the offset marks where parsing stopped, just past the
-        // rejected kind — scanning forward from it could only
-        // mis-attribute a later bad token, so render the stop-and-
-        // reason form straight away.
-        Some(offset) if failure.consumed_offender => {
-            stop_or_eof(format, input, offset, failure, true)
+    let located = failure
+        .offset
+        .map(|offset| (format, offset, failure.consumed_offender));
+
+    let (span, label, message, source_text) = match wire_site(input, located) {
+        // The offending token, highlighted in an excerpt, because wire
+        // data is one huge line.
+        WireSite::Offender { offset, token } => {
+            // Counting the tokens before the failure (not the
+            // spaces) keeps the layer number right for device
+            // captures, which end every layer with a trailing
+            // space, and for any mixed separator runs.
+            let layer = match format {
+                WireFormat::Keymap => format!(
+                    " (layer {})",
+                    input[..offset].split_whitespace().count() / 80 + 1
+                ),
+                _ => String::new(),
+            };
+
+            let label = if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+                "not a number".to_owned()
+            } else {
+                match format {
+                    WireFormat::Macros => "out of range for a u8".to_owned(),
+                    _ => "out of range for a u16".to_owned(),
+                }
+            };
+
+            let (source_text, span) = excerpt(input, offset, token.len());
+
+            (
+                span,
+                label,
+                format!(
+                    "invalid token `{token}` in {} wire data{layer}",
+                    format.noun()
+                ),
+                source_text,
+            )
         }
-        // The parser located the failure: highlight the offending token
-        // in an excerpt, because wire data is one huge line. The keymap
-        // parser gives up at the start of the layer that failed rather
-        // than at the token, so scan forward from its offset for the
-        // first token that is not a valid value of the format's width —
-        // when the scan finds one, that token is the failure.
-        Some(offset) => match wire_offender(input, offset, format) {
-            Some((token_offset, token)) => {
-                // Counting the tokens before the failure (not the
-                // spaces) keeps the layer number right for device
-                // captures, which end every layer with a trailing
-                // space, and for any mixed separator runs.
-                let layer = match format {
-                    WireFormat::Keymap => format!(
-                        " (layer {})",
-                        input[..token_offset].split_whitespace().count() / 80 + 1
-                    ),
-                    _ => String::new(),
-                };
+        WireSite::Stop { offset, token } => {
+            let (source_text, span) = excerpt(input, offset, token.len());
 
-                let label = if !token.bytes().all(|byte| byte.is_ascii_digit()) {
-                    "not a number".to_owned()
-                } else {
-                    match format {
-                        WireFormat::Macros => "out of range for a u8".to_owned(),
-                        _ => "out of range for a u16".to_owned(),
-                    }
-                };
+            (
+                span,
+                "parsing stopped here".to_owned(),
+                failure.reason.clone(),
+                source_text,
+            )
+        }
+        WireSite::End => {
+            let (source_text, span) = excerpt(input, input.len(), 0);
 
-                let (source_text, span) = excerpt(input, token_offset, token.len());
-
-                (
-                    span,
-                    label,
-                    format!(
-                        "invalid token `{token}` in {} wire data{layer}",
-                        format.noun()
-                    ),
-                    source_text,
+            // A consumed-offender rejection keeps the reason as the
+            // message even at the end of the data: the true failure is
+            // the consumed byte, not the end.
+            let message = if failure.consumed_offender {
+                failure.reason.clone()
+            } else {
+                format!(
+                    "the {} wire data ended where a value was expected",
+                    format.noun()
                 )
-            }
-            // No offender at or after the offset: fall back to the
-            // stop-and-reason form.
-            None => stop_or_eof(format, input, offset, failure, false),
-        },
+            };
+
+            (span, "the data ends here".to_owned(), message, source_text)
+        }
         // No located failure (a layer-count or map-size rejection):
         // point at the first token and let the reason carry the message.
-        None => {
-            let span = token_at(input, 0).map_or((0, 0), |(start, token)| (start, token.len()));
-            let (source_text, span) = excerpt(input, span.0, span.1);
+        WireSite::Unlocated { token } => {
+            let (source_text, span) = match token {
+                Some((start, token)) => excerpt(input, start, token.len()),
+                None => excerpt(input, 0, 0),
+            };
 
             let label = match format {
                 WireFormat::Keymap => {
@@ -670,45 +769,6 @@ fn wire_snippet(
         label,
         context,
         help: Some(format.help().to_owned()),
-    }
-}
-
-/// The rendering for a failure whose offset marks where parsing
-/// stopped rather than an offending token: the span marks the stop
-/// when data follows it, or the end of the data, and the library
-/// reason carries the message — no invented story. A consumed-offender
-/// rejection keeps the reason as the message even at the end of the
-/// data: the true failure is the consumed byte, not the end.
-fn stop_or_eof(
-    format: WireFormat,
-    input: &str,
-    offset: usize,
-    failure: &WireFailure,
-    consumed_offender: bool,
-) -> ((usize, usize), String, String, String) {
-    match token_at(input, offset) {
-        Some((token_start, token)) => {
-            let (source_text, span) = excerpt(input, token_start, token.len());
-
-            (
-                span,
-                "parsing stopped here".to_owned(),
-                failure.reason.clone(),
-                source_text,
-            )
-        }
-        None => {
-            let (source_text, span) = excerpt(input, input.len(), 0);
-            let message = match consumed_offender {
-                true => failure.reason.clone(),
-                false => format!(
-                    "the {} wire data ended where a value was expected",
-                    format.noun()
-                ),
-            };
-
-            (span, "the data ends here".to_owned(), message, source_text)
-        }
     }
 }
 
@@ -809,66 +869,40 @@ fn entry_span_and_label(
     start: usize,
     source: &BackupEntryError,
 ) -> ((usize, usize), String) {
-    // A keymap whose layer count is wrong parses as wire data, so the
-    // count is the whole story: say it with the numbers.
-    if let BackupEntryError::Keymap(ParseKeymapError::IncorrectLayerCount(_)) = source {
-        let numbers = data.split_whitespace().count();
-        let first_token = data.split_whitespace().next().map(str::len).unwrap_or(0);
+    match wire_site(data, wire_failure(source)) {
+        WireSite::Offender { offset, token } => (
+            (start + offset, token.len()),
+            format!("not valid wire data: `{token}`"),
+        ),
+        WireSite::Stop { offset, token } => (
+            (start + offset, token.len()),
+            "parsing stopped here".to_owned(),
+        ),
+        WireSite::End => (
+            (start, 0),
+            "the data ended where a value was expected".to_owned(),
+        ),
+        // Map-size rejections and the keymap layer count carry no
+        // offset. A keymap whose layer count is wrong parses as wire
+        // data, so the count is the whole story: say it with the
+        // numbers. The rest let the source's own message carry it.
+        WireSite::Unlocated { token } => {
+            if let BackupEntryError::Keymap(ParseKeymapError::IncorrectLayerCount(_)) = source {
+                let numbers = data.split_whitespace().count();
+                let first_token = token.map_or(0, |(_, token)| token.len());
 
-        return (
-            (start, first_token),
-            format!(
-                "{numbers} codes = {} layers; a `keymap.custom` write carries \
-                 exactly 800 = 10",
-                numbers / 80
-            ),
-        );
-    }
-
-    match wire_failure(source) {
-        Some((format, offset, consumed_offender)) => {
-            if consumed_offender {
-                // Parsing stopped at the offset (e.g. an unsupported
-                // macro action kind is consumed before it is rejected);
-                // scanning forward could only mis-attribute a later bad
-                // token — mark the stop, the entry message carries the
-                // reason.
-                return match token_at(data, offset) {
-                    Some((token_start, token)) => (
-                        (start + token_start, token.len()),
-                        "parsing stopped here".to_owned(),
+                return (
+                    (start, first_token),
+                    format!(
+                        "{numbers} codes = {} layers; a `keymap.custom` write carries \
+                         exactly 800 = 10",
+                        numbers / 80
                     ),
-                    None => (
-                        (start, 0),
-                        "the data ended where a value was expected".to_owned(),
-                    ),
-                };
+                );
             }
 
-            match wire_offender(data, offset, format) {
-                // The keymap parser gives up at the start of the layer
-                // that failed, so scan forward from its offset for the
-                // token that is actually not valid data.
-                Some((token_offset, token)) => (
-                    (start + token_offset, token.len()),
-                    format!("not valid wire data: `{token}`"),
-                ),
-                // No offender at or after the offset, but data follows
-                // it: parsing stopped there.
-                None => match token_at(data, offset) {
-                    Some((token_start, token)) => (
-                        (start + token_start, token.len()),
-                        "parsing stopped here".to_owned(),
-                    ),
-                    None => (
-                        (start, 0),
-                        "the data ended where a value was expected".to_owned(),
-                    ),
-                },
-            }
+            ((start, 0), source.to_string())
         }
-        // Map-size rejections carry no offset; point at the value.
-        None => ((start, 0), source.to_string()),
     }
 }
 
@@ -1322,6 +1356,30 @@ Error:
         assert!(!rendered.contains("ended where a value was expected"));
     }
 
+    /// A `--keymap` string cut off mid-layer fails at the end of the
+    /// input with nothing after the offset: the end case of the shared
+    /// decision. The label marks the end and the message says the data
+    /// ended where a value was expected; the label itself is not drawn
+    /// for a zero-length span at the source's end (miette), so the
+    /// snippet fields are pinned directly.
+    #[test]
+    fn wire_failure_at_the_end_says_the_data_ended() {
+        let wire = "41 30";
+        let err = wire.parse::<DefyKeymap>().unwrap_err();
+        let report = wire_parse_report(WireFormat::Keymap, wire, WireFailure::keymap(&err));
+
+        let snippet = report
+            .frames()
+            .find_map(|frame| frame.downcast_ref::<ErrorSnippet>())
+            .unwrap();
+
+        assert_eq!(snippet.span, (5, 0));
+        assert_eq!(snippet.label, "the data ends here");
+        assert!(
+            render_plain(&report).contains("the keymap wire data ended where a value was expected")
+        );
+    }
+
     /// Mixed separator runs must not skew the layer hint: a widened
     /// gap before layer 2 with the failure at layer 2's last token
     /// still reports layer 2 (a space count would say 3).
@@ -1512,6 +1570,27 @@ Error:
 
         assert_eq!(span, (103, 3));
         assert_eq!(label, "parsing stopped here");
+    }
+
+    /// A backup entry whose parse failure sits at the end of the data
+    /// (nothing follows the offset, and no token is the offender): the
+    /// span sits at the entry's start and the label says the data
+    /// ended where a value was expected — the end case of the shared
+    /// decision, reached here without a consumed offender.
+    #[test]
+    fn backup_entry_failure_at_the_end_says_the_data_ended() {
+        let source = BackupEntryError::Macros(ParseMacroMapError::MalformedData(
+            dygma_cli::focus_api::parsing::macros::ParseMacroMapError {
+                offset: 10,
+                expected: "u8".to_owned(),
+                unsupported_kind: false,
+            },
+        ));
+
+        let (span, label) = entry_span_and_label("12 300 0 0", 100, &source);
+
+        assert_eq!(span, (100, 0));
+        assert_eq!(label, "the data ended where a value was expected");
     }
 
     /// serde's column points at the offending character for syntax
