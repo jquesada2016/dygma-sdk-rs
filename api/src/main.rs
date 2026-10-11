@@ -247,10 +247,9 @@ impl KeymapCommands {
             Self::ToCommandData { path } => {
                 let keymap = read_json_file::<DefyKeymap>(&path).await?;
 
-                let data = keymap
-                    .to_keymap_custom_data()
-                    .change_context(Error)
-                    .attach("serializing keymap into command data")?;
+                // Infallible: a `DefyKeymap` holds exactly the ten
+                // layers the command data requires.
+                let data = keymap.to_keymap_custom_data();
 
                 println!("{data}");
 

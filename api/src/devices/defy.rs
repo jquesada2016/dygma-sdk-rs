@@ -21,8 +21,15 @@ mod error {
 
     /// Error when parsing a keymap from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
-    #[display("failed to parse keymap: {_0}")]
-    pub struct ParseKeymapError(parsing::keymap::ParseKeymapError);
+    pub enum ParseKeymapError {
+        /// The keymap data is not valid wire data.
+        #[display("failed to parse keymap: {_0}")]
+        MalformedData(parsing::keymap::ParseKeymapError),
+        /// The keymap data is valid wire data but does not hold exactly
+        /// the ten layers every Defy keymap holds.
+        #[display("{_0}")]
+        IncorrectLayerCount(KeymapDoesNotHave10LayersError),
+    }
 
     /// Error when parsing a superkey map from a string slice.
     #[derive(Clone, Debug, Display, From, Error)]
@@ -76,22 +83,17 @@ mod error {
     )]
     pub struct SuperkeyMapTooLargeError;
 
-    /// Error returned when there are not exactly 10 layers in a [`DefyKeymap`] necessary for
-    /// creating the command data.
+    /// Error returned when building a [`DefyKeymap`] from anything but
+    /// exactly 10 layers (the number every Defy keymap holds and every
+    /// `keymap.custom` write carries).
     #[derive(Clone, Copy, Debug, Display, Error)]
     #[display("keymap does not have exactly 10 layers")]
     pub struct KeymapDoesNotHave10LayersError;
 
     /// Error returned from [`DefyKeyboard::apply_custom_keymap`].
     #[derive(Debug, Display, From, Error)]
-    pub enum ApplyCustomKeymapError {
-        /// 10 layers are required, but this keymap has a different number of them.
-        #[display("{_0}")]
-        IncorrectNumberOfLayers(KeymapDoesNotHave10LayersError),
-        /// Command failed to run.
-        #[display("{_0}")]
-        CommandFailed(RunCommandError),
-    }
+    #[display("{_0}")]
+    pub struct ApplyCustomKeymapError(RunCommandError);
 
     /// Error returned from [`DefyKeyboard::get_custom_keymap`].
     #[derive(Debug, Display, From, Error)]
@@ -140,9 +142,6 @@ mod error {
         /// Too many macros were in the map to fit in the macro memory.
         #[display("{_0}")]
         TooManyMacros(parsing::macros::TooManyMacrosError),
-        /// The map holds more macros than the firmware can address.
-        #[display("{_0}")]
-        MacroMapTooLarge(MacroMapTooLargeError),
         /// A key code was too large for a single-byte macro action.
         #[display("{_0}")]
         KeyCodeTooLarge(parsing::macros::KeyCodeTooLargeError),
@@ -257,15 +256,13 @@ mod error {
     /// captured command this crate can validate.
     #[derive(Clone, Debug, Display, Error)]
     pub enum BackupEntryError {
-        /// The `keymap.custom` data is not a valid Defy keymap.
+        /// The `keymap.custom` data is not a valid Defy keymap — either
+        /// not valid wire data at all, or not the exactly ten layers
+        /// every `keymap.custom` write carries (the wire parser itself
+        /// accepts any layer count, so the [`DefyKeymap`] type enforces
+        /// the count at construction).
         #[display("{_0}")]
         Keymap(ParseKeymapError),
-        /// The `keymap.custom` data parsed but does not hold exactly
-        /// the ten layers every `keymap.custom` write carries (the wire
-        /// parser itself accepts any layer count, so restore validation
-        /// enforces the write shape).
-        #[display("{_0}")]
-        KeymapLayers(KeymapDoesNotHave10LayersError),
         /// The `superkeys.map` data is not a valid superkeys map.
         #[display("{_0}")]
         Superkeys(ParseSuperkeyMapError),
@@ -316,7 +313,8 @@ mod error {
         /// Layer 0 is not a valid layer. Layers start with index 1.
         #[display("0 is not a valid layer, layers start at index 1")]
         ZeroIndexProvided,
-        /// Tried to clear a layer that does not exist.
+        /// Tried to clear a layer that does not exist. A Defy keymap has
+        /// exactly ten layers (numbered 1–10).
         #[display("the layer does not exist in this keymap")]
         LayerDoesNotExist,
     }
@@ -329,6 +327,10 @@ pub type DefyLayerData = [KeyKind; KEYS_PER_LAYER];
 pub const KEYS_PER_LAYER: usize = 80;
 
 /// Number of layers in a `keymap.custom` command.
+///
+/// This is the exact layer count of every Defy keymap: the device
+/// stores and reports exactly this many, and [`DefyKeymap`] can only
+/// hold this many.
 pub const KEYMAP_CUSTOM_COMMAND_LAYERS: usize = 10;
 
 /// Constant providing the Defy keymap layout.
@@ -436,7 +438,7 @@ impl DefyKeyboard {
         &mut self,
         keymap: &DefyKeymap,
     ) -> Result<(), ApplyCustomKeymapError> {
-        let data = keymap.to_keymap_custom_data()?;
+        let data = keymap.to_keymap_custom_data();
 
         self.run_command(Self::KEYMAP_CUSTOM_COMMAND_NAME, Some(&data))
             .await?;
@@ -484,13 +486,10 @@ impl DefyKeyboard {
     /// `macros.memory` command first, so the map is serialized with the
     /// correct padding and erase semantics for this specific keyboard.
     ///
-    /// Fails with [`ApplyMacroError::MacroMapTooLarge`] before touching
-    /// the device when the map holds more than
-    /// [`MacroMap::MAX_MACROS`] macros, since the firmware could never
-    /// trigger them.
+    /// The map cannot hold more macros than the firmware can address —
+    /// [`MacroMap`] enforces that bound wherever it is constructed — so
+    /// applying never emits a map the firmware could never trigger.
     pub async fn apply_macros(&mut self, macros: &MacroMap) -> Result<(), ApplyMacroError> {
-        MacroMap::check_size(macros.0.len()).map_err(ApplyMacroError::MacroMapTooLarge)?;
-
         let memory_size = self
             .macro_memory_size()
             .await
@@ -1032,10 +1031,11 @@ impl DefyKeyboard {
     /// this crate can prove things about is parsed against its wire
     /// format — `keymap.custom`, `superkeys.map`, and `macros.map`
     /// through the map types, which also enforce the firmware's
-    /// addressing limits — and the backup's device descriptor, when it
-    /// carries one, must name the Defy. Everything else passes through
-    /// verbatim the way Bazecor's restore sends it. An invalid backup
-    /// fails here with a typed error, so
+    /// addressing limits and (for the keymap) the exactly-ten-layer
+    /// write shape by construction — and the backup's device
+    /// descriptor, when it carries one, must name the Defy. Everything
+    /// else passes through verbatim the way Bazecor's restore sends it.
+    /// An invalid backup fails here with a typed error, so
     /// [`DefyKeyboard::restore_backup`] never sends a partial restore.
     ///
     /// [seq]: crate::focus_api::parsing::backup::restore_command_sequence
@@ -1057,20 +1057,13 @@ impl DefyKeyboard {
 
         for entry in &backup.backup {
             let validated: Result<(), BackupEntryError> = match entry.command.as_str() {
+                // A `keymap.custom` write carries exactly the ten
+                // layers; [`DefyKeymap`] cannot be constructed from
+                // anything else, so the parse here is the whole
+                // validation.
                 Self::KEYMAP_CUSTOM_COMMAND_NAME => DefyKeymap::from_str(&entry.data)
                     .map_err(BackupEntryError::Keymap)
-                    .and_then(|keymap| {
-                        // The wire parser accepts any layer count;
-                        // a `keymap.custom` write carries exactly the
-                        // ten, so that is what validation proves.
-                        if keymap.len() == KEYMAP_CUSTOM_COMMAND_LAYERS {
-                            Ok(())
-                        } else {
-                            Err(BackupEntryError::KeymapLayers(
-                                KeymapDoesNotHave10LayersError,
-                            ))
-                        }
-                    }),
+                    .map(|_| ()),
                 Self::SUPERKEY_MAP_COMMAND_NAME => SuperkeyMap::from_str(&entry.data)
                     .map_err(BackupEntryError::Superkeys)
                     .map(|_| ()),
@@ -1300,20 +1293,45 @@ pub struct DefyThumbClusterLayout {
 }
 
 /// Full Defy keymap.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, From, Deref, DerefMut, Deserialize)]
-pub struct DefyKeymap(pub Vec<DefyKeymapLayer>);
+///
+/// A Defy keymap holds exactly
+/// [`KEYMAP_CUSTOM_COMMAND_LAYERS`]
+/// layers — the device stores exactly that many, and every
+/// `keymap.custom` write carries exactly that many — so a
+/// [`DefyKeymap`] cannot hold a different number of layers by
+/// construction. Building one from a count that is not known at compile
+/// time (wire data, a JSON file) is fallible: it goes through
+/// [`TryFrom<Vec<DefyKeymapLayer>>`](TryFrom) and fails with
+/// [`KeymapDoesNotHave10LayersError`] when the count is wrong.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deref, DerefMut, From)]
+pub struct DefyKeymap {
+    /// The keymap's ten layers, in wire order (layer 1 first).
+    pub layers: [DefyKeymapLayer; KEYMAP_CUSTOM_COMMAND_LAYERS],
+}
+
+impl TryFrom<Vec<DefyKeymapLayer>> for DefyKeymap {
+    type Error = KeymapDoesNotHave10LayersError;
+
+    fn try_from(layers: Vec<DefyKeymapLayer>) -> Result<Self, Self::Error> {
+        let layers = layers
+            .try_into()
+            .map_err(|_| KeymapDoesNotHave10LayersError)?;
+
+        Ok(Self { layers })
+    }
+}
 
 impl FromStr for DefyKeymap {
     type Err = ParseKeymapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let layers = s
+        let layers: Vec<DefyKeymapLayer> = s
             .parse::<parsing::keymap::Keymap>()?
             .iter()
             .map(DefyKeymapLayer::from)
             .collect();
 
-        Ok(Self(layers))
+        Ok(Self::try_from(layers)?)
     }
 }
 
@@ -1322,7 +1340,7 @@ impl serde::Serialize for DefyKeymap {
     where
         S: serde::Serializer,
     {
-        self.0
+        self.layers
             .iter()
             .copied()
             .enumerate()
@@ -1335,16 +1353,30 @@ impl serde::Serialize for DefyKeymap {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for DefyKeymap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let layers = <Vec<DefyKeymapLayer> as serde::Deserialize>::deserialize(deserializer)?;
+
+        // Checked at the JSON boundary like `FromStr` checks it at the
+        // wire boundary: a config file holding a different number of
+        // layers cannot come into existence as a [`DefyKeymap`] either,
+        // so every consumer of the type can rely on the write shape.
+        Self::try_from(layers).map_err(serde::de::Error::custom)
+    }
+}
+
 impl DefyKeymap {
     /// Converts this keymap into a form suitable for sending over to the keyboard
     /// as the data of a `keymap.custom` command.
-    pub fn to_keymap_custom_data(&self) -> Result<String, KeymapDoesNotHave10LayersError> {
-        if self.0.len() != KEYMAP_CUSTOM_COMMAND_LAYERS {
-            return Err(KeymapDoesNotHave10LayersError);
-        };
-
+    ///
+    /// Infallible by construction: a [`DefyKeymap`] holds exactly the
+    /// ten layers the command requires.
+    pub fn to_keymap_custom_data(&self) -> String {
         let data = self
-            .0
+            .layers
             .iter()
             .map(|layer| {
                 layer
@@ -1355,7 +1387,7 @@ impl DefyKeymap {
 
         let keymap = parsing::keymap::Keymap(data);
 
-        Ok(keymap.to_string())
+        keymap.to_string()
     }
 
     /// Clears the layer to the provided key.
@@ -1366,11 +1398,11 @@ impl DefyKeymap {
 
         let layer = layer - 1;
 
-        if self.len() <= layer {
+        if layer >= KEYMAP_CUSTOM_COMMAND_LAYERS {
             return Err(ClearLayerError::LayerDoesNotExist);
         }
 
-        self[layer] = DefyKeymapLayer::new_cleared_to(key);
+        self.layers[layer] = DefyKeymapLayer::new_cleared_to(key);
 
         Ok(())
     }
@@ -1626,14 +1658,18 @@ impl From<&DefyLayerData> for DefyThumbclusterKeymapRight {
 
 /// Holds a superkey map.
 ///
-/// A map holds at most [`SuperkeyMap::MAX_SUPERKEYS`] superkeys. The
-/// invariant is enforced wherever a map comes into existence: parsing
-/// from wire data, deserializing from JSON, and serializing all reject
-/// oversized maps, so converting a [`SuperkeyMap`] to command data
-/// (offline or on [`DefyKeyboard::apply_superkeys`]) can never emit a
-/// map the firmware could not address.
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq)]
-pub struct SuperkeyMap(pub Vec<Superkey>);
+/// A map holds at most [`SuperkeyMap::MAX_SUPERKEYS`] superkeys, and
+/// cannot hold more: the inner vector is private and every way of
+/// constructing a map — parsing from wire data, deserializing from
+/// JSON, or [`TryFrom<Vec<Superkey>>`](TryFrom) — rejects oversized
+/// maps. Converting a [`SuperkeyMap`] to command data (offline or on
+/// [`DefyKeyboard::apply_superkeys`]) therefore can never emit a map
+/// the firmware could not address, and the 1-based superkey numbering
+/// can never overflow.
+#[derive(Clone, Debug, Default, Deref, PartialEq, Eq)]
+pub struct SuperkeyMap {
+    superkeys: Vec<Superkey>,
+}
 
 impl SuperkeyMap {
     /// The maximum number of superkeys a [`SuperkeyMap`] can hold.
@@ -1643,15 +1679,17 @@ impl SuperkeyMap {
     /// the firmware's `Kaleidoscope-Ranges.h`), so superkeys beyond that
     /// count could never be triggered.
     pub const MAX_SUPERKEYS: usize = 128;
+}
 
-    /// Checks that a map holding `superkeys` superkeys does not hold
-    /// more than [`MAX_SUPERKEYS`](Self::MAX_SUPERKEYS).
-    fn check_size(superkeys: usize) -> Result<(), SuperkeyMapTooLargeError> {
-        if superkeys > Self::MAX_SUPERKEYS {
+impl TryFrom<Vec<Superkey>> for SuperkeyMap {
+    type Error = SuperkeyMapTooLargeError;
+
+    fn try_from(superkeys: Vec<Superkey>) -> Result<Self, Self::Error> {
+        if superkeys.len() > Self::MAX_SUPERKEYS {
             return Err(SuperkeyMapTooLargeError);
         }
 
-        Ok(())
+        Ok(Self { superkeys })
     }
 }
 
@@ -1660,16 +1698,12 @@ impl serde::Serialize for SuperkeyMap {
     where
         S: serde::Serializer,
     {
-        // Checked before the numbering below: an unchecked position past
-        // 255 would overflow the 1-based `u8` numbering.
-        Self::check_size(self.0.len()).map_err(serde::ser::Error::custom)?;
-
-        self.0
+        self.superkeys
             .iter()
             .copied()
             .enumerate()
             .map(|(i, key)| Superkey {
-                // Cannot wrap: the size check bounds the position to
+                // Cannot wrap: the type's invariant bounds the map to
                 // `MAX_SUPERKEYS` (128), well within `u8`.
                 superkey_number: i as u8 + 1,
                 ..key
@@ -1684,9 +1718,7 @@ impl<'de> serde::Deserialize<'de> for SuperkeyMap {
     where
         D: serde::Deserializer<'de>,
     {
-        let map = Self(<Vec<Superkey> as serde::Deserialize>::deserialize(
-            deserializer,
-        )?);
+        let superkeys = <Vec<Superkey> as serde::Deserialize>::deserialize(deserializer)?;
 
         // Checked at the JSON boundary like `FromStr` checks it at the
         // wire boundary: an oversized map cannot come into existence
@@ -1694,9 +1726,7 @@ impl<'de> serde::Deserialize<'de> for SuperkeyMap {
         // `superkeys to-command-data` path fails at read time instead of
         // emitting apply-ready command data for a map the firmware
         // could never address.
-        Self::check_size(map.0.len()).map_err(serde::de::Error::custom)?;
-
-        Ok(map)
+        Self::try_from(superkeys).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1706,19 +1736,22 @@ impl FromStr for SuperkeyMap {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let wire_map = s.parse::<parsing::superkeys::SuperkeyMap>()?;
 
-        // Checked before the numbering below: the wire parse itself
-        // imposes no count cap, so an unchecked position past 255 would
-        // overflow the 1-based `u8` numbering.
-        Self::check_size(wire_map.0.len())?;
+        // Checked before the 1-based `u8` numbering below: the wire
+        // parse itself imposes no count cap, and numbering a position
+        // past `u8` would overflow before [`TryFrom`] could reject the
+        // count.
+        if wire_map.0.len() > Self::MAX_SUPERKEYS {
+            return Err(SuperkeyMapTooLargeError.into());
+        }
 
-        let map = Self(
-            wire_map
+        let map = Self {
+            // Cannot wrap: the check above bounds every position to
+            // `MAX_SUPERKEYS` (128), well within `u8`.
+            superkeys: wire_map
                 .0
                 .into_iter()
                 .enumerate()
                 .map(|(i, key)| Superkey {
-                    // Cannot wrap: the size check above bounds the
-                    // position to `MAX_SUPERKEYS` (128), well within `u8`.
                     superkey_number: i as u8 + 1,
                     tap: key.tap,
                     hold: key.hold,
@@ -1727,7 +1760,7 @@ impl FromStr for SuperkeyMap {
                     double_tap_hold: key.double_tap_hold,
                 })
                 .collect(),
-        );
+        };
 
         Ok(map)
     }
@@ -1735,7 +1768,7 @@ impl FromStr for SuperkeyMap {
 
 impl From<&SuperkeyMap> for parsing::superkeys::SuperkeyMap {
     fn from(map: &SuperkeyMap) -> Self {
-        Self(map.0.iter().copied().map(Into::into).collect())
+        Self(map.superkeys.iter().copied().map(Into::into).collect())
     }
 }
 
@@ -1790,14 +1823,18 @@ impl From<Superkey> for parsing::superkeys::Superkey {
 
 /// Holds a macro map.
 ///
-/// A map holds at most [`MacroMap::MAX_MACROS`] macros. The invariant is
-/// enforced wherever a map comes into existence: parsing from wire data,
-/// deserializing from JSON, and serializing all reject oversized maps,
-/// so converting a [`MacroMap`] to command data (offline or on
-/// [`DefyKeyboard::apply_macros`]) can never emit a map the firmware
-/// could not address.
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq)]
-pub struct MacroMap(pub Vec<Macro>);
+/// A map holds at most [`MacroMap::MAX_MACROS`] macros, and cannot hold
+/// more: the inner vector is private and every way of constructing a
+/// map — parsing from wire data, deserializing from JSON, or
+/// [`TryFrom<Vec<Macro>>`](TryFrom) — rejects oversized maps. Converting
+/// a [`MacroMap`] to command data (offline or on
+/// [`DefyKeyboard::apply_macros`]) therefore can never emit a map the
+/// firmware could not address, and the 1-based macro numbering can
+/// never overflow.
+#[derive(Clone, Debug, Default, Deref, PartialEq, Eq)]
+pub struct MacroMap {
+    macros: Vec<Macro>,
+}
 
 impl MacroMap {
     /// The maximum number of macros a [`MacroMap`] can hold.
@@ -1807,15 +1844,17 @@ impl MacroMap {
     /// firmware's `Kaleidoscope-Ranges.h`), so macros beyond that count
     /// could never be triggered.
     pub const MAX_MACROS: usize = 128;
+}
 
-    /// Checks that a map holding `macros` macros does not hold more
-    /// than [`MAX_MACROS`](Self::MAX_MACROS).
-    fn check_size(macros: usize) -> Result<(), MacroMapTooLargeError> {
-        if macros > Self::MAX_MACROS {
+impl TryFrom<Vec<Macro>> for MacroMap {
+    type Error = MacroMapTooLargeError;
+
+    fn try_from(macros: Vec<Macro>) -> Result<Self, Self::Error> {
+        if macros.len() > Self::MAX_MACROS {
             return Err(MacroMapTooLargeError);
         }
 
-        Ok(())
+        Ok(Self { macros })
     }
 }
 
@@ -1824,13 +1863,11 @@ impl serde::Serialize for MacroMap {
     where
         S: serde::Serializer,
     {
-        Self::check_size(self.0.len()).map_err(serde::ser::Error::custom)?;
-
-        self.0
+        self.macros
             .iter()
             .enumerate()
             .map(|(i, m)| Macro {
-                // Cannot wrap: the size check bounds the position to
+                // Cannot wrap: the type's invariant bounds the map to
                 // `MAX_MACROS` (128), well within `u8`.
                 macro_number: i as u8 + 1,
                 actions: m.actions.clone(),
@@ -1845,9 +1882,7 @@ impl<'de> serde::Deserialize<'de> for MacroMap {
     where
         D: serde::Deserializer<'de>,
     {
-        let map = Self(<Vec<Macro> as serde::Deserialize>::deserialize(
-            deserializer,
-        )?);
+        let macros = <Vec<Macro> as serde::Deserialize>::deserialize(deserializer)?;
 
         // Checked at the JSON boundary like `FromStr` checks it at the
         // wire boundary: an oversized map cannot come into existence
@@ -1855,9 +1890,7 @@ impl<'de> serde::Deserialize<'de> for MacroMap {
         // `macros to-command-data` path fails at read time instead of
         // emitting apply-ready command data for a map the firmware
         // could never address.
-        Self::check_size(map.0.len()).map_err(serde::de::Error::custom)?;
-
-        Ok(map)
+        Self::try_from(macros).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1867,24 +1900,27 @@ impl FromStr for MacroMap {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let wire_map = s.parse::<parsing::macros::MacroMap>()?;
 
-        // Checked before the numbering below: the wire parse itself
-        // imposes no count cap, so an unchecked position past 255 would
-        // overflow the 1-based `u8` numbering.
-        Self::check_size(wire_map.0.len())?;
+        // Checked before the 1-based `u8` numbering below: the wire
+        // parse itself imposes no count cap, and numbering a position
+        // past `u8` would overflow before [`TryFrom`] could reject the
+        // count.
+        if wire_map.0.len() > Self::MAX_MACROS {
+            return Err(MacroMapTooLargeError.into());
+        }
 
-        let map = Self(
-            wire_map
+        let map = Self {
+            // Cannot wrap: the check above bounds every position to
+            // `MAX_MACROS` (128), well within `u8`.
+            macros: wire_map
                 .0
                 .into_iter()
                 .enumerate()
                 .map(|(i, macro_data)| Macro {
-                    // Cannot wrap: the size check above bounds the
-                    // position to `MAX_MACROS` (128), well within `u8`.
                     macro_number: i as u8 + 1,
                     actions: macro_data.actions.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
-        );
+        };
 
         Ok(map)
     }
@@ -1893,7 +1929,7 @@ impl FromStr for MacroMap {
 impl From<&MacroMap> for parsing::macros::MacroMap {
     fn from(map: &MacroMap) -> Self {
         Self(
-            map.0
+            map.macros
                 .iter()
                 .map(|m| parsing::macros::Macro {
                     actions: m.actions.iter().copied().map(Into::into).collect(),
@@ -1996,45 +2032,27 @@ mod tests {
     const KEYMAP_DATA: &str = "41 30 31 32 33 34 0 0 0 0 35 36 37 38 39 0 43 20 26 8 21 23 0 0 0 0 28 24 12 18 19 0 57 4 22 7 9 10 17152 0 0 0 11 13 14 15 51 52 53980 29 27 6 25 5 0 0 0 0 17 16 54 55 56 0 53853 17452 44 49467 49209 226 227 0 0 231 76 49209 52028 44 49162 230 41 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 43 85 95 96 97 87 0 0 0 0 75 74 82 77 0 0 0 84 92 93 94 86 83 0 0 0 78 80 81 79 70 0 0 46 89 90 91 99 0 0 0 0 0 0 0 0 0 0 0 0 98 65535 65535 65535 0 0 0 0 0 65535 65535 65535 65535 0 0 58 59 60 61 62 63 65535 65535 64 65 66 67 68 69 0 0 0 0 22710 22709 23785 0 65535 65535 0 0 23663 0 0 65535 0 0 0 22713 22711 22733 23785 0 65535 65535 0 0 23664 20866 20865 0 0 0 0 0 0 0 19682 65535 65535 65535 65535 0 0 0 0 0 0 0 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 65535 65535 0 0 0 0 0 0 0 0 53 2079 2080 2081 2101 0 65535 65535 0 2083 2095 2096 2093 2094 0 0 2078 56 2102 2103 2082 0 65535 65535 0 2084 2086 2087 45 46 0 0 0 0 49 2097 0 65535 65535 65535 65535 0 47 48 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 65535 0 0 0 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 ";
     const SUPERKEY_DATA: &str = "262 281 1 1 1 0 0 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 ";
 
-    fn defy_keymap_layers<R>(layers: R) -> (Vec<u16>, DefyKeymap)
-    where
-        R: std::ops::RangeBounds<usize>,
-    {
-        use std::ops::Bound;
-
-        let start = match layers.start_bound() {
-            Bound::Included(i) => *i,
-            Bound::Unbounded => 0,
-            _ => unreachable!(),
-        };
-        let end = match layers.end_bound() {
-            Bound::Included(i) => i + 1,
-            Bound::Excluded(i) => *i,
-            Bound::Unbounded => 10,
-        };
-
-        let layers = end - start;
-
+    /// The full real-shaped keymap data as its 800 raw codes, and the
+    /// [`DefyKeymap`] it parses into (the only shape a [`DefyKeymap`]
+    /// can have: exactly ten layers).
+    fn defy_keymap() -> (Vec<u16>, DefyKeymap) {
         let layer_data = KEYMAP_DATA
             .split(' ')
-            .skip(start * KEYS_PER_LAYER)
-            .take(layers * KEYS_PER_LAYER);
+            .take(KEYMAP_CUSTOM_COMMAND_LAYERS * KEYS_PER_LAYER)
+            .map(|s| s.parse().unwrap())
+            .collect();
 
-        let keymap = layer_data.clone().join(" ").parse::<DefyKeymap>().unwrap();
-
-        assert_eq!(keymap.0.len(), layers);
-
-        let layer_data = layer_data.map(|s| s.parse().unwrap()).collect();
+        let keymap = KEYMAP_DATA.parse::<DefyKeymap>().unwrap();
 
         (layer_data, keymap)
     }
 
     #[test]
     fn keymap_round_trips_from_str() {
-        let (mut layer_data, keymap) = defy_keymap_layers(..);
+        let (mut layer_data, keymap) = defy_keymap();
 
         let res = keymap
-            .0
+            .layers
             .into_iter()
             .enumerate()
             .flat_map(|(i, layer)| {
@@ -2054,6 +2072,106 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(res, layer_data);
+    }
+
+    #[test]
+    fn keymap_command_data_round_trips() {
+        // The real 10-layer capture serializes to its command data
+        // infallibly (the type cannot hold a different layer count),
+        // the data has the exact write shape, and it parses back to
+        // the same keymap.
+        let (_layer_data, keymap) = defy_keymap();
+
+        let data = keymap.to_keymap_custom_data();
+
+        assert_eq!(
+            data.split(' ').count(),
+            KEYMAP_CUSTOM_COMMAND_LAYERS * KEYS_PER_LAYER
+        );
+        assert_eq!(data.parse::<DefyKeymap>().unwrap(), keymap);
+    }
+
+    #[test]
+    fn keymap_json_round_trips() {
+        // The hand-written `Deserialize` impl keeps accepting exactly
+        // the JSON the `Serialize` impl (and a config file) carries,
+        // with the UX layer numbers skipped on the way in.
+        let (_layer_data, keymap) = defy_keymap();
+
+        let json = serde_json::to_string(&keymap).unwrap();
+
+        for number in 1..=KEYMAP_CUSTOM_COMMAND_LAYERS as u8 {
+            assert!(json.contains(&format!(r#""layer_number":{number}"#)));
+        }
+
+        let parsed: DefyKeymap = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, keymap);
+    }
+
+    #[test]
+    fn keymap_from_layers_of_the_wrong_count_is_unrepresentable() {
+        let (_, keymap) = defy_keymap();
+
+        // Nine layers parse as wire data but no such keymap exists: the
+        // type rejects the count at construction.
+        let nine = DefyKeymap::try_from(keymap.layers[..9].to_vec());
+
+        assert!(matches!(nine, Err(KeymapDoesNotHave10LayersError)));
+        assert_eq!(
+            nine.unwrap_err().to_string(),
+            "keymap does not have exactly 10 layers"
+        );
+
+        // So does eleven.
+        let mut eleven = keymap.layers.to_vec();
+        eleven.push(keymap.layers[0]);
+
+        assert!(DefyKeymap::try_from(eleven).is_err());
+    }
+
+    #[test]
+    fn keymap_json_of_the_wrong_layer_count_fails_to_deserialize() {
+        // Nine whole layers are valid wire data, but a config file
+        // holding them cannot become a `DefyKeymap` — the offline
+        // `keymap to-command-data` path reads files through this impl,
+        // so the write shape is enforced at read time.
+        let nine_layer_wire = KEYMAP_DATA.split(' ').take(80 * 9).join(" ");
+        let nine_layer_json = {
+            let layers: Vec<DefyKeymapLayer> = nine_layer_wire
+                .parse::<parsing::keymap::Keymap>()
+                .unwrap()
+                .iter()
+                .map(DefyKeymapLayer::from)
+                .collect();
+
+            serde_json::to_string(&layers).unwrap()
+        };
+
+        let err = serde_json::from_str::<DefyKeymap>(&nine_layer_json).unwrap_err();
+
+        assert!(err.to_string().contains("exactly 10 layers"));
+    }
+
+    #[test]
+    fn clear_layer_bounds_are_layer_one_through_ten() {
+        let (_, mut keymap) = defy_keymap();
+
+        // Layer 0 is not a layer (layers are 1-based UX numbers).
+        assert!(matches!(
+            keymap.clear_layer_to(0, Blank::NoKey.into()),
+            Err(ClearLayerError::ZeroIndexProvided)
+        ));
+
+        // The device has exactly ten layers; nothing beyond exists.
+        assert!(matches!(
+            keymap.clear_layer_to(11, Blank::NoKey.into()),
+            Err(ClearLayerError::LayerDoesNotExist)
+        ));
+
+        // Both bounds clear fine.
+        keymap.clear_layer_to(1, Blank::NoKey.into()).unwrap();
+        keymap.clear_layer_to(10, Blank::NoKey.into()).unwrap();
     }
 
     #[test]
@@ -2077,8 +2195,8 @@ mod tests {
 
         let map = data.parse::<MacroMap>().unwrap();
 
-        assert_eq!(map.0[0].macro_number, 1);
-        assert_eq!(map.0[1].macro_number, 2);
+        assert_eq!(map[0].macro_number, 1);
+        assert_eq!(map[1].macro_number, 2);
 
         let str_data = parsing::macros::MacroMap::from(&map)
             .to_command_data(19)
@@ -2127,8 +2245,8 @@ mod tests {
 
         let parsed: MacroMap = serde_json::from_str(&json).unwrap();
 
-        let actions: Vec<_> = parsed.0.iter().map(|m| m.actions.clone()).collect();
-        let expected: Vec<_> = map.0.iter().map(|m| m.actions.clone()).collect();
+        let actions: Vec<_> = parsed.iter().map(|m| m.actions.clone()).collect();
+        let expected: Vec<_> = map.iter().map(|m| m.actions.clone()).collect();
 
         assert_eq!(actions, expected);
     }
@@ -2160,9 +2278,9 @@ mod tests {
             .parse::<MacroMap>()
             .unwrap();
 
-        assert_eq!(map.0.len(), MacroMap::MAX_MACROS);
-        assert_eq!(map.0.first().unwrap().macro_number, 1);
-        assert_eq!(map.0.last().unwrap().macro_number, 128);
+        assert_eq!(map.len(), MacroMap::MAX_MACROS);
+        assert_eq!(map.first().unwrap().macro_number, 1);
+        assert_eq!(map.last().unwrap().macro_number, 128);
 
         let json = serde_json::to_string(&map).unwrap();
 
@@ -2204,24 +2322,41 @@ mod tests {
     }
 
     #[test]
-    fn macros_past_the_firmware_limit_are_rejected_when_serializing() {
+    fn macros_past_the_firmware_limit_are_unrepresentable() {
         // 257 macros is well past both the firmware's 128-macro
         // addressing space and the old `u8` numbering wrap at position
-        // 256 (numbers went ...254, 255, 0, 1...). A hand-written JSON
-        // like this must fail to serialize, not be renumbered into a
-        // plausible-looking file.
-        let map = MacroMap(
-            std::iter::repeat_n(
-                Macro {
-                    macro_number: 0,
-                    actions: vec![MacroAction::Wait(1000)],
-                },
-                257,
-            )
-            .collect(),
-        );
+        // 256 (numbers went ...254, 255, 0, 1...). No such map can come
+        // into existence: the count is rejected at construction, so a
+        // serialization of one (and the numbering overflow it used to
+        // guard against) is not even expressible.
+        let macros: Vec<Macro> = std::iter::repeat_n(
+            Macro {
+                macro_number: 0,
+                actions: vec![MacroAction::Wait(1000)],
+            },
+            257,
+        )
+        .collect();
 
-        assert!(serde_json::to_string(&map).is_err());
+        assert!(matches!(
+            MacroMap::try_from(macros),
+            Err(MacroMapTooLargeError)
+        ));
+
+        // The boundary itself, one past the limit, is rejected too.
+        let macros_129: Vec<Macro> = std::iter::repeat_n(
+            Macro {
+                macro_number: 0,
+                actions: vec![MacroAction::Wait(1000)],
+            },
+            MacroMap::MAX_MACROS + 1,
+        )
+        .collect();
+
+        assert!(matches!(
+            MacroMap::try_from(macros_129),
+            Err(MacroMapTooLargeError)
+        ));
     }
 
     #[test]
@@ -2244,16 +2379,14 @@ mod tests {
         // deserializing: the guard rejects only oversized maps.
         let map = serde_json::from_str::<MacroMap>(&macro_map_json(MacroMap::MAX_MACROS)).unwrap();
 
-        assert_eq!(map.0.len(), MacroMap::MAX_MACROS);
-        assert_eq!(map.0.first().unwrap().macro_number, 0);
-        assert_eq!(map.0.last().unwrap().actions, vec![MacroAction::Wait(1000)]);
+        assert_eq!(map.len(), MacroMap::MAX_MACROS);
+        assert_eq!(map.first().unwrap().macro_number, 0);
+        assert_eq!(map.last().unwrap().actions, vec![MacroAction::Wait(1000)]);
 
         // The accepted map round-trips back out through serialization.
         assert_eq!(
-            serde_json::from_str::<MacroMap>(&serde_json::to_string(&map).unwrap())
-                .unwrap()
-                .0,
-            map.0
+            serde_json::from_str::<MacroMap>(&serde_json::to_string(&map).unwrap()).unwrap(),
+            map
         );
     }
 
@@ -2288,9 +2421,9 @@ mod tests {
             .parse::<SuperkeyMap>()
             .unwrap();
 
-        assert_eq!(map.0.len(), SuperkeyMap::MAX_SUPERKEYS);
-        assert_eq!(map.0.first().unwrap().superkey_number, 1);
-        assert_eq!(map.0.last().unwrap().superkey_number, 128);
+        assert_eq!(map.len(), SuperkeyMap::MAX_SUPERKEYS);
+        assert_eq!(map.first().unwrap().superkey_number, 1);
+        assert_eq!(map.last().unwrap().superkey_number, 128);
 
         let json = serde_json::to_string(&map).unwrap();
 
@@ -2320,28 +2453,49 @@ mod tests {
     }
 
     #[test]
-    fn superkeys_past_the_firmware_limit_are_rejected_when_serializing() {
+    fn superkeys_past_the_firmware_limit_are_unrepresentable() {
         // 257 superkeys is well past both the firmware's 128-superkey
         // addressing space and the `u8` numbering overflow at position
-        // 256. A hand-written JSON like this must fail to serialize
-        // — before the numbering — not panic or wrap into a
-        // plausible-looking file.
-        let map = SuperkeyMap(
-            std::iter::repeat_n(
-                Superkey {
-                    superkey_number: 0,
-                    tap: None,
-                    hold: None,
-                    tap_hold: None,
-                    double_tap: None,
-                    double_tap_hold: None,
-                },
-                257,
-            )
-            .collect(),
-        );
+        // 256. No such map can come into existence: the count is
+        // rejected at construction, so a serialization of one (and the
+        // numbering overflow it used to guard against) is not even
+        // expressible.
+        let superkeys: Vec<Superkey> = std::iter::repeat_n(
+            Superkey {
+                superkey_number: 0,
+                tap: None,
+                hold: None,
+                tap_hold: None,
+                double_tap: None,
+                double_tap_hold: None,
+            },
+            257,
+        )
+        .collect();
 
-        assert!(serde_json::to_string(&map).is_err());
+        assert!(matches!(
+            SuperkeyMap::try_from(superkeys),
+            Err(SuperkeyMapTooLargeError)
+        ));
+
+        // The boundary itself, one past the limit, is rejected too.
+        let superkeys_129: Vec<Superkey> = std::iter::repeat_n(
+            Superkey {
+                superkey_number: 0,
+                tap: None,
+                hold: None,
+                tap_hold: None,
+                double_tap: None,
+                double_tap_hold: None,
+            },
+            SuperkeyMap::MAX_SUPERKEYS + 1,
+        )
+        .collect();
+
+        assert!(matches!(
+            SuperkeyMap::try_from(superkeys_129),
+            Err(SuperkeyMapTooLargeError)
+        ));
     }
 
     #[test]
@@ -2367,9 +2521,9 @@ mod tests {
             serde_json::from_str::<SuperkeyMap>(&superkey_map_json(SuperkeyMap::MAX_SUPERKEYS))
                 .unwrap();
 
-        assert_eq!(map.0.len(), SuperkeyMap::MAX_SUPERKEYS);
-        assert_eq!(map.0.first().unwrap().superkey_number, 0);
-        assert_eq!(map.0.last().unwrap().tap, None);
+        assert_eq!(map.len(), SuperkeyMap::MAX_SUPERKEYS);
+        assert_eq!(map.first().unwrap().superkey_number, 0);
+        assert_eq!(map.last().unwrap().tap, None);
 
         // Numbering runs to exactly the firmware's limit when the
         // accepted map is serialized back out.
@@ -2379,7 +2533,7 @@ mod tests {
         assert!(!json.contains(r#""superkey_number":129"#));
 
         // The accepted map round-trips back out through serialization.
-        assert_eq!(serde_json::from_str::<SuperkeyMap>(&json).unwrap().0, map.0);
+        assert_eq!(serde_json::from_str::<SuperkeyMap>(&json).unwrap(), map);
     }
     // === Restore planning (phase 2): the real shipped Defy wireless
     // === backup's data, byte for byte.
@@ -2547,8 +2701,10 @@ mod tests {
     #[test]
     fn plan_rejects_a_keymap_with_the_wrong_layer_count() {
         // Nine *whole* layers parse as a keymap (the wire parser
-        // accepts any layer count), but a `keymap.custom` write carries
-        // exactly ten, so restore validation enforces that count.
+        // accepts any layer count), but a `DefyKeymap` cannot be built
+        // from anything but the exactly ten layers every
+        // `keymap.custom` write carries — the type's construction is
+        // the whole validation.
         let mut backup = real_ordered_backup();
 
         backup.backup[0].data = REAL_KEYMAP_CUSTOM_DATA.split(' ').take(80 * 9).join(" ");
@@ -2559,10 +2715,13 @@ mod tests {
             err,
             BackupValidationError::InvalidEntry {
                 ref command,
-                source: BackupEntryError::KeymapLayers(_),
+                source: BackupEntryError::Keymap(
+                    ParseKeymapError::IncorrectLayerCount(_)
+                ),
             } if command == "keymap.custom"
         ));
         assert!(err.to_string().contains("keymap.custom"));
+        assert!(err.to_string().contains("exactly 10 layers"));
     }
 
     #[test]
