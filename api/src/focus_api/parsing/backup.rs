@@ -27,7 +27,9 @@
 //!   lines are dropped from the capture list instead of being captured
 //!   as empty commands — Bazecor captures them, and its own shipped
 //!   Sonsei backup carries the resulting `{"command": "", "data": ""}`
-//!   artifact. Foreign files carrying that artifact still parse.
+//!   artifact. Foreign files carrying that artifact still parse, and
+//!   the restore sequence drops such entries (an empty command carries
+//!   no state to restore).
 
 /// The commands a backup does **not** capture, as substring patterns
 /// over the device's `help` output.
@@ -127,6 +129,81 @@ impl BackupCommand {
     }
 }
 
+/// Computes the command sequence a restore sends for a backup's
+/// captured entries, in Bazecor's restore order
+/// (`bazecor/src/api/backup/Backup.ts`, `restoreBackup`):
+///
+/// - Entries with an empty command are dropped. They carry no state to
+///   restore — they are the empty-`help`-line capture artifact Bazecor's
+///   own shipped Sonsei backup carries (see the [module docs](self)).
+/// - Every `superkeys.map` entry that comes *after* the first
+///   `keymap.custom` entry is moved directly before it, keeping the
+///   entries' relative order and the order of everything else. Bazecor
+///   does this so the superkeys are in place before a keymap that may
+///   reference them; the match is its `^superkeys?\.map$` regular
+///   expression (case-insensitive, singular `superkey` allowed). The
+///   `keymap.custom` match itself is exact and case-sensitive, like
+///   Bazecor's.
+///
+/// Everything else is passed through verbatim, including entries this
+/// crate has no wire parser for yet. The trailing `led.mode 0` Bazecor
+/// sends after the sequence is **not** part of this function's output;
+/// the restore seam appends it (see
+/// [`DefyKeyboard::restore_backup`]).
+///
+/// [`DefyKeyboard::restore_backup`]:
+///     crate::devices::defy::DefyKeyboard::restore_backup
+pub fn restore_command_sequence(entries: &[BackupCommand]) -> Vec<BackupCommand> {
+    let entries: Vec<&BackupCommand> = entries
+        .iter()
+        .filter(|entry| !entry.command.is_empty())
+        .collect();
+
+    let rebuilt = entries
+        .iter()
+        .position(|entry| entry.command == "keymap.custom")
+        .map(|keymap_index| rebuild_with_superkeys_first(&entries, keymap_index));
+
+    rebuilt.unwrap_or_else(|| entries.iter().map(|entry| (*entry).clone()).collect())
+}
+
+/// Bazecor's reorder (`Backup.ts` `restoreBackup`): the entries after
+/// `keymap_index` whose command is a `superkeys.map` (case-insensitive,
+/// singular allowed) move directly before it, in their own order;
+/// everything else keeps its order.
+fn rebuild_with_superkeys_first(
+    entries: &[&BackupCommand],
+    keymap_index: usize,
+) -> Vec<BackupCommand> {
+    let to_move: Vec<usize> = (keymap_index + 1..entries.len())
+        .filter(|&index| is_superkeys_map_command(&entries[index].command))
+        .collect();
+
+    let mut rebuilt = Vec::with_capacity(entries.len());
+
+    for (index, entry) in entries.iter().enumerate() {
+        // The moved entries land exactly at the keymap's position, so
+        // they are sent before `keymap.custom` itself (which is never
+        // in `to_move`: its index precedes the scanned range).
+        if index == keymap_index {
+            rebuilt.extend(to_move.iter().map(|&moved| entries[moved].clone()));
+        }
+
+        if !to_move.contains(&index) {
+            rebuilt.push((*entry).clone());
+        }
+    }
+
+    rebuilt
+}
+
+/// Whether a captured command is a superkeys map entry in the sense of
+/// Bazecor's restore reorder: its `^superkeys?\.map$` regular
+/// expression, case-insensitive.
+fn is_superkeys_map_command(command: &str) -> bool {
+    command.eq_ignore_ascii_case("superkeys.map") || command.eq_ignore_ascii_case("superkey.map")
+}
+
 /// The `versions` object of a backup file: the tokens of the device's
 /// `version` response, keyed the way Bazecor keys them.
 ///
@@ -198,6 +275,23 @@ pub struct BackupNeuron {
     /// no-neuron fallback serializes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<serde_json::Value>,
+}
+
+impl BackupNeuron {
+    /// Whether this store entry carries any user-visible names: a
+    /// non-empty keyboard name, or any layer, macro, or superkey name
+    /// entries.
+    ///
+    /// The names store and the restore path use this to detect the
+    /// "name-less backup would replace a named neuron" case — a backup
+    /// captured without a store carries the empty neuron shape — which
+    /// the CLI warns about before applying names.
+    pub fn has_names(&self) -> bool {
+        !self.name.is_empty()
+            || !self.layers.is_empty()
+            || !self.macros.is_empty()
+            || !self.superkeys.is_empty()
+    }
 }
 
 /// A Bazecor-compatible device backup file.
@@ -805,5 +899,204 @@ mod tests {
 
         // A file missing the neuron object is not a backup either.
         assert!(serde_json::from_str::<DefyBackup>(r#"{ "backup": [] }"#).is_err());
+    }
+
+    /// A real-shaped capture in the shipped Defy wireless backup's
+    /// order: `keymap.custom` first, `superkeys.map` in the middle —
+    /// the shape Bazecor's reorder exists for.
+    fn defy_capture_entries() -> Vec<BackupCommand> {
+        [
+            ("keymap.custom", "41 30 31"),
+            ("keymap.onlyCustom", "1"),
+            ("settings.defaultLayer", "0"),
+            ("led.brightness", "153"),
+            ("palette", "255 196 0 0"),
+            ("colormap.map", "10 4 4 4"),
+            ("superkeys.map", "262 281 2329 283 1 0 0"),
+            ("superkeys.waitfor", "500"),
+            ("macros.map", "6 229 8 11 0 0"),
+            ("mouse.speed", "20"),
+        ]
+        .iter()
+        .map(|(command, data)| BackupCommand::new((*command).to_owned(), (*data).to_owned()))
+        .collect()
+    }
+
+    #[test]
+    fn restore_sequence_moves_superkeys_before_keymap_like_bazecor() {
+        let sequence = restore_command_sequence(&defy_capture_entries());
+
+        let commands: Vec<&str> = sequence
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect();
+
+        // `superkeys.map` lands directly before `keymap.custom`; every
+        // other entry keeps its relative order; nothing is lost.
+        assert_eq!(
+            commands,
+            [
+                "superkeys.map",
+                "keymap.custom",
+                "keymap.onlyCustom",
+                "settings.defaultLayer",
+                "led.brightness",
+                "palette",
+                "colormap.map",
+                "superkeys.waitfor",
+                "macros.map",
+                "mouse.speed",
+            ]
+        );
+
+        // The moved entry's data travels with it.
+        let superkeys = sequence.first().unwrap();
+
+        assert_eq!(superkeys.data, "262 281 2329 283 1 0 0");
+    }
+
+    #[test]
+    fn restore_sequence_keeps_entries_already_ordered() {
+        // Bazecor's reorder only touches `superkeys.map` entries that
+        // come *after* `keymap.custom`; one already before it stays put.
+        let sequence = restore_command_sequence(&[
+            BackupCommand::new("superkeys.map".to_owned(), "262 281 1 0 0".to_owned()),
+            BackupCommand::new("keymap.custom".to_owned(), "41 30 31".to_owned()),
+            BackupCommand::new("macros.map".to_owned(), "6 229 0 0".to_owned()),
+        ]);
+
+        let commands: Vec<&str> = sequence
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect();
+
+        assert_eq!(commands, ["superkeys.map", "keymap.custom", "macros.map"]);
+    }
+
+    #[test]
+    fn restore_sequence_without_keymap_custom_is_unchanged() {
+        let entries = [
+            BackupCommand::new("macros.map".to_owned(), "6 229 0 0".to_owned()),
+            BackupCommand::new("superkeys.map".to_owned(), "262 281 1 0 0".to_owned()),
+            BackupCommand::new("led.brightness".to_owned(), "153".to_owned()),
+        ];
+
+        assert_eq!(restore_command_sequence(&entries), entries);
+    }
+
+    #[test]
+    fn restore_sequence_moves_every_superkeys_entry_keeping_their_order() {
+        // Two `superkeys.map` entries after the keymap (a foreign-file
+        // oddity, but exactly what Bazecor's loop collects) both move,
+        // in their own relative order, directly before the keymap.
+        let sequence = restore_command_sequence(&[
+            BackupCommand::new("keymap.custom".to_owned(), "41 30 31".to_owned()),
+            BackupCommand::new("led.brightness".to_owned(), "153".to_owned()),
+            BackupCommand::new("superkeys.map".to_owned(), "1 1 0 0".to_owned()),
+            BackupCommand::new("macros.map".to_owned(), "6 229 0 0".to_owned()),
+            BackupCommand::new("superkeys.map".to_owned(), "2 2 0 0".to_owned()),
+        ]);
+
+        let commands: Vec<&str> = sequence
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect();
+
+        assert_eq!(
+            commands,
+            [
+                "superkeys.map",
+                "superkeys.map",
+                "keymap.custom",
+                "led.brightness",
+                "macros.map",
+            ]
+        );
+
+        // Their relative order survived.
+        assert_eq!(sequence[0].data, "1 1 0 0");
+        assert_eq!(sequence[1].data, "2 2 0 0");
+    }
+
+    #[test]
+    fn restore_sequence_superkeys_match_is_bazecors_regular_expression() {
+        // `^superkeys?\.map$`, case-insensitive: singular `superkey`
+        // and any case match; anything with extra characters does not.
+        let sequence = restore_command_sequence(&[
+            BackupCommand::new("keymap.custom".to_owned(), "41 30 31".to_owned()),
+            BackupCommand::new("SUPERKEYS.MAP".to_owned(), "1 1 0 0".to_owned()),
+            BackupCommand::new("Superkey.Map".to_owned(), "2 2 0 0".to_owned()),
+            BackupCommand::new("xsuperkeys.map".to_owned(), "nope".to_owned()),
+            BackupCommand::new("superkeys.map2".to_owned(), "nope".to_owned()),
+        ]);
+
+        let commands: Vec<&str> = sequence
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect();
+
+        // The regex matches moved; the near-misses stayed after the
+        // keymap.
+        assert_eq!(
+            commands,
+            [
+                "SUPERKEYS.MAP",
+                "Superkey.Map",
+                "keymap.custom",
+                "xsuperkeys.map",
+                "superkeys.map2",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_sequence_drops_empty_commands_but_keeps_empty_data() {
+        // The shipped Sonsei backup's `{"command": "", "data": ""}`
+        // artifact carries no state and cannot be sent; an entry with
+        // a real command but no data is a read and stays.
+        let sequence = restore_command_sequence(&[
+            BackupCommand::new("keymap.custom".to_owned(), "41 30 31".to_owned()),
+            BackupCommand::new(String::new(), String::new()),
+            BackupCommand::new("wireless.bluetooth.macs".to_owned(), String::new()),
+        ]);
+
+        let commands: Vec<&str> = sequence
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect();
+
+        assert_eq!(commands, ["keymap.custom", "wireless.bluetooth.macs"]);
+    }
+
+    #[test]
+    fn has_names_distinguishes_the_empty_store_shape_from_a_named_neuron() {
+        // Exactly the neuron object phase-1 captures carry: the empty
+        // store shape.
+        assert!(!BackupNeuron::default().has_names());
+
+        // Any one of the name carriers counts.
+        assert!(
+            BackupNeuron {
+                name: "Silver Defy".to_owned(),
+                ..BackupNeuron::default()
+            }
+            .has_names()
+        );
+
+        assert!(
+            BackupNeuron {
+                layers: vec![serde_json::json!({ "id": 0, "name": "Base" })],
+                ..BackupNeuron::default()
+            }
+            .has_names()
+        );
+
+        assert!(
+            BackupNeuron {
+                superkeys: vec![serde_json::json!({ "id": 0, "name": "F" })],
+                ..BackupNeuron::default()
+            }
+            .has_names()
+        );
     }
 }

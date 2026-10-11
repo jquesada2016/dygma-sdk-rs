@@ -8,6 +8,7 @@ use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
 use error_stack::{IntoReport, ResultExt};
 use itertools::Itertools;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::{
     fs::File,
@@ -42,6 +43,16 @@ enum Cli {
     /// Commands for working with device backups.
     #[command(subcommand)]
     Backup(BackupCommands),
+    /// Commands for working with the neuron names store.
+    Names {
+        /// The path of the names store JSON file.
+        ///
+        /// Defaults to `$HOME/.dygma-sdk/names.json`.
+        #[clap(long, global = true)]
+        store: Option<PathBuf>,
+        #[command(subcommand)]
+        command: NamesCommands,
+    },
     /// Commands for working with keymap key codes.
     #[command(subcommand)]
     KeyCode(KeyCodeCommands),
@@ -56,6 +67,7 @@ impl Cli {
             Self::Macros(cmd) => cmd.perform().await,
             Self::Settings(cmd) => cmd.perform().await,
             Self::Backup(cmd) => cmd.perform().await,
+            Self::Names { store, command } => command.perform(store.as_deref()).await,
             Self::KeyCode(cmd) => cmd.perform(),
         }
     }
@@ -924,6 +936,38 @@ enum BackupCommands {
         /// The path of the backup JSON file.
         path: PathBuf,
     },
+    /// Restore a backup JSON file to the device.
+    ///
+    /// This **rewrites the captured parts of the keyboard's
+    /// configuration** (keymap, superkeys, macros, settings, LED
+    /// state). It cannot be undone except by restoring another backup —
+    /// capture a fresh one with `backup create` first. The whole backup
+    /// is validated offline before anything is sent, so an invalid
+    /// backup never touches the device; commands are sent in Bazecor's
+    /// restore order (superkeys before the keymap) and `led.mode 0` is
+    /// sent last. Note the known Bluetooth limitation: large payloads
+    /// fail over BLE, so restore wired or over RF.
+    ///
+    /// The backup's neuron object (its names) is applied to the names
+    /// store under the connected device's `hardware.chip_id` after the
+    /// device restore succeeds — names travel to the Neuron the backup
+    /// is restored on, as in Bazecor. When the backup carries no names
+    /// but the store already holds names for the connected Neuron, a
+    /// warning is printed after connecting and before anything is
+    /// sent, and the stored names are overwritten.
+    Restore {
+        /// The path of the backup JSON file.
+        path: PathBuf,
+        /// Print the validated restore plan without opening a
+        /// connection to the device.
+        #[clap(long, default_value_t = false)]
+        dry_run: bool,
+        /// The path of the names store JSON file.
+        ///
+        /// Defaults to `$HOME/.dygma-sdk/names.json`.
+        #[clap(long, global = true)]
+        store: Option<PathBuf>,
+    },
 }
 
 impl BackupCommands {
@@ -976,8 +1020,335 @@ impl BackupCommands {
 
                 Ok(())
             }
+            Self::Restore {
+                path,
+                dry_run,
+                store,
+            } => {
+                // Everything offline first: parse the file, validate the
+                // whole backup, load the names store — nothing touches
+                // the device until all three succeeded.
+                let backup = read_json_file::<DefyBackup>(&path).await?;
+
+                let plan = DefyKeyboard::backup_restore_plan(&backup)
+                    .change_context(Error)
+                    .attach_with(|| format!("validating the backup in {}", path.display()))?;
+
+                let store_path = names_store_path(store.as_deref())?;
+                let mut names_store = load_names_store(&store_path).await?;
+
+                if dry_run {
+                    println!(
+                        "Restore plan for Neuron {} from {} ({} commands, \
+                        `led.mode 0` last):",
+                        backup.neuron_id,
+                        path.display(),
+                        plan.len()
+                    );
+
+                    for entry in &plan {
+                        println!(
+                            "  {} ({} bytes of data)",
+                            entry.command,
+                            entry.data.trim().len()
+                        );
+                    }
+
+                    println!("Dry run: nothing was sent, no device connection was opened.");
+                    println!(
+                        "On a real restore the backup's names are applied to the \
+                        names store under the connected device's chip id."
+                    );
+
+                    return Ok(());
+                }
+
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                // The connected Neuron's chip id keys the names apply —
+                // Bazecor restores names onto the Neuron the backup
+                // lands on, whatever Neuron captured the file. Probed
+                // before anything is sent so the overwrite warning
+                // below fires on the same key; a failed probe aborts
+                // with nothing sent.
+                let chip_id = defy
+                    .get_chip_id()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `hardware.chip_id` to key the names apply")?;
+
+                if names_store.replaces_named_entry(&backup, chip_id.as_str())
+                    && let Some(entry) = names_store.get(chip_id.as_str())
+                {
+                    eprintln!(
+                        "Warning: this backup carries no names, but the names store \
+                        already holds names for Neuron {} ({}). Restoring will \
+                        overwrite them with the backup's empty names.",
+                        chip_id,
+                        describe_neuron_names(entry)
+                    );
+                }
+
+                defy.restore_backup(&backup)
+                    .await
+                    .change_context(Error)
+                    .attach_with(|| format!("restoring the backup in {}", path.display()))?;
+
+                println!(
+                    "Restored {} commands to the Defy (`led.mode 0` last).",
+                    plan.len()
+                );
+
+                // Names apply only after the device restore succeeded:
+                // a failed restore leaves the names store untouched.
+                // They apply under the connected Neuron's chip id, so a
+                // backup captured elsewhere carries its names here.
+                names_store.apply_backup(&backup, chip_id.as_str());
+                save_names_store(&store_path, &names_store).await?;
+
+                println!(
+                    "Names for Neuron {} written to {}.",
+                    chip_id,
+                    store_path.display()
+                );
+
+                if chip_id.as_str() != backup.neuron_id {
+                    println!(
+                        "Note: the backup was captured from Neuron {}; its names \
+                        were carried to the connected Neuron {chip_id}.",
+                        backup.neuron_id
+                    );
+                }
+
+                Ok(())
+            }
         }
     }
+}
+
+/// The target of a `names set` write.
+#[derive(Subcommand)]
+enum NameTarget {
+    /// The keyboard's user-chosen name.
+    KeyboardName {
+        /// The name to set.
+        name: String,
+    },
+    /// One layer's name. Layer ids are 0-based, as the device and
+    /// Bazecor number them.
+    Layer {
+        /// The layer's id.
+        id: u8,
+        /// The name to set.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NamesCommands {
+    /// Lists every neuron entry in the names store.
+    ///
+    /// This never opens a connection to the device.
+    List,
+    /// Shows one neuron's stored names entry.
+    ///
+    /// This never opens a connection to the device.
+    Show {
+        /// The Neuron's `hardware.chip_id`.
+        chip_id: String,
+    },
+    /// Imports a backup file's neuron object (its names) into the
+    /// names store.
+    ///
+    /// The store entry keyed by the backup's `neuronID` is replaced
+    /// wholesale with the backup's neuron. Unlike `backup restore`,
+    /// which applies names under the connected device's chip id, this
+    /// offline import keys the entry by the backup file's own
+    /// `neuronID`. When the backup carries no names but the store
+    /// already holds names for that Neuron, a warning is printed and
+    /// the stored names are overwritten.
+    ///
+    /// This never opens a connection to the device.
+    Import {
+        /// The path of the backup JSON file.
+        path: PathBuf,
+    },
+    /// Sets a name on a neuron's stored entry, creating the entry if
+    /// the store does not hold one for this chip id yet.
+    ///
+    /// This never opens a connection to the device.
+    Set {
+        /// The Neuron's `hardware.chip_id`.
+        chip_id: String,
+        #[command(subcommand)]
+        target: NameTarget,
+    },
+}
+
+/// One human-readable line describing what names a neuron entry
+/// carries, for lists and warnings.
+fn describe_neuron_names(neuron: &parsing::backup::BackupNeuron) -> String {
+    match (
+        neuron.name.is_empty(),
+        neuron.layers.len(),
+        neuron.macros.len(),
+        neuron.superkeys.len(),
+    ) {
+        (true, 0, 0, 0) => "no names".to_owned(),
+        _ => format!(
+            "\"{}\", {} layers, {} macros, {} superkeys named",
+            neuron.name,
+            neuron.layers.len(),
+            neuron.macros.len(),
+            neuron.superkeys.len()
+        ),
+    }
+}
+
+impl NamesCommands {
+    async fn perform(self, store: Option<&Path>) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::List => {
+                let store_path = names_store_path(store)?;
+                let store = load_names_store(&store_path).await?;
+
+                if store.is_empty() {
+                    println!("The names store at {} is empty.", store_path.display());
+
+                    return Ok(());
+                }
+
+                for (chip_id, neuron) in store.iter() {
+                    println!("{chip_id}  {}", describe_neuron_names(neuron));
+                }
+
+                Ok(())
+            }
+            Self::Show { chip_id } => {
+                let store_path = names_store_path(store)?;
+                let store = load_names_store(&store_path).await?;
+
+                let neuron = store.get(&chip_id).ok_or_else(|| {
+                    Error
+                        .into_report()
+                        .attach(format!("no names stored for Neuron `{chip_id}`"))
+                })?;
+
+                println!("{}", serde_json::to_string_pretty(neuron).unwrap());
+
+                Ok(())
+            }
+            Self::Import { path } => {
+                let backup = read_json_file::<DefyBackup>(&path).await?;
+
+                let store_path = names_store_path(store)?;
+                let mut store = load_names_store(&store_path).await?;
+
+                // Offline import: keyed by the backup file's own
+                // `neuronID`, unlike the device-backed `backup restore`.
+                if store.replaces_named_entry(&backup, &backup.neuron_id)
+                    && let Some(entry) = store.get(&backup.neuron_id)
+                {
+                    eprintln!(
+                        "Warning: this backup carries no names, but the names store \
+                        already holds names for Neuron {} ({}). Importing will \
+                        overwrite them with the backup's empty names.",
+                        backup.neuron_id,
+                        describe_neuron_names(entry)
+                    );
+                }
+
+                store.apply_backup(&backup, &backup.neuron_id);
+                save_names_store(&store_path, &store).await?;
+
+                println!(
+                    "Names for Neuron {} imported from {} into {}.",
+                    backup.neuron_id,
+                    path.display(),
+                    store_path.display()
+                );
+
+                Ok(())
+            }
+            Self::Set { chip_id, target } => {
+                let store_path = names_store_path(store)?;
+                let mut store = load_names_store(&store_path).await?;
+
+                match target {
+                    NameTarget::KeyboardName { name } => {
+                        store.set_keyboard_name(&chip_id, &name);
+
+                        println!("Keyboard name \"{name}\" set for Neuron {chip_id}.");
+                    }
+                    NameTarget::Layer { id, name } => {
+                        store.set_layer_name(&chip_id, id, &name);
+
+                        println!("Layer {id} named \"{name}\" for Neuron {chip_id}.");
+                    }
+                }
+
+                save_names_store(&store_path, &store).await?;
+
+                println!("Names written to {}.", store_path.display());
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Resolves the names store path: `--store` when given, else
+/// `$HOME/.dygma-sdk/names.json`.
+fn names_store_path(store: Option<&Path>) -> Result<PathBuf, error_stack::Report<Error>> {
+    if let Some(store) = store {
+        return Ok(store.to_owned());
+    }
+
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".dygma-sdk").join("names.json"))
+        .ok_or_else(|| {
+            Error
+                .into_report()
+                .attach("resolving the names store path; pass --store or set $HOME")
+        })
+}
+
+/// Loads the names store, treating a missing file as an empty store.
+/// Any other failure to stat the file (permissions, I/O) surfaces as
+/// an error instead of silently reading as an empty store.
+async fn load_names_store(
+    path: &Path,
+) -> Result<dygma_cli::names::NeuronNameStore, error_stack::Report<Error>> {
+    match tokio::fs::metadata(path).await {
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            Ok(dygma_cli::names::NeuronNameStore::new())
+        }
+        Err(err) => Err(err
+            .into_report()
+            .change_context(Error)
+            .attach("statting the names store")
+            .attach(path.to_string_lossy().into_owned())),
+        Ok(_) => read_json_file(path).await,
+    }
+}
+
+/// Saves the names store, creating its parent directory if needed.
+async fn save_names_store(
+    path: &Path,
+    store: &dygma_cli::names::NeuronNameStore,
+) -> Result<(), error_stack::Report<Error>> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .change_context(Error)
+            .attach("creating the names store directory")
+            .attach_with(|| parent.to_string_lossy().into_owned())?;
+    }
+
+    safe_pretty_json_file(store, path).await
 }
 
 /// A parsed setting write: the value has been validated from its

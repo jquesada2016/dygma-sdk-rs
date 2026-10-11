@@ -12,5 +12,6 @@ extern crate tracing;
 
 pub mod devices;
 pub mod focus_api;
+pub mod names;
 
 pub use focus_api::parsing::keymap::keycode_tables;

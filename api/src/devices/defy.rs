@@ -221,6 +221,78 @@ mod error {
         Wireless(GetSettingError),
     }
 
+    /// Error returned when a backup fails restore validation.
+    ///
+    /// Validation ([`DefyKeyboard::backup_restore_plan`]) runs entirely
+    /// offline, before anything is sent: a backup either validates
+    /// whole, or nothing reaches the device.
+    #[derive(Clone, Debug, Display, Error)]
+    pub enum BackupValidationError {
+        /// The backup's device descriptor names a product other than
+        /// the Defy. This crate speaks the Defy's wire formats only —
+        /// restoring another product's backup (a Raise's, say) would
+        /// write foreign data to the device.
+        #[display("the backup is for a `{product}`, not a Defy")]
+        NotADefyBackup {
+            /// The product the backup's device descriptor names.
+            product: String,
+        },
+        /// One of the backup's captured commands carries data this
+        /// crate can prove is not valid Defy wire data. The keymap,
+        /// superkeys, and macros maps are validated by parsing them;
+        /// captured commands without a wire parser yet (LED and
+        /// colormap data, say) pass through verbatim, exactly the way
+        /// Bazecor's restore sends them.
+        #[display("the `{command}` entry failed restore validation: {source}")]
+        InvalidEntry {
+            /// The captured command whose data failed validation.
+            command: String,
+            /// The parse failure.
+            source: BackupEntryError,
+        },
+    }
+
+    /// The parse failure behind
+    /// [`BackupValidationError::InvalidEntry`]: one variant per
+    /// captured command this crate can validate.
+    #[derive(Clone, Debug, Display, Error)]
+    pub enum BackupEntryError {
+        /// The `keymap.custom` data is not a valid Defy keymap.
+        #[display("{_0}")]
+        Keymap(ParseKeymapError),
+        /// The `keymap.custom` data parsed but does not hold exactly
+        /// the ten layers every `keymap.custom` write carries (the wire
+        /// parser itself accepts any layer count, so restore validation
+        /// enforces the write shape).
+        #[display("{_0}")]
+        KeymapLayers(KeymapDoesNotHave10LayersError),
+        /// The `superkeys.map` data is not a valid superkeys map.
+        #[display("{_0}")]
+        Superkeys(ParseSuperkeyMapError),
+        /// The `macros.map` data is not a valid macros map.
+        #[display("{_0}")]
+        Macros(ParseMacroMapError),
+    }
+
+    /// Error returned from [`DefyKeyboard::restore_backup`].
+    #[derive(Debug, Display, Error)]
+    pub enum RestoreBackupError {
+        /// The backup failed restore validation, so nothing was sent
+        /// to the device.
+        #[display("{_0}")]
+        Validation(BackupValidationError),
+        /// Sending one of the backup's commands failed. The restore
+        /// stopped at this command; everything sent before it was
+        /// applied and the commands after it were not.
+        #[display("failed to send the `{command}` command: {source}")]
+        Send {
+            /// The command that failed to send.
+            command: String,
+            /// The error the send failed with.
+            source: RunCommandError,
+        },
+    }
+
     impl From<parsing::macros::ToCommandDataError> for ApplyMacroError {
         fn from(err: parsing::macros::ToCommandDataError) -> Self {
             match err {
@@ -321,6 +393,14 @@ impl DefyKeyboard {
     const MOUSE_SPEED_LIMIT_COMMAND_NAME: &str = "mouse.speedLimit";
     const MACROS_MEMORY_COMMAND_NAME: &str = "macros.memory";
     const EEPROM_CONTENTS_COMMAND_NAME: &str = "eeprom.contents";
+    /// The command Bazecor's restore sends after every backup entry
+    /// (`noCacheCommand("led.mode 0")` in `Backup.ts`
+    /// `restoreBackup`), switching the LEDs out of whatever state the
+    /// restored `led.*` writes left them in. `led.mode` is deny-listed
+    /// from captures, so restores append it unconditionally — exactly
+    /// like Bazecor.
+    const RESTORE_FINALIZE_COMMAND_NAME: &str = "led.mode";
+    const RESTORE_FINALIZE_DATA: &str = "0";
 
     /// The memory size of the superkey map.
     pub const SUPERKEY_MEMORY_SIZE: usize = 512;
@@ -934,6 +1014,132 @@ impl DefyKeyboard {
         descriptor["chipId"] = chip_id.into();
 
         descriptor
+    }
+
+    /// Computes the exact command sequence
+    /// [`DefyKeyboard::restore_backup`] sends for a backup, validating
+    /// the backup first — **without opening a connection to the
+    /// device**.
+    ///
+    /// The plan is Bazecor's restore order
+    /// ([`restore_command_sequence`][seq]: `superkeys.map` entries
+    /// before `keymap.custom`, empty-command capture artifacts dropped)
+    /// with the trailing `led.mode 0` Bazecor appends after the
+    /// sequence ([`Backup.ts`][bazecor] `restoreBackup`) added as the
+    /// last entry, so the plan *is* the complete device write sequence.
+    ///
+    /// Validation, before anything is returned: every captured command
+    /// this crate can prove things about is parsed against its wire
+    /// format — `keymap.custom`, `superkeys.map`, and `macros.map`
+    /// through the map types, which also enforce the firmware's
+    /// addressing limits — and the backup's device descriptor, when it
+    /// carries one, must name the Defy. Everything else passes through
+    /// verbatim the way Bazecor's restore sends it. An invalid backup
+    /// fails here with a typed error, so
+    /// [`DefyKeyboard::restore_backup`] never sends a partial restore.
+    ///
+    /// [seq]: crate::focus_api::parsing::backup::restore_command_sequence
+    /// [bazecor]: https://github.com/Dygmalab/Bazecor/blob/main/src/api/backup/Backup.ts
+    pub fn backup_restore_plan(
+        backup: &parsing::backup::DefyBackup,
+    ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
+        if let Some(product) = backup.neuron.device.as_ref().and_then(|device| {
+            device
+                .get("info")
+                .and_then(|info| info.get("product"))
+                .and_then(serde_json::Value::as_str)
+        }) && product != "Defy"
+        {
+            return Err(BackupValidationError::NotADefyBackup {
+                product: product.to_owned(),
+            });
+        }
+
+        for entry in &backup.backup {
+            let validated: Result<(), BackupEntryError> = match entry.command.as_str() {
+                Self::KEYMAP_CUSTOM_COMMAND_NAME => DefyKeymap::from_str(&entry.data)
+                    .map_err(BackupEntryError::Keymap)
+                    .and_then(|keymap| {
+                        // The wire parser accepts any layer count;
+                        // a `keymap.custom` write carries exactly the
+                        // ten, so that is what validation proves.
+                        if keymap.len() == KEYMAP_CUSTOM_COMMAND_LAYERS {
+                            Ok(())
+                        } else {
+                            Err(BackupEntryError::KeymapLayers(
+                                KeymapDoesNotHave10LayersError,
+                            ))
+                        }
+                    }),
+                Self::SUPERKEY_MAP_COMMAND_NAME => SuperkeyMap::from_str(&entry.data)
+                    .map_err(BackupEntryError::Superkeys)
+                    .map(|_| ()),
+                Self::MACRO_MAP_COMMAND_NAME => MacroMap::from_str(&entry.data)
+                    .map_err(BackupEntryError::Macros)
+                    .map(|_| ()),
+                _ => Ok(()),
+            };
+
+            validated.map_err(|source| BackupValidationError::InvalidEntry {
+                command: entry.command.clone(),
+                source,
+            })?;
+        }
+
+        let mut plan = parsing::backup::restore_command_sequence(&backup.backup);
+
+        plan.push(parsing::backup::BackupCommand::new(
+            Self::RESTORE_FINALIZE_COMMAND_NAME.to_owned(),
+            Self::RESTORE_FINALIZE_DATA.to_owned(),
+        ));
+
+        Ok(plan)
+    }
+
+    /// Restores a captured backup to the device: validates it
+    /// ([`DefyKeyboard::backup_restore_plan`]) and then sends every
+    /// planned command with its data, in Bazecor's restore order,
+    /// ending with the `led.mode 0` tail Bazecor's restore sends.
+    ///
+    /// This **rewrites the captured parts of the device's
+    /// configuration** — the keymap, superkeys, macros, settings, and
+    /// LED state the backup holds. It cannot be undone except by
+    /// restoring another backup; capture one with
+    /// [`DefyKeyboard::create_backup`] first.
+    ///
+    /// Data is trimmed at send time and an empty payload is sent as a
+    /// bare command (a read), exactly how Bazecor's restore treats it
+    /// (`String(val).trim()` in `Backup.ts` `restoreBackup`; the
+    /// firmware answers an empty write as a read). A send failure stops
+    /// the restore at that command with [`RestoreBackupError::Send`],
+    /// leaving everything sent before it applied and the rest not —
+    /// capture a fresh backup before retrying.
+    pub async fn restore_backup(
+        &mut self,
+        backup: &parsing::backup::DefyBackup,
+    ) -> Result<(), RestoreBackupError> {
+        let plan = Self::backup_restore_plan(backup).map_err(RestoreBackupError::Validation)?;
+
+        // The device seam of the restore: the only place backup
+        // commands are sent, a flat loop over the validated plan —
+        // every write this backup performs goes through here, and
+        // nothing is sent before `backup_restore_plan` accepted the
+        // whole backup.
+        for entry in &plan {
+            let data = entry.data.trim();
+
+            self.run_command(
+                &entry.command,
+                if data.is_empty() { None } else { Some(data) },
+            )
+            .await
+            .map_err(|source| RestoreBackupError::Send {
+                command: entry.command.clone(),
+                source,
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Runs a single-value settings command and parses its response.
@@ -2174,5 +2380,233 @@ mod tests {
 
         // The accepted map round-trips back out through serialization.
         assert_eq!(serde_json::from_str::<SuperkeyMap>(&json).unwrap().0, map.0);
+    }
+    // === Restore planning (phase 2): the real shipped Defy wireless
+    // === backup's data, byte for byte.
+
+    /// the real `keymap.custom` data of the shipped Defy wireless backup: 10 full layers of 80 keys each.
+    const REAL_KEYMAP_CUSTOM_DATA: &str = "41 30 31 32 33 34 45 0 0 46 35 36 37 38 39 42 43 20 26 8 21 23 47 0 0 48 28 24 12 18 19 76 57 4 22 7 9 10 17152 0 0 49 11 13 14 15 51 52 225 29 27 6 25 5 0 0 0 0 17 16 54 55 56 229 53980 17452 44 49211 49721 227 0 0 54109 54108 101 49209 49162 44 230 53852 41 0 0 0 0 0 0 0 0 0 83 0 84 85 46 42 43 0 74 82 77 75 0 0 0 0 0 95 96 97 86 0 0 70 80 81 79 78 0 0 0 0 0 92 93 94 87 0 225 0 0 0 0 0 0 0 0 0 99 89 90 91 88 0 0 0 65535 65535 65535 65535 0 0 0 0 0 0 65535 98 0 0 53 58 59 60 61 62 63 65535 65535 64 65 66 67 68 69 0 0 0 0 22710 22709 23785 0 65535 65535 0 0 23663 0 0 65535 0 0 0 22713 22711 22733 23786 0 65535 65535 0 0 23664 20866 20865 0 0 0 0 0 0 0 19682 65535 65535 65535 65535 0 0 0 0 0 0 0 65535 0 0 0 0 0 0 0 0 0 0 0 0 0 0 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535";
+
+    /// the real `palette` data of the shipped Defy wireless backup (16 RGBW colors).
+    const REAL_PALETTE_DATA: &str = "255 196 0 0 0 254 24 0 0 0 0 255 231 255 0 0 0 254 234 0 0 52 255 0 255 0 232 0 0 77 168 87 125 0 235 19 20 0 36 219 85 0 126 129 255 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+
+    /// the real `colormap.map` data of the shipped Defy wireless backup: 10 layers of 178 palette indices.
+    const REAL_COLORMAP_DATA: &str = "10 4 4 4 4 4 7 10 4 4 4 4 4 7 2 4 4 4 4 4 0 2 4 4 4 4 4 10 3 1 5 8 2 0 0 5 4 4 4 4 4 7 11 4 4 4 4 4 7 7 7 4 4 4 4 7 2 7 7 7 4 4 10 2 1 3 8 2 6 6 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 10 12 12 12 12 12 12 10 12 9 3 9 10 12 12 1 3 3 3 10 12 2 12 12 12 12 12 12 12 1 6 5 2 12 12 5 0 0 0 12 11 12 12 0 3 3 3 12 12 12 0 3 0 3 12 12 12 6 3 3 3 3 12 12 9 3 12 12 12 12 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 7 4 8 8 8 8 8 8 15 12 15 7 7 9 15 15 12 3 0 1 9 15 15 15 15 15 15 9 15 8 15 12 15 15 15 15 15 8 8 8 8 8 8 15 15 15 12 3 15 15 15 12 11 0 3 12 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 3 6 6 6 6 6 3 3 6 6 6 6 6 3 3 6 6 6 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15";
+
+    /// the real `superkeys.map` data of the shipped Defy wireless backup: one superkey, live bytes only.
+    const REAL_SUPERKEYS_DATA: &str = "262 281 2329 283 1 0 0";
+
+    /// the real `macros.map` data of the shipped Defy wireless backup: the Dygmate macro.
+    const REAL_MACROS_DATA: &str =
+        "6 229 8 11 7 229 8 8 8 28 8 54 8 44 6 229 8 7 7 229 8 28 8 10 8 16 8 4 8 23 8 8 0 0";
+
+    /// The real-shaped macro map data with one macro too many for the
+    /// firmware's 128-macro addressing space (`MacroMap::MAX_MACROS`):
+    /// 129 single-keycode-down macros plus the map terminator.
+    fn oversized_macros_data() -> String {
+        std::iter::repeat_n("6 229 0", MacroMap::MAX_MACROS + 1)
+            .chain(std::iter::once("0"))
+            .join(" ")
+    }
+
+    /// A backup holding a representative slice of the shipped Defy
+    /// wireless backup's capture, in its real order: `keymap.custom`
+    /// first, `superkeys.map` later — the order Bazecor's reorder
+    /// exists for. All map data is the real, full-shaped data.
+    fn real_ordered_backup() -> parsing::backup::DefyBackup {
+        let entries = [
+            ("keymap.custom", REAL_KEYMAP_CUSTOM_DATA),
+            ("keymap.onlyCustom", "1"),
+            ("settings.defaultLayer", "0"),
+            ("led.brightness", "153"),
+            ("palette", REAL_PALETTE_DATA),
+            ("colormap.map", REAL_COLORMAP_DATA),
+            ("idleleds.time_limit", "300"),
+            ("qukeys.holdTimeout", "250"),
+            ("qukeys.overlapThreshold", "80"),
+            ("superkeys.map", REAL_SUPERKEYS_DATA),
+            ("superkeys.waitfor", "500"),
+            ("macros.map", REAL_MACROS_DATA),
+            ("mouse.speedLimit", "127"),
+            ("wireless.bluetooth.macs", ""),
+            ("wireless.rf.power", "0"),
+        ];
+
+        parsing::backup::DefyBackup {
+            neuron_id: "8ed7f33db024a5b5".to_owned(),
+            neuron: parsing::backup::BackupNeuron {
+                id: "8ed7f33db024a5b5".to_owned(),
+                device: Some(DefyKeyboard::backup_device_descriptor(
+                    true,
+                    "8ed7f33db024a5b5",
+                )),
+                ..Default::default()
+            },
+            versions: Default::default(),
+            backup: entries
+                .iter()
+                .map(|(command, data)| {
+                    parsing::backup::BackupCommand::new((*command).to_owned(), (*data).to_owned())
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn real_backup_yields_bazecors_full_restore_plan() {
+        let plan = DefyKeyboard::backup_restore_plan(&real_ordered_backup()).unwrap();
+
+        let commands: Vec<&str> = plan.iter().map(|entry| entry.command.as_str()).collect();
+
+        // Bazecor's restore order: the superkeys map moved directly
+        // before the keymap, everything else in its captured order, and
+        // the `led.mode 0` tail appended (Bazecor's
+        // `noCacheCommand("led.mode 0")`; `led.mode` is deny-listed
+        // from captures, so the tail is always an append). The plan is
+        // the complete device write sequence, tail included.
+        assert_eq!(
+            commands,
+            [
+                "superkeys.map",
+                "keymap.custom",
+                "keymap.onlyCustom",
+                "settings.defaultLayer",
+                "led.brightness",
+                "palette",
+                "colormap.map",
+                "idleleds.time_limit",
+                "qukeys.holdTimeout",
+                "qukeys.overlapThreshold",
+                "superkeys.waitfor",
+                "macros.map",
+                "mouse.speedLimit",
+                "wireless.bluetooth.macs",
+                "wireless.rf.power",
+                "led.mode",
+            ]
+        );
+
+        assert_eq!(plan.last().unwrap().data, "0");
+
+        // Validation parsed the full real data and the plan carries it
+        // through verbatim — restores re-send captures byte for byte.
+        let keymap = plan
+            .iter()
+            .find(|entry| entry.command == "keymap.custom")
+            .unwrap();
+
+        assert_eq!(keymap.data, REAL_KEYMAP_CUSTOM_DATA);
+    }
+
+    #[test]
+    fn plan_rejects_a_backup_for_another_product() {
+        let mut backup = real_ordered_backup();
+
+        backup.neuron.device = Some(serde_json::json!({ "info": { "product": "Raise" } }));
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert_eq!(err.to_string(), "the backup is for a `Raise`, not a Defy");
+        assert!(matches!(err, BackupValidationError::NotADefyBackup { .. }));
+    }
+
+    #[test]
+    fn plan_allows_a_backup_without_a_device_descriptor() {
+        // Nothing to check the product against: the entries carry the
+        // proof (a foreign keymap or map data fails their parse).
+        let mut backup = real_ordered_backup();
+
+        backup.neuron.device = None;
+
+        assert!(DefyKeyboard::backup_restore_plan(&backup).is_ok());
+    }
+
+    #[test]
+    fn plan_rejects_truncated_keymap_data() {
+        // The real keymap data with the tenth layer cut off mid-layer:
+        // half a restore is worse than none, so validation fails the
+        // whole backup with the parse failure.
+        let mut backup = real_ordered_backup();
+
+        backup.backup[0].data = REAL_KEYMAP_CUSTOM_DATA
+            .split(' ')
+            .take(80 * 9 + 40)
+            .join(" ");
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::Keymap(_),
+            } if command == "keymap.custom"
+        ));
+    }
+
+    #[test]
+    fn plan_rejects_a_keymap_with_the_wrong_layer_count() {
+        // Nine *whole* layers parse as a keymap (the wire parser
+        // accepts any layer count), but a `keymap.custom` write carries
+        // exactly ten, so restore validation enforces that count.
+        let mut backup = real_ordered_backup();
+
+        backup.backup[0].data = REAL_KEYMAP_CUSTOM_DATA.split(' ').take(80 * 9).join(" ");
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::KeymapLayers(_),
+            } if command == "keymap.custom"
+        ));
+        assert!(err.to_string().contains("keymap.custom"));
+    }
+
+    #[test]
+    fn plan_rejects_a_macro_map_past_the_firmware_limit() {
+        // One macro past the firmware's 128-macro addressing space:
+        // validation parses the map through `MacroMap`, whose limit
+        // (issue #17) rejects it before anything is sent.
+        let mut backup = real_ordered_backup();
+
+        backup
+            .backup
+            .iter_mut()
+            .find(|entry| entry.command == "macros.map")
+            .unwrap()
+            .data = oversized_macros_data();
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::Macros(_),
+            } if command == "macros.map"
+        ));
+    }
+
+    #[test]
+    fn plan_passes_through_commands_without_a_wire_parser() {
+        // LED and colormap data have no parser in this crate yet
+        // (WS-C); like Bazecor's restore, the plan sends them verbatim
+        // — here with the real shipped data at full size.
+        let plan = DefyKeyboard::backup_restore_plan(&real_ordered_backup()).unwrap();
+
+        let colormap = plan
+            .iter()
+            .find(|entry| entry.command == "colormap.map")
+            .unwrap();
+        let palette = plan
+            .iter()
+            .find(|entry| entry.command == "palette")
+            .unwrap();
+
+        assert_eq!(colormap.data, REAL_COLORMAP_DATA);
+        assert_eq!(palette.data, REAL_PALETTE_DATA);
     }
 }
