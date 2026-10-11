@@ -11,10 +11,26 @@ use winnow::{
 
 use crate::keycode_tables::KeyKind;
 
-/// Error when parsing a keymap.
-#[derive(Clone, Debug, Display, Error, From)]
-#[display("failed to parse keymap data:\n{_0}")]
-pub struct ParseKeymapError(#[error(not(source))] String);
+/// Error when parsing a keymap from wire data.
+///
+/// Carries where the parser gave up within the input it was given, so
+/// errors can point at the offending part of the data instead of
+/// quoting it whole.
+#[derive(Clone, Debug, Display, Error)]
+#[display("failed to parse keymap data at byte offset {offset}: expected {expected}")]
+pub struct ParseKeymapError {
+    /// Byte offset of the failure.
+    ///
+    /// This is where the parser gave up, which is exact when the
+    /// offending token sits in the first layer or at a layer boundary;
+    /// inside a later layer it is the start of the layer that failed.
+    /// Walk the whitespace-separated tokens forward from here to find
+    /// the first one that is not a valid key code.
+    pub offset: usize,
+    /// What the parser expected at `offset`, from the parser's own
+    /// context (e.g. `a key code`).
+    pub expected: String,
+}
 
 /// A complete raw keymap with individual layers and uninterpreted keycodes.
 #[derive(Clone, Debug, Deref)]
@@ -24,10 +40,11 @@ impl FromStr for Keymap {
     type Err = ParseKeymapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let layers = layers_parser
-            .parse(s)
-            .map_err(|err| err.to_string())
-            .map_err(ParseKeymapError)?;
+        let layers = layers_parser.parse(s).map_err(|err| ParseKeymapError {
+            offset: err.offset(),
+            expected: crate::focus_api::parsing::parse_expectation(err.inner().context())
+                .unwrap_or_else(|| "a key code".to_owned()),
+        })?;
 
         Ok(Self(layers))
     }
@@ -87,5 +104,48 @@ mod tests {
         let layers = data.parse::<Keymap>().unwrap().0;
 
         assert_eq!(layers.len(), 10);
+    }
+
+    #[test]
+    fn parse_error_locates_the_failure() {
+        // Layer 1 parses; the first token of layer 2 is corrupted. The
+        // error carries the offset and the parser's expectation instead
+        // of quoting the input.
+        let err = "41 30 O".parse::<Keymap>().unwrap_err();
+
+        assert_eq!(err.offset, 6);
+        assert_eq!(
+            err.to_string(),
+            "failed to parse keymap data at byte offset 6: expected a key code"
+        );
+
+        // Data that ends where a token was expected fails at the end of
+        // the input.
+        let err = "41 30 31 ".parse::<Keymap>().unwrap_err();
+
+        assert_eq!(err.offset, 9);
+    }
+
+    #[test]
+    fn mid_layer_failure_reports_the_layer_start() {
+        // A full ten-layer wire string (the real default layer, ten
+        // times) with one token of layer 2 corrupted: the parser gives
+        // up at the start of the layer that failed rather than at the
+        // token. (The offset documents this; consumers walk forward
+        // from it to find the token that is not a valid key code.)
+        let layer = "41 30 31 32 33 34 35 0 0 51518 37 38 39 45 46 42 43 20 26 8 21 23 128 0 0 28 24 12 18 19 47 48 57 4 22 7 9 10 129 0 0 11 13 14 15 51 52 229 49 29 27 6 25 5 0 0 0 0 17 16 54 55 56 229 224 227 42 76 44 40 226 225 79 81 80 40 17152 74 82 77";
+        let mut tokens: Vec<&str> = std::iter::repeat_n(layer, 10)
+            .flat_map(str::split_whitespace)
+            .collect();
+
+        assert_eq!(tokens.len(), 10 * 80);
+
+        tokens[80 + 20] = "O";
+
+        let data = tokens.join(" ");
+        let err = data.parse::<Keymap>().unwrap_err();
+
+        // Layer 2 starts right after layer 1 and its separating space.
+        assert_eq!(err.offset, layer.len() + 1);
     }
 }

@@ -13,10 +13,40 @@ use winnow::{
 
 use crate::keycode_tables::KeyKind;
 
-/// Error when parsing a macro map.
-#[derive(Clone, Debug, Display, Error, From)]
-#[display("failed to parse macro map data:\n{_0}")]
-pub struct ParseMacroMapError(#[error(not(source))] String);
+/// The winnow expectation the parser attaches when it meets an
+/// unsupported action kind (kinds 9 to 13, documented firmware actions
+/// this crate does not support yet).
+const UNSUPPORTED_KIND_EXPECTATION: &str =
+    "a supported action kind; kinds 9 to 13 are not yet supported";
+
+/// Error when parsing a macro map from wire data.
+///
+/// Carries the byte offset of the failure within the input the parser
+/// was given, so errors can point at the offending part of the data
+/// instead of quoting it whole.
+#[derive(Clone, Debug, Display, Error)]
+#[display("failed to parse macro map data at byte offset {offset}: expected {expected}")]
+pub struct ParseMacroMapError {
+    /// Byte offset of the failure within the parsed input.
+    ///
+    /// This is the start of the token that could not be parsed, or the
+    /// end of the input when the data ended where a token was expected
+    /// — except when an unsupported action kind is rejected: the parser
+    /// has already consumed the kind byte, so the offset sits just past
+    /// it (see [`Self::unsupported_kind`]).
+    pub offset: usize,
+    /// What the parser expected at `offset`, from the parser's own
+    /// context — e.g. `a supported action kind; kinds 9 to 13 are not
+    /// yet supported`.
+    pub expected: String,
+    /// Whether the failure is the unsupported-action-kind rejection.
+    ///
+    /// That rejection is the one failure whose offset does not sit on
+    /// the offending token: the kind byte is consumed before it is
+    /// rejected, so `offset` marks where parsing stopped, just past the
+    /// offender.
+    pub unsupported_kind: bool,
+}
 
 /// Error returned when there are too many macros in a [`MacroMap`] and
 /// thus, creating the command data would overflow the macro memory.
@@ -68,9 +98,16 @@ impl FromStr for MacroMap {
             return Ok(Self(Vec::new()));
         }
 
-        let macros = macros_parser
-            .parse(s)
-            .map_err(|err| ParseMacroMapError(err.to_string()))?;
+        let macros = macros_parser.parse(s).map_err(|err| {
+            let expected = crate::focus_api::parsing::parse_expectation(err.inner().context())
+                .unwrap_or_else(|| "a macro action value".to_owned());
+
+            ParseMacroMapError {
+                offset: err.offset(),
+                unsupported_kind: expected == UNSUPPORTED_KIND_EXPECTATION,
+                expected,
+            }
+        })?;
 
         Ok(Self(macros))
     }
@@ -260,7 +297,7 @@ fn action_parser(input: &mut &str) -> ModalResult<MacroAction> {
         cut_err(fail)
             .context(context_label.clone())
             .context(StrContext::Expected(StrContextValue::Description(
-                "a supported action kind; kinds 9 to 13 are not yet supported",
+                UNSUPPORTED_KIND_EXPECTATION,
             )))
             .parse_next(input)?;
     }
@@ -511,17 +548,29 @@ mod tests {
         // Kind 12 is TAP_SEQUENCE in the firmware, which the SDK does not
         // support yet. It must fail deterministically instead of being
         // skipped as a stray byte and misparsing the sequence's bytes as
-        // action kinds.
+        // action kinds. The error carries the failure's offset and the
+        // parser's expectation, not the input.
         let err = "12 14 7 18 18 26 0 0 ".parse::<MacroMap>().unwrap_err();
 
+        // The kind byte is consumed before the rejection fires, so the
+        // failure points just past it. The error marks this as the
+        // consumed-offender case for diagnostics.
+        assert_eq!(err.offset, 3);
+        assert!(err.unsupported_kind);
+        assert!(err.expected.contains("not yet supported"));
         assert!(err.to_string().contains("not yet supported"));
 
         // A stray byte followed by an unsupported kind still fails,
         // through the generic out-of-range path.
         assert!("14 12 8 44 0 0 ".parse::<MacroMap>().is_err());
 
-        // Unparsable data still fails.
-        assert!("garbage".parse::<MacroMap>().is_err());
+        // Unparsable data still fails, at its offset — not a
+        // consumed-offender failure.
+        let err = "garbage".parse::<MacroMap>().unwrap_err();
+
+        assert_eq!(err.offset, 0);
+        assert_eq!(err.expected, "u8 representing action type");
+        assert!(!err.unsupported_kind);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate derive_more;
 
+mod diagnostics;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
@@ -224,10 +226,16 @@ impl KeymapCommands {
         match self {
             Self::New { keymap, path } => {
                 let keymap = if let Some(keymap) = keymap {
-                    keymap
-                        .parse::<DefyKeymap>()
-                        .change_context(Error)
-                        .attach("parsing keymap JSON file")?
+                    match keymap.parse::<DefyKeymap>() {
+                        Ok(keymap) => keymap,
+                        Err(err) => {
+                            return Err(diagnostics::wire_parse_report(
+                                diagnostics::WireFormat::Keymap,
+                                &keymap,
+                                diagnostics::WireFailure::keymap(&err),
+                            ));
+                        }
+                    }
                 } else {
                     let mut defy = DefyKeyboard::new()
                         .await
@@ -341,10 +349,16 @@ impl SuperkeyCommands {
         match self {
             Self::New { superkeys, path } => {
                 let map = if let Some(superkeys) = superkeys {
-                    superkeys
-                        .parse::<SuperkeyMap>()
-                        .change_context(Error)
-                        .attach("parsing superkeys JSON file")?
+                    match superkeys.parse::<SuperkeyMap>() {
+                        Ok(map) => map,
+                        Err(err) => {
+                            return Err(diagnostics::wire_parse_report(
+                                diagnostics::WireFormat::Superkeys,
+                                &superkeys,
+                                diagnostics::WireFailure::superkeys(&err),
+                            ));
+                        }
+                    }
                 } else {
                     let mut defy = DefyKeyboard::new()
                         .await
@@ -458,10 +472,16 @@ impl MacroCommands {
         match self {
             Self::New { macros, path } => {
                 let map = if let Some(macros) = macros {
-                    macros
-                        .parse::<MacroMap>()
-                        .change_context(Error)
-                        .attach("parsing macros string")?
+                    match macros.parse::<MacroMap>() {
+                        Ok(map) => map,
+                        Err(err) => {
+                            return Err(diagnostics::wire_parse_report(
+                                diagnostics::WireFormat::Macros,
+                                &macros,
+                                diagnostics::WireFailure::macros(&err),
+                            ));
+                        }
+                    }
                 } else {
                     let mut defy = DefyKeyboard::new()
                         .await
@@ -1029,9 +1049,12 @@ impl BackupCommands {
                 // the device until all three succeeded.
                 let backup = read_json_file::<DefyBackup>(&path).await?;
 
-                let plan = DefyKeyboard::backup_restore_plan(&backup)
-                    .change_context(Error)
-                    .attach_with(|| format!("validating the backup in {}", path.display()))?;
+                let plan = match DefyKeyboard::backup_restore_plan(&backup) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        return Err(diagnostics::backup_validation_report(&path, err));
+                    }
+                };
 
                 let store_path = names_store_path(store.as_deref())?;
                 let mut names_store = load_names_store(&store_path).await?;
@@ -1700,10 +1723,12 @@ impl KeyCodeCommands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), error_stack::Report<Error>> {
-    Cli::parse().perform().await?;
+async fn main() {
+    if let Err(report) = Cli::parse().perform().await {
+        eprint!("{}", diagnostics::render(&report));
 
-    Ok(())
+        std::process::exit(1);
+    }
 }
 
 #[derive(Clone, Debug, Display, Error)]
@@ -1747,7 +1772,7 @@ fn get_command_suggestions<'a>(available_cmds: &'a [String], user_input: &str) -
 
 async fn read_json_file<T>(path: &Path) -> Result<T, error_stack::Report<Error>>
 where
-    T: for<'de> serde::Deserialize<'de>,
+    T: for<'de> serde::Deserialize<'de> + diagnostics::JsonDomainHint,
 {
     let file = File::open(path)
         .await
@@ -1764,10 +1789,10 @@ where
         .attach("reading file contents")
         .attach_with(|| path.to_string_lossy().into_owned())?;
 
-    serde_json::from_reader::<_, T>(data.as_slice())
-        .change_context(Error)
-        .attach("parsing file contents")
-        .attach_with(|| path.to_string_lossy().into_owned())
+    match serde_json::from_reader::<_, T>(data.as_slice()) {
+        Ok(value) => Ok(value),
+        Err(err) => Err(diagnostics::json_parse_report::<T>(path, &data, err)),
+    }
 }
 
 async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), error_stack::Report<Error>>

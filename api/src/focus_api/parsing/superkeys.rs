@@ -11,10 +11,22 @@ use winnow::{
     token::rest,
 };
 
-/// Error when parsing a superkeys map..
-#[derive(Clone, Debug, Display, Error, From)]
-#[display("failed to parse superkey map data:\n{_0}")]
-pub struct ParseSuperkeyMapError(#[error(not(source))] String);
+/// Error when parsing a superkey map from wire data.
+///
+/// Carries the byte offset of the failure within the input the parser
+/// was given, so errors can point at the offending part of the data
+/// instead of quoting it whole.
+#[derive(Clone, Debug, Display, Error)]
+#[display("failed to parse superkey map data at byte offset {offset}: expected {expected}")]
+pub struct ParseSuperkeyMapError {
+    /// Byte offset of the failure: the start of the token that could not
+    /// be parsed, or the end of the input when the data ended where a
+    /// token was expected.
+    pub offset: usize,
+    /// What the parser expected at `offset`, from the parser's own
+    /// context (e.g. `superkey terminator`).
+    pub expected: String,
+}
 
 /// Error returned when there are too many superkeys in a [`SuperkeyMap`]
 /// and thus, creating the command data would overflow.
@@ -38,7 +50,11 @@ impl FromStr for SuperkeyMap {
 
         let map = super_keys_parser
             .parse(s)
-            .map_err(|err| ParseSuperkeyMapError(err.to_string()))?;
+            .map_err(|err| ParseSuperkeyMapError {
+                offset: err.offset(),
+                expected: crate::focus_api::parsing::parse_expectation(err.inner().context())
+                    .unwrap_or_else(|| "a superkey action value".to_owned()),
+            })?;
 
         Ok(Self(map))
     }
@@ -314,14 +330,48 @@ mod tests {
 
     #[test]
     fn malformed_data_fails_cleanly() {
-        // Garbage instead of superkey data.
-        assert!("garbage".parse::<SuperkeyMap>().is_err());
+        // Garbage instead of superkey data: the failure carries its
+        // offset and the parser's expectation, not the input.
+        let err = "garbage".parse::<SuperkeyMap>().unwrap_err();
 
-        // A truncated map: a superkey terminator without the map's final
-        // `0`.
-        assert!("44 57 1 1 1 0".parse::<SuperkeyMap>().is_err());
+        assert_eq!(err.offset, 0);
+        assert_eq!(
+            err.to_string(),
+            "failed to parse superkey map data at byte offset 0: expected a superkey action value"
+        );
+
+        // A truncated map: a superkey terminator without the map's
+        // final `0`. The parser fails at the end of the input looking
+        // for the next superkey's first action.
+        let err = "44 57 1 1 1 0".parse::<SuperkeyMap>().unwrap_err();
+
+        assert_eq!(err.offset, 13);
+        assert_eq!(err.expected, "a superkey action value");
 
         // A superkey with fewer than five actions.
         assert!("44 57 1 1 0".parse::<SuperkeyMap>().is_err());
+
+        // A mid-map token that is not a number fails exactly at its
+        // start.
+        let err = "44 57 O 1 1 0".parse::<SuperkeyMap>().unwrap_err();
+
+        assert_eq!(err.offset, 6);
+
+        // Later superkeys fail exactly at the offending token too —
+        // both a non-numeric action and a terminator mismatch (the
+        // offset sits on the token where the `0` was expected).
+        let err = "44 57 1 1 1 0 44 57 O 1 1 0"
+            .parse::<SuperkeyMap>()
+            .unwrap_err();
+
+        assert_eq!(err.offset, 20);
+        assert_eq!(err.expected, "a superkey action value");
+
+        let err = "44 57 1 1 1 0 44 57 1 1 1 1 0"
+            .parse::<SuperkeyMap>()
+            .unwrap_err();
+
+        assert_eq!(err.offset, 26);
+        assert_eq!(err.expected, "superkey terminator");
     }
 }

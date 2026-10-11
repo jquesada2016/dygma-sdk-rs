@@ -14,6 +14,15 @@ derive_more = { version = "2.0.1", features = ["full"] }
 error-stack = "0.6.0"
 futures = "0.3.31"
 itertools = "0.14.0"
+# Binary-only rendering of context-full error diagnostics (issue #16).
+# Library code must not depend on this: the bridge lives in the CLI's
+# `diagnostics` module. `fancy-no-syscall` (over the full `fancy`)
+# suffices because the renderer picks its theme and pins its width
+# itself — it never probes the terminal, so miette's `supports-*`,
+# `terminal_size`, and `backtrace` machinery is dead weight here.
+miette = { version = "7.6", default-features = false, features = [
+  "fancy-no-syscall",
+] }
 macros = { path = "../macros" }
 paste = "1.0.15"
 pin-project = "1.1.10"
