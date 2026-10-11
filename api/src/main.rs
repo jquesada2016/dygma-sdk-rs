@@ -1774,6 +1774,11 @@ async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), error_sta
 where
     T: serde::Serialize,
 {
+    let data = serde_json::to_vec_pretty(data)
+        .change_context(Error)
+        .attach("serializing data")
+        .attach_with(|| path.to_string_lossy().into_owned())?;
+
     let file = File::create(path)
         .await
         .change_context(Error)
@@ -1781,8 +1786,6 @@ where
         .attach_with(|| path.to_string_lossy().into_owned())?;
 
     let mut writer = BufWriter::new(file);
-
-    let data = serde_json::to_vec_pretty(data).unwrap();
 
     writer
         .write_all(&data)
@@ -1799,4 +1802,84 @@ where
         .attach_with(|| path.to_string_lossy().into_owned())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A type whose [`serde::Serialize`] implementation always fails
+    /// deterministically.
+    #[derive(Debug)]
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::ser::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "unserializable by design (issue #21 test fixture)",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn serialize_failure_leaves_the_destination_untouched() {
+        let directory =
+            std::env::temp_dir().join(format!("dygma-cli-issue-21-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("destination.json");
+        let original = b"{\"sentinel\": true}";
+        std::fs::write(&path, original).unwrap();
+
+        let result = safe_pretty_json_file(&Unserializable, &path).await;
+
+        assert!(result.is_err());
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, original);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serializes_pretty_json_to_the_destination() {
+        let directory = std::env::temp_dir().join(format!(
+            "dygma-cli-issue-21-happy-path-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("destination.json");
+        let data = serde_json::json!({ "sentinel": true });
+
+        safe_pretty_json_file(&data, &path).await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, serde_json::to_string_pretty(&data).unwrap());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serialize_failure_never_creates_the_destination() {
+        let directory = std::env::temp_dir().join(format!(
+            "dygma-cli-issue-21-no-destination-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("destination.json");
+
+        let result = safe_pretty_json_file(&Unserializable, &path).await;
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+
+        std::fs::remove_dir(&directory).unwrap();
+    }
 }
