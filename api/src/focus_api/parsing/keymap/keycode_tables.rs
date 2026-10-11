@@ -30,7 +30,7 @@ pub const ALT_DUAL_FUNCTION: u16 = 49681;
 pub const ALTGR_DUAL_FUNCTION: u16 = 50705;
 
 /// Offset used to enable/check for OS dual-use functionality.
-pub const OSGR_DUAL_FUNCTION: u16 = 49937;
+pub const OS_DUAL_FUNCTION: u16 = 49937;
 
 /// Offset used to enable/check for layer 1 dual-use functionality.
 pub const LAYER_1_DUAL_FUNCTION: u16 = 51218;
@@ -160,7 +160,7 @@ macros::generate_keycode_tables! {
     Four,
     /// 5
     Five,
-    /// Six
+    /// 6
     Six,
     /// 7
     Seven,
@@ -241,11 +241,11 @@ macros::generate_keycode_tables! {
   },
   // [`Symbols`] keys with the `Shift` key applied.
   //
-  // Declared BEFORE `symbols`: their codes are the `Shift` modifier
-  // variants of `symbols` keys (e.g. `Underscore = 2093` is
-  // `Shift + -`), and the generated `From<u16>` match resolves
-  // first-match-wins in DSL order. Declared first, these named keys win
-  // and render like Bazecor's (its DB substitutes shifted punctuation,
+  // Their codes are the `Shift` modifier variants of `symbols` keys
+  // (e.g. `Underscore = 2093` is `Shift + -`), so the `symbols` table
+  // drops those exact expansions via `#[drop_modifier_combos(Shift)]`:
+  // these named keys are the only holders of their codes, and they
+  // render like Bazecor's (its DB substitutes shifted punctuation,
   // rendering 2093 as "_").
   /// Shift symbols.
   shift_symbols: {
@@ -278,31 +278,47 @@ macros::generate_keycode_tables! {
   #[with_modifiers]
   #[with_dual_functions]
   symbols: {
+    // The `Shift` expansions of the keys below are held by the named
+    // `shift_symbols` keys above (e.g. `Shift + -` = `_` = 2093), so
+    // generating them too would duplicate their codes.
     /// -
+    #[drop_modifier_combos(Shift)]
     Dash = 45,
     /// =
+    #[drop_modifier_combos(Shift)]
     Equals,
     /// [
+    #[drop_modifier_combos(Shift)]
     BracketLeft,
     /// ]
+    #[drop_modifier_combos(Shift)]
     BracketRight,
     /// \
+    #[drop_modifier_combos(Shift)]
     Backslash,
     /// ;
+    #[drop_modifier_combos(Shift)]
     Semicolon = 51,
     /// '
+    #[drop_modifier_combos(Shift)]
     SingleQuote,
     /// `
+    #[drop_modifier_combos(Shift)]
     BackTick,
     /// ,
+    #[drop_modifier_combos(Shift)]
     Comma,
     /// .
+    #[drop_modifier_combos(Shift)]
     Period,
     /// /
+    #[drop_modifier_combos(Shift)]
     Slash,
     /// Caps Lock
     CapsLock,
     /// ISO <>
+    // `Shift` + IsoGTLT (2148) is held by `shift_symbols::AltPipe`.
+    #[drop_modifier_combos(Shift)]
     IsoGTLT = 100,
   },
   /// Modifier keys.
@@ -313,8 +329,16 @@ macros::generate_keycode_tables! {
     /// Left Shift
     LeftShift,
     /// Left Alt
+    // Meh (2530) is `LeftAlt` with the `Ctrl` + `Shift` modifiers
+    // (firmware `Key_Meh = LCTRL(LSHIFT(Key_LeftAlt))`); the named
+    // `modifier_combos::Meh` key below holds that code.
+    #[drop_modifier_combos(Ctrl + Shift)]
     LeftAlt,
     /// Left OS
+    // Hyper (3043) is `LeftOs` with the `Ctrl` + `Alt` + `Shift`
+    // modifiers (firmware `Key_Hyper = MEH(Key_LeftGui)`); the named
+    // `modifier_combos::Hyper` key below holds that code.
+    #[drop_modifier_combos(Ctrl + Alt + Shift)]
     LeftOs,
     /// Right Ctrl
     RightCtrl,
@@ -323,6 +347,13 @@ macros::generate_keycode_tables! {
     AltGr,
     /// Right OS
     RightOs,
+  },
+  /// Modifier combinations.
+  modifier_combos: {
+    /// Meh
+    Meh = 2530,
+    /// Hyper
+    Hyper = 3043,
   },
   /// Media keys.
   media: {
@@ -380,14 +411,14 @@ macros::generate_keycode_tables! {
 
   },
   /// Mouse Wheel
-  mouse_wheele: {
-    /// Mouse Wheele Up
+  mouse_wheel: {
+    /// Mouse Wheel Up
     WheelUp = 20497,
     /// Mouse Wheel Down
     WheelDown,
     /// Mouse Wheel Left
     WheelLeft = 20500,
-    /// Mouse Wheele Right
+    /// Mouse Wheel Right
     WheelRight = 20504,
   },
   /// Mouse buttons.
@@ -433,7 +464,6 @@ macros::generate_keycode_tables! {
   /// Bluetooth functions.
   bluetooth: {
     /// Bluetooth Pairing
-    /// Bluetooth Pairing
     Pair = 54109,
   },
   /// Energy functions.
@@ -445,6 +475,17 @@ macros::generate_keycode_tables! {
   rf: {
     /// Wireless RF Status
     Status = 54112,
+  },
+  // The Overlay family lives only in Bazecor (`src/hw/overlay.ts`);
+  // nothing in the Kaleidoscope sources models it. Bazecor's own DB
+  // carries OVERLAY_KEY (54112), which collides with the RF status key
+  // above — mirrored here by NOT modeling it.
+  /// Overlay functions.
+  overlay: {
+    /// Overlay Tap
+    Tap = 54113,
+    /// Overlay Hold
+    Hold,
   },
   /// Lock to layer keys.
   layer_lock: {
@@ -1140,4 +1181,328 @@ macros::generate_keycode_tables! {
     /// TapDance 15
     TapDance15,
   },
+  // Steno and SpaceCadet follow the tapdance/leader/CYCLE/SYSTER block
+  // in the firmware's `Kaleidoscope-Ranges.h` (after the unmodeled
+  // TT_FIRST..TT_LAST range, 53293-53548). Steno's 42 keys are the
+  // GeminiPR action enum (`geminipr::START..END`), one per code from
+  // STENO_FIRST (53549) through ZR (53590); the 43rd range slot (53591,
+  // `STENO_LAST`) is unused and stays unmodeled. SpaceCadet uses the
+  // firmware's own `SC_FIRST`/`SC_LAST` (53592/53593), adjudicated over
+  // Bazecor's DB, whose SCadet keys are one lower — see the SpaceCadet
+  // table docs below.
+  /// Steno keys.
+  steno: {
+    /// Steno FN
+    Fn = 53549,
+    /// Steno N1
+    N1,
+    /// Steno N2
+    N2,
+    /// Steno N3
+    N3,
+    /// Steno N4
+    N4,
+    /// Steno N5
+    N5,
+    /// Steno N6
+    N6,
+    /// Steno S1
+    S1,
+    /// Steno S2
+    S2,
+    /// Steno TL
+    Tl,
+    /// Steno KL
+    Kl,
+    /// Steno PL
+    Pl,
+    /// Steno WL
+    Wl,
+    /// Steno HL
+    Hl,
+    /// Steno RL
+    Rl,
+    /// Steno A
+    A,
+    /// Steno O
+    O,
+    /// Steno ST1
+    St1,
+    /// Steno ST2
+    St2,
+    /// Steno RE1
+    Re1,
+    /// Steno RE2
+    Re2,
+    /// Steno PWR
+    Pwr,
+    /// Steno ST3
+    St3,
+    /// Steno ST4
+    St4,
+    /// Steno E
+    E,
+    /// Steno U
+    U,
+    /// Steno FR
+    Fr,
+    /// Steno RR
+    Rr,
+    /// Steno PR
+    Pr,
+    /// Steno BR
+    Br,
+    /// Steno LR
+    Lr,
+    /// Steno GR
+    Gr,
+    /// Steno TR
+    Tr,
+    /// Steno SR
+    Sr,
+    /// Steno DR
+    Dr,
+    /// Steno N7
+    N7,
+    /// Steno N8
+    N8,
+    /// Steno N9
+    N9,
+    /// Steno NA
+    Na,
+    /// Steno NB
+    Nb,
+    /// Steno NC
+    Nc,
+    /// Steno ZR
+    Zr,
+  },
+  /// SpaceCadet functions.
+  ///
+  /// Codes follow the firmware ground truth: `Kaleidoscope-Ranges.h`
+  /// places `SC_FIRST`/`SC_LAST` (the `Key_SpaceCadetEnable` /
+  /// `Key_SpaceCadetDisable` keys of `plugin/SpaceCadet.h`) at
+  /// 53592/53593, right after the steno range whose 43rd slot (53591)
+  /// is unused by GeminiPR.
+  ///
+  /// **Bazecor's DB spells these one lower** — its "SCadet ENABLE" is
+  /// 53591 and its "SCadet DISABLE" is 53592
+  /// (`src/api/keymap/db/spacecadet.ts`). Per the firmware, 53591 is a
+  /// dead key and 53592 switches SpaceCadet **on**, so those spellings
+  /// are known-bad for backup interop: a Bazecor backup carrying them
+  /// needs remapping (relevant to backup import, WS-E).
+  spacecadet: {
+    /// SpaceCadet Enable
+    Enable = 53592,
+    /// SpaceCadet Disable
+    Disable,
+  },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated `From<u16>` match must resolve every code without
+    /// dead arms, and every named key must round-trip through its own
+    /// `Display` output — the parse matchers include the display names,
+    /// so a collision (two spellings for one code, or a display string
+    /// that parses to a different key) would fail here.
+    #[test]
+    fn every_code_resolves_and_named_keys_round_trip() {
+        for code in 0..=u16::MAX {
+            let kind = KeyKind::from(code);
+
+            assert_eq!(u16::from(kind), code);
+
+            // `Unknown` has no parse path (`#[from(ignore)]`); named
+            // keys must parse back from their own display name.
+            if let KeyKind::Unknown(_) = kind {
+                continue;
+            }
+
+            let reparsed: KeyKind = kind
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| panic!("code {code} ({kind:?}) does not parse back"));
+
+            assert_eq!(reparsed, kind, "code {code} does not round-trip");
+        }
+    }
+
+    #[test]
+    fn meh_and_hyper_are_the_named_variants() {
+        assert!(matches!(
+            KeyKind::from(2530),
+            KeyKind::ModifierCombos(ModifierCombos::Meh)
+        ));
+        assert!(matches!(
+            KeyKind::from(3043),
+            KeyKind::ModifierCombos(ModifierCombos::Hyper)
+        ));
+
+        assert_eq!(KeyKind::from(2530).to_string(), "Meh");
+        assert_eq!(KeyKind::from(3043).to_string(), "Hyper");
+
+        assert_eq!(
+            "Meh".parse::<KeyKind>().unwrap(),
+            KeyKind::ModifierCombos(ModifierCombos::Meh)
+        );
+        assert_eq!(
+            "Hyper".parse::<KeyKind>().unwrap(),
+            KeyKind::ModifierCombos(ModifierCombos::Hyper)
+        );
+    }
+
+    /// Ratified in issue #14: the named `shift_symbols` keys are the
+    /// only holders of their codes — the generated `Shift` expansions
+    /// are gone, so their spellings stop parsing (`Shift + -` becomes
+    /// the dead spelling of `_`).
+    #[test]
+    fn shift_symbols_are_the_only_holders_of_their_codes() {
+        assert!(matches!(
+            KeyKind::from(2093),
+            KeyKind::ShiftSymbols(ShiftSymbols::Underscore)
+        ));
+        assert_eq!(KeyKind::from(2093).to_string(), "_");
+        assert_eq!(KeyKind::from(2148).to_string(), "Non-U.S. |");
+
+        assert_eq!(
+            "_".parse::<KeyKind>().unwrap(),
+            KeyKind::ShiftSymbols(ShiftSymbols::Underscore)
+        );
+
+        for spelling in ["Shift + -", "shiftdash", "Shift + ?"] {
+            assert!(
+                spelling.parse::<KeyKind>().is_err(),
+                "`{spelling}` should no longer parse"
+            );
+        }
+
+        // `symbols::CapsLock` keeps its `Shift` expansion — it is not a
+        // `shift_symbols` key.
+        assert_eq!(KeyKind::from(57 + 2048).to_string(), "Shift + Caps Lock");
+    }
+
+    #[test]
+    fn name_level_cleanup_from_issue_14() {
+        assert_eq!(Digits::Six.to_string(), "6");
+        assert_eq!(
+            "6".parse::<KeyKind>().unwrap(),
+            KeyKind::Digits(Digits::Six)
+        );
+
+        assert_eq!(Bluetooth::Pair.to_string(), "Bluetooth Pairing");
+
+        assert_eq!(OS_DUAL_FUNCTION, 49937);
+    }
+
+    #[test]
+    fn mouse_wheel_table_name() {
+        // The table rename is compile-checked by the enum name; pin the
+        // display names, which used to carry the "Wheele" typo.
+        let kinds = [
+            (20497, MouseWheel::WheelUp, "Mouse Wheel Up"),
+            (20498, MouseWheel::WheelDown, "Mouse Wheel Down"),
+            (20500, MouseWheel::WheelLeft, "Mouse Wheel Left"),
+            (20504, MouseWheel::WheelRight, "Mouse Wheel Right"),
+        ];
+
+        for (code, key, display) in kinds {
+            assert_eq!(KeyKind::from(code), KeyKind::MouseWheel(key));
+            assert_eq!(KeyKind::from(code).to_string(), display);
+        }
+    }
+
+    #[test]
+    fn overlay_family() {
+        assert_eq!(KeyKind::from(54113), KeyKind::Overlay(Overlay::Tap));
+        assert_eq!(KeyKind::from(54114), KeyKind::Overlay(Overlay::Hold));
+
+        assert_eq!(Overlay::Tap.to_string(), "Overlay Tap");
+        assert_eq!(Overlay::Hold.to_string(), "Overlay Hold");
+
+        // 54112 stays the RF status key: Bazecor's own DB collides
+        // OVERLAY_KEY with it, and `rf::Status` mirrors that.
+        assert_eq!(KeyKind::from(54112), KeyKind::Rf(Rf::Status));
+    }
+
+    #[test]
+    fn spacecadet_family() {
+        // Firmware ground truth (`Kaleidoscope-Ranges.h`): SC_FIRST =
+        // 53592, SC_LAST = 53593. Bazecor's DB spells these one lower
+        // (53591/53592) — known-bad for backup interop; see the
+        // SpaceCadet table docs.
+        assert_eq!(
+            KeyKind::from(53592),
+            KeyKind::Spacecadet(Spacecadet::Enable)
+        );
+        assert_eq!(
+            KeyKind::from(53593),
+            KeyKind::Spacecadet(Spacecadet::Disable)
+        );
+
+        assert_eq!(Spacecadet::Enable.to_string(), "SpaceCadet Enable");
+        assert_eq!(Spacecadet::Disable.to_string(), "SpaceCadet Disable");
+    }
+
+    #[test]
+    fn steno_family_covers_53549_through_53590() {
+        let expected_displays = [
+            "Steno FN",
+            "Steno N1",
+            "Steno N2",
+            "Steno N3",
+            "Steno N4",
+            "Steno N5",
+            "Steno N6",
+            "Steno S1",
+            "Steno S2",
+            "Steno TL",
+            "Steno KL",
+            "Steno PL",
+            "Steno WL",
+            "Steno HL",
+            "Steno RL",
+            "Steno A",
+            "Steno O",
+            "Steno ST1",
+            "Steno ST2",
+            "Steno RE1",
+            "Steno RE2",
+            "Steno PWR",
+            "Steno ST3",
+            "Steno ST4",
+            "Steno E",
+            "Steno U",
+            "Steno FR",
+            "Steno RR",
+            "Steno PR",
+            "Steno BR",
+            "Steno LR",
+            "Steno GR",
+            "Steno TR",
+            "Steno SR",
+            "Steno DR",
+            "Steno N7",
+            "Steno N8",
+            "Steno N9",
+            "Steno NA",
+            "Steno NB",
+            "Steno NC",
+            "Steno ZR",
+        ];
+
+        for (offset, display) in expected_displays.iter().enumerate() {
+            let kind = KeyKind::from(53549 + offset as u16);
+
+            assert!(matches!(kind, KeyKind::Steno(_)));
+            assert_eq!(kind.to_string(), *display);
+        }
+
+        // The firmware reserves one unused steno range slot (STENO_LAST,
+        // 53591) before SpaceCadet — unmodeled, and the reason Bazecor's
+        // one-lower SpaceCadet spellings are off by one.
+        assert!(matches!(KeyKind::from(53591), KeyKind::Unknown(53591)));
+    }
 }

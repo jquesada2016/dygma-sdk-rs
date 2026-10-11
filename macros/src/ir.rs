@@ -1,6 +1,7 @@
 use crate::{ast, lit_int_to_u16};
 use itertools::Itertools;
-use std::collections::HashMap;
+use proc_macro2::Span;
+use std::collections::{HashMap, HashSet};
 
 struct KeyCodeOverflowsU16Error;
 
@@ -11,6 +12,7 @@ impl From<ast::Ast> for Ir {
         let tables: Vec<KeyTable> = ast.0.into_iter().map(KeyTable::from).collect();
 
         abort_on_duplicate_codes(&tables);
+        abort_on_ownerless_drops(&tables);
 
         Self(tables)
     }
@@ -18,42 +20,20 @@ impl From<ast::Ast> for Ir {
 
 /// Every generated key ends up as a match arm on the same `u16`, so two
 /// keys sharing a code would silently make one of them unreachable.
-/// Aborts the compile, pointing at the second key, when a code repeats.
+/// Aborts the compile, pointing at the second key, when a code repeats —
+/// whether the repeat is within one table or across tables.
 ///
-/// The one exemption is `shift_symbols`, whose keys intentionally
-/// duplicate codes that are also generated as `Shift` modifier variants
-/// of `symbols` keys (e.g. `Underscore = 2093` is the `Shift` variant of
-/// `symbols::Dash`, `-`). The table is declared before `symbols`, so
-/// first-match-wins resolves those codes to the named `shift_symbols`
-/// keys — mirroring Bazecor, which renders 2093 as "_" — leaving the
-/// generated `Shift` arms the genuinely unreachable ones (hence the
-/// `#[allow(unreachable_patterns)]` on the `From<u16> for KeyKind`
-/// match).
-///
-/// Note the scope of that exemption: cross-table duplicates involving
-/// `shift_symbols` compile silently against *any* other table, not just
-/// `symbols`. Intra-table duplicates still abort. This is interim — the
-/// exemption, and the `#[allow]` above, go away entirely once the dead
-/// `Shift` variants are dropped (issue #14).
+/// The guarantee boundary: this proves *code* uniqueness at compile
+/// time. Parse-matcher uniqueness (two keys normalizing to the same
+/// parse string) is a separate property — it is proven by the keycode
+/// round-trip test in `keycode_tables` plus the zero-warning clippy gate
+/// on the generated matches, not here.
 fn abort_on_duplicate_codes(tables: &[KeyTable]) {
     let mut first_key_by_code: HashMap<u16, String> = HashMap::new();
 
     for table in tables {
-        if table.name == "shift_symbols" {
-            abort_on_intra_table_duplicates(table);
-            continue;
-        }
-
         check_table_for_duplicates(table, &mut first_key_by_code);
     }
-}
-
-/// Aborts the compile when two keys within the same table share a code.
-///
-/// Used for the cross-table-exempted `shift_symbols` table, where an
-/// intra-table duplicate would still be silently unreachable.
-fn abort_on_intra_table_duplicates(table: &KeyTable) {
-    check_table_for_duplicates(table, &mut HashMap::new());
 }
 
 /// Checks `table`'s keys against `seen`, aborting the compile when a key
@@ -80,6 +60,66 @@ fn check_table_for_duplicates(table: &KeyTable, seen: &mut HashMap<u16, String>)
                 help = "every key must have a unique code"
             );
         }
+    }
+}
+
+/// A `drop_modifier_combos` entry exists to hand its expansion's
+/// would-be code (`key.code + mask`) to a named key. Verifies that, for
+/// every drop, some key actually owns that code — otherwise the drop
+/// silently removes it from the resolution space (expansion gone, no
+/// owner, code becomes unknown), and a future DSL edit could delete a
+/// keycode without a sound. Aborts the compile, pointing at the
+/// offending key, mirroring `abort_on_duplicate_codes`.
+fn abort_on_ownerless_drops(tables: &[KeyTable]) {
+    let owned_codes: HashSet<u16> = tables
+        .iter()
+        .flat_map(|table| {
+            table
+                .keys
+                .iter()
+                .chain(&table.keys_with_modifiers)
+                .chain(&table.keys_with_dual_functions)
+        })
+        .map(|key| lit_int_to_u16(&key.code))
+        .collect();
+
+    for table in tables {
+        for key in &table.keys {
+            let base = lit_int_to_u16(&key.code);
+
+            for &mask in &key.modifier_combo_drops {
+                if !is_unowned_drop(&owned_codes, base, mask) {
+                    continue;
+                }
+
+                match base.checked_add(mask) {
+                    Some(code) => abort!(
+                        key.code.span(),
+                        "dropping the `+0x{mask:04X}` modifier combo from `{}::{}` leaves code {code} unowned",
+                        table.name,
+                        key.name;
+                        help = "a `drop_modifier_combos` entry must hand its code to a named key"
+                    ),
+                    None => abort!(
+                        key.code.span(),
+                        "the `+0x{mask:04X}` modifier combo of `{}::{}` overflows u16",
+                        table.name,
+                        key.name;
+                        help = "every dropped combo's code must fit u16"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Whether dropping `mask` from base `base` would leave its would-be
+/// code (`base + mask`) owned by no key — either because no key owns
+/// that code or because the sum overflows u16.
+fn is_unowned_drop(owned_codes: &HashSet<u16>, base: u16, mask: u16) -> bool {
+    match base.checked_add(mask) {
+        Some(code) => !owned_codes.contains(&code),
+        None => true,
     }
 }
 
@@ -134,11 +174,21 @@ pub struct Key {
     pub meta: KeyMeta,
     pub name: syn::Ident,
     pub code: syn::LitInt,
+    /// Masks of the modifier combos whose generated expansions must not
+    /// exist for this key (from `drop_modifier_combos` attributes). The
+    /// modifier values are distinct bits, so each combo's mask uniquely
+    /// identifies it.
+    pub modifier_combo_drops: Vec<u16>,
 }
 
 impl Key {
     fn new(key: ast::Key, offset: &mut u16) -> Result<Self, KeyCodeOverflowsU16Error> {
-        let ast::Key { doc, name, code } = key;
+        let ast::Key {
+            doc,
+            modifier_combo_drops,
+            name,
+            code,
+        } = key;
 
         *offset = if let Some(code_u16) = code.as_ref().map(lit_int_to_u16) {
             code_u16
@@ -152,11 +202,36 @@ impl Key {
 
         let code = code.unwrap_or_else(|| syn::LitInt::new(&offset.to_string(), name.span()));
 
-        Ok(Self { meta, name, code })
+        let modifier_combo_drops = modifier_combo_drops
+            .iter()
+            .map(|combo| resolve_modifier_combo_mask(combo))
+            .collect();
+
+        Ok(Self {
+            meta,
+            name,
+            code,
+            modifier_combo_drops,
+        })
+    }
+
+    /// Whether the modifier powerset expansion must skip the combo
+    /// `modifiers` for this key because a `drop_modifier_combos`
+    /// attribute lists it.
+    fn is_modifier_combo_dropped(&self, modifiers: &[Modifier]) -> bool {
+        let mask = modifiers
+            .iter()
+            .copied()
+            .map(|modifier| modifier.as_modifier_value())
+            .sum::<u16>();
+
+        self.modifier_combo_drops.contains(&mask)
     }
 
     fn with_modifiers(&self, modifiers: &[Modifier]) -> Result<Self, KeyCodeOverflowsU16Error> {
-        let Self { meta, name, code } = self;
+        let Self {
+            meta, name, code, ..
+        } = self;
 
         let meta = meta.with_modifiers(modifiers);
 
@@ -179,14 +254,22 @@ impl Key {
 
         let code = syn::LitInt::new(&code_u16.to_string(), code.span());
 
-        Ok(Self { meta, name, code })
+        // Combo keys are leaf keys; only plain table keys carry drops.
+        Ok(Self {
+            meta,
+            name,
+            code,
+            modifier_combo_drops: Vec::new(),
+        })
     }
 
     fn with_dual_functions(
         &self,
         modifier: DualFunctionModifier,
     ) -> Result<Self, KeyCodeOverflowsU16Error> {
-        let Self { meta, name, code } = self;
+        let Self {
+            meta, name, code, ..
+        } = self;
 
         let meta = meta.with_dual_functions(modifier);
 
@@ -198,7 +281,12 @@ impl Key {
 
         let code = syn::LitInt::new(&code_u16.to_string(), code.span());
 
-        Ok(Self { meta, name, code })
+        Ok(Self {
+            meta,
+            name,
+            code,
+            modifier_combo_drops: Vec::new(),
+        })
     }
 }
 
@@ -252,7 +340,7 @@ impl KeyMeta {
     }
 }
 
-#[derive(Clone, Copy, Display)]
+#[derive(Clone, Copy, Debug, Display, PartialEq)]
 enum Modifier {
     Ctrl,
     Alt,
@@ -262,6 +350,24 @@ enum Modifier {
 }
 
 impl Modifier {
+    /// Resolves one modifier name from a `drop_modifier_combos`
+    /// attribute, aborting the compile on a name that is not a modifier.
+    fn from_ident(ident: &syn::Ident) -> Self {
+        match ident.to_string().as_str() {
+            "Ctrl" => Self::Ctrl,
+            "Alt" => Self::Alt,
+            "AltGr" => Self::AltGr,
+            "Os" => Self::Os,
+            "Shift" => Self::Shift,
+            _ => abort!(
+                ident,
+                "unknown modifier `{}` in `drop_modifier_combos`",
+                ident;
+                help = "expected one of Ctrl, Alt, AltGr, Os, Shift"
+            ),
+        }
+    }
+
     const fn as_modifier_value(self) -> u16 {
         match self {
             Self::Ctrl => 0x0100,
@@ -341,13 +447,81 @@ impl DualFunctionModifier {
     }
 }
 
+/// Why a `drop_modifier_combos` combo cannot be reduced to a mask.
+#[derive(Debug, PartialEq)]
+enum InvalidModifierCombo {
+    /// No modifiers at all.
+    Empty,
+    /// A modifier repeats; the mask must combine DISTINCT modifier bits
+    /// to identify one combo.
+    Duplicate(Modifier),
+}
+
+/// Reduces a combo to a single mask of its modifiers' values. The
+/// modifier values are distinct bits, so a combo's mask identifies it —
+/// which only holds when no modifier repeats (`Ctrl + Ctrl` would sum to
+/// `Alt`'s bit and drop the wrong expansion).
+fn modifier_combo_mask(combo: &[Modifier]) -> Result<u16, InvalidModifierCombo> {
+    let mut mask = 0;
+
+    for modifier in combo {
+        let bit = modifier.as_modifier_value();
+
+        if mask & bit != 0 {
+            return Err(InvalidModifierCombo::Duplicate(*modifier));
+        }
+
+        mask |= bit;
+    }
+
+    if mask == 0 {
+        return Err(InvalidModifierCombo::Empty);
+    }
+
+    Ok(mask)
+}
+
+/// Resolves one `drop_modifier_combos` attribute into a single mask of
+/// its modifiers' values, aborting the compile on an invalid combo.
+fn resolve_modifier_combo_mask(combo: &[syn::Ident]) -> u16 {
+    let modifiers: Vec<Modifier> = combo.iter().map(Modifier::from_ident).collect();
+
+    match modifier_combo_mask(&modifiers) {
+        Ok(mask) => mask,
+        Err(InvalidModifierCombo::Empty) => abort!(
+            Span::call_site(),
+            "empty `drop_modifier_combos` attribute";
+            help = "list at least one modifier: Ctrl, Alt, AltGr, Os, Shift"
+        ),
+        Err(InvalidModifierCombo::Duplicate(modifier)) => {
+            let repeated = combo
+                .iter()
+                .filter(|ident| Modifier::from_ident(ident) == modifier)
+                .nth(1)
+                .expect("duplicate reported, so a second occurrence exists");
+
+            abort!(
+                repeated.span(),
+                "duplicate modifier `{}` in `drop_modifier_combos`",
+                modifier;
+                help = "each modifier may appear at most once per combo"
+            )
+        }
+    }
+}
+
 fn create_keys_with_modifiers(keys: &[Key]) -> Vec<Key> {
     Modifier::powerset()
         .into_iter()
         .filter(|modifiers| !modifiers.is_empty())
         .flat_map(|modifiers| {
-            keys.iter()
-                .filter_map(move |key| key.with_modifiers(&modifiers).ok())
+            keys.iter().filter_map(move |key| {
+                if key.is_modifier_combo_dropped(&modifiers) {
+                    return None;
+                }
+
+                key.with_modifiers(&modifiers).ok()
+            })
         })
         .collect()
 }
@@ -361,4 +535,52 @@ fn create_keys_with_dual_functions(keys: &[Key]) -> Vec<Key> {
                 .filter_map(move |key| key.with_dual_functions(modifier).ok())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{InvalidModifierCombo, Modifier, is_unowned_drop, modifier_combo_mask};
+
+    #[test]
+    fn distinct_modifiers_combine_to_their_mask() {
+        assert_eq!(
+            modifier_combo_mask(&[Modifier::Ctrl, Modifier::Shift]),
+            Ok(0x0900)
+        );
+        assert_eq!(
+            modifier_combo_mask(&[Modifier::Ctrl, Modifier::Alt, Modifier::Shift]),
+            Ok(0x0B00)
+        );
+        assert_eq!(modifier_combo_mask(&[Modifier::Os]), Ok(0x1000));
+    }
+
+    #[test]
+    fn a_repeated_modifier_is_rejected() {
+        // `Ctrl + Ctrl` would otherwise sum to `Alt`'s bit.
+        assert_eq!(
+            modifier_combo_mask(&[Modifier::Ctrl, Modifier::Ctrl]),
+            Err(InvalidModifierCombo::Duplicate(Modifier::Ctrl))
+        );
+    }
+
+    #[test]
+    fn an_empty_combo_is_rejected() {
+        assert_eq!(modifier_combo_mask(&[]), Err(InvalidModifierCombo::Empty));
+    }
+
+    #[test]
+    fn a_drop_without_an_owner_is_flagged() {
+        let owned: HashSet<u16> = [2093].into();
+
+        // `symbols::Dash` + `Shift` = 2093, owned by `shift_symbols`.
+        assert!(!is_unowned_drop(&owned, 45, 2048));
+
+        // The same drop with no `shift_symbols` key would orphan 2093.
+        assert!(is_unowned_drop(&HashSet::new(), 45, 2048));
+
+        // A base + mask that cannot fit u16 can never be owned.
+        assert!(is_unowned_drop(&owned, u16::MAX, 2048));
+    }
 }

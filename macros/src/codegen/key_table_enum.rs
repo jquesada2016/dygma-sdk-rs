@@ -61,7 +61,12 @@ struct Variant<'a> {
 
 impl<'a> From<&'a ir::Key> for Variant<'a> {
     fn from(key: &'a ir::Key) -> Self {
-        let ir::Key { meta, name, code } = key;
+        let ir::Key {
+            meta,
+            name,
+            code,
+            modifier_combo_drops: _,
+        } = key;
 
         let meta = VariantMeta::from(meta);
 

@@ -1,6 +1,15 @@
 use crate::ir;
 use quote::{ToTokens, quote};
 
+/// Emits the `FromStr` impl for one table enum, matching keys by
+/// normalized display name and by (lowercased) variant name.
+///
+/// Guarantee boundary: matcher uniqueness within the emitted match is
+/// NOT proven by the DSL — unlike code uniqueness, which
+/// `ir::abort_on_duplicate_codes` proves at compile time. It is proven
+/// by the keycode round-trip test in `keycode_tables` plus the
+/// zero-warning clippy gate (an unreachable-pattern warning would fail
+/// it if two matchers ever collided).
 pub struct ImplFromStrForKeyTableEnum<'a> {
     name: &'a syn::Ident,
     variants: Vec<Variant<'a>>,
@@ -43,7 +52,6 @@ impl<'a> ToTokens for ImplFromStrForKeyTableEnum<'a> {
                         .map(|c| c.to_ascii_lowercase())
                         .collect::<String>();
 
-                    #[allow(unreachable_patterns)]
                     match s.as_str() {
                         #( #variants ),*,
                         _ => Err(FromStrError)
@@ -67,6 +75,7 @@ impl<'a> From<&'a ir::Key> for Variant<'a> {
             meta: ir::KeyMeta { display_name },
             name,
             code: _,
+            modifier_combo_drops: _,
         } = key;
 
         let display_name_matcher = syn::LitStr::new(
