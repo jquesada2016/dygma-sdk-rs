@@ -1259,7 +1259,12 @@ impl NamesCommands {
                         .attach(format!("no names stored for Neuron `{chip_id}`"))
                 })?;
 
-                println!("{}", serde_json::to_string_pretty(neuron).unwrap());
+                let rendered = serde_json::to_string_pretty(neuron)
+                    .change_context(Error)
+                    .attach("serializing the stored names entry")
+                    .attach_with(|| store_path.to_string_lossy().into_owned())?;
+
+                println!("{rendered}");
 
                 Ok(())
             }
@@ -1795,38 +1800,101 @@ where
     }
 }
 
+/// Computes the sibling temp-file path used to stage an atomic write
+/// of `path`: a dot-prefixed sibling of the destination whose name
+/// embeds the process id, so concurrent writers from different
+/// processes cannot collide. Staging in the same directory keeps the
+/// final `rename` within one filesystem, which is what makes it
+/// atomic.
+fn temp_sibling_path(path: &Path) -> Result<PathBuf, error_stack::Report<Error>> {
+    let file_name = path.file_name().ok_or_else(|| {
+        Error.into_report().attach(format!(
+            "computing the temp-file path for `{}`; the path has no file name",
+            path.to_string_lossy()
+        ))
+    })?;
+
+    Ok(path.with_file_name(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
+/// Serializes `data` to pretty JSON and writes it to `path` atomically:
+/// the bytes are staged in a sibling temp file (see
+/// [`temp_sibling_path`]) and only then renamed over the destination, so
+/// a mid-write failure (a full disk, a crash) can never leave the
+/// destination truncated — it holds either the old content or the new
+/// content, never a mix. On any failure after serialization the temp
+/// file is removed (best-effort), and the original error is returned
+/// unmasked.
 async fn safe_pretty_json_file<T>(data: &T, path: &Path) -> Result<(), error_stack::Report<Error>>
 where
     T: serde::Serialize,
 {
+    // Serialize BEFORE touching the filesystem (#21): a serialization
+    // failure must leave the destination untouched.
     let data = serde_json::to_vec_pretty(data)
         .change_context(Error)
         .attach("serializing data")
         .attach_with(|| path.to_string_lossy().into_owned())?;
 
-    let file = File::create(path)
-        .await
-        .change_context(Error)
-        .attach("creating file")
-        .attach_with(|| path.to_string_lossy().into_owned())?;
+    let temp_path = temp_sibling_path(path)?;
 
-    let mut writer = BufWriter::new(file);
+    let result = async {
+        let file = File::create(&temp_path)
+            .await
+            .change_context(Error)
+            .attach("creating temp file")
+            .attach_with(|| temp_path.to_string_lossy().into_owned())?;
 
-    writer
-        .write_all(&data)
-        .await
-        .change_context(Error)
-        .attach("writing data to the file")
-        .attach_with(|| path.to_string_lossy().into_owned())?;
+        let mut writer = BufWriter::new(file);
 
-    writer
-        .flush()
-        .await
-        .change_context(Error)
-        .attach("flushing data to the file")
-        .attach_with(|| path.to_string_lossy().into_owned())?;
+        writer
+            .write_all(&data)
+            .await
+            .change_context(Error)
+            .attach("writing data to the temp file")
+            .attach_with(|| temp_path.to_string_lossy().into_owned())?;
 
-    Ok(())
+        writer
+            .flush()
+            .await
+            .change_context(Error)
+            .attach("flushing data to the temp file")
+            .attach_with(|| temp_path.to_string_lossy().into_owned())?;
+
+        // `rename` atomically replaces the destination within one
+        // filesystem on macOS/Linux, so the switch from old to new
+        // content cannot be observed half-done. Windows replaces an
+        // existing destination FILE too (`std::fs::rename` — and
+        // tokio's async wrapper of it — corresponds to MoveFileExW
+        // with MOVEFILE_REPLACE_EXISTING, falling back to
+        // SetFileInformationByHandle; on Windows 10 1607+ whose
+        // filesystem supports FileRenameInfoEx the behavior matches
+        // Unix) — only replacing a directory is forbidden there, so
+        // the atomic replace works on all three platforms.
+        //
+        // Atomic replace also trades in-place-write semantics: the
+        // renamed-in file carries fresh umask permissions/ownership
+        // rather than the previous destination's, and a symlinked
+        // destination is replaced rather than written through.
+        tokio::fs::rename(&temp_path, path)
+            .await
+            .change_context(Error)
+            .attach("renaming temp file over the destination")
+            .attach_with(|| path.to_string_lossy().into_owned())
+    }
+    .await;
+
+    if result.is_err() {
+        // Best-effort cleanup of the staged file; the original error is
+        // returned unmasked.
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1905,6 +1973,99 @@ mod tests {
         assert!(result.is_err());
         assert!(!path.exists());
 
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn atomic_write_replaces_the_destination_and_leaves_no_temp_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "dygma-cli-issue-22-happy-path-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("destination.json");
+        std::fs::write(&path, b"{\"sentinel\": \"old\"}").unwrap();
+
+        let data = serde_json::json!({ "sentinel": "new" });
+
+        safe_pretty_json_file(&data, &path).await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, serde_json::to_string_pretty(&data).unwrap());
+
+        let staged = temp_sibling_path(&path).unwrap();
+        assert!(
+            !staged.exists(),
+            "temp file left behind: {}",
+            staged.display()
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn temp_file_creation_failure_leaves_the_destination_untouched() {
+        let directory = std::env::temp_dir().join(format!(
+            "dygma-cli-issue-22-temp-create-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("destination.json");
+        let original = b"{\"sentinel\": true}";
+        std::fs::write(&path, original).unwrap();
+
+        // A directory squatting on the computed temp path forces the
+        // temp-file creation failure deterministically — no timing, no
+        // permissions tricks.
+        let temp_path = temp_sibling_path(&path).unwrap();
+        std::fs::create_dir(&temp_path).unwrap();
+
+        let result = safe_pretty_json_file(&serde_json::json!({ "sentinel": 1 }), &path).await;
+
+        assert!(result.is_err());
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, original);
+
+        // The write neither replaced the destination nor disturbed the
+        // fixture directory sitting on the temp path.
+        assert!(temp_path.is_dir());
+
+        std::fs::remove_dir(&temp_path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_failure_leaves_the_destination_intact_and_removes_the_temp_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "dygma-cli-issue-22-rename-failure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // A directory at the destination makes `rename` fail (EISDIR)
+        // after the temp file has been fully written — exercising the
+        // failure cleanup deterministically.
+        let path = directory.join("destination.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let result = safe_pretty_json_file(&serde_json::json!({ "sentinel": true }), &path).await;
+
+        assert!(result.is_err());
+        assert!(path.is_dir());
+
+        let staged = temp_sibling_path(&path).unwrap();
+        assert!(
+            !staged.exists(),
+            "temp file left behind: {}",
+            staged.display()
+        );
+
+        std::fs::remove_dir(&path).unwrap();
         std::fs::remove_dir(&directory).unwrap();
     }
 }
