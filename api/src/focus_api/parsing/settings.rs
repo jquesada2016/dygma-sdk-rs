@@ -1,7 +1,8 @@
 //! Types for parsing and serializing the identity and settings Focus
 //! commands (`version`, `hardware.*`, `keymap.onlyCustom`,
 //! `settings.defaultLayer`, `qukeys.*`, `superkeys.*` timings, `mouse.*`,
-//! `macros.memory`, and `eeprom.contents`).
+//! `macros.memory`, `eeprom.contents`, and the LED settings `led.fade`
+//! and `idleleds.true_sleep`).
 //!
 //! These commands all carry trivial single values, but each has its own
 //! wire shape: decimal numbers of different widths, `true`/`false` words,
@@ -64,6 +65,11 @@ pub enum ParseSettingsError {
     /// parse as a stream of byte-sized decimal numbers.
     #[display("expected a stream of decimal bytes, got: {_0}")]
     EepromContents(#[error(not(source))] String),
+    /// An on/off setting (`led.fade`, `idleleds.true_sleep`) response
+    /// was expected (a decimal `1` or `0`), but the data was something
+    /// else.
+    #[display("expected `1` or `0`, got: {_0}")]
+    OnOff(#[error(not(source))] String),
 }
 
 /// The firmware version triple reported by the `version` command.
@@ -277,6 +283,49 @@ impl FromStr for OnlyCustom {
 /// Returns the command data for writing `keymap.onlyCustom`: `"1"` or
 /// `"0"`.
 pub fn only_custom_command_data(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+/// An on/off setting the firmware serves and accepts as the decimals
+/// `"1"` and `"0"`: `led.fade` and `idleleds.true_sleep`.
+///
+/// The first decimal token is the value; anything after the first
+/// separator is ignored, exactly like Bazecor's `parseInt` read of the
+/// same responses. That tolerance is not incidental: the only real
+/// `led.fade` response ever captured from a Dygma LED-side firmware
+/// (the shipped Sonsei backup's `led.fade` entry) reads `"1 0"`, two
+/// tokens — a strict single-value parse would refuse data the device
+/// really serves. Reads of single-value settings with no such capture
+/// ([`DecimalU8`]/[`DecimalU16`]) stay strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnOff(pub bool);
+
+impl FromStr for OnOff {
+    type Err = ParseSettingsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Leading whitespace is a separator run like any other; the
+        // first token must be a complete decimal 0/1 (a partial token
+        // like `10` is a different value, not a tolerated form).
+        let first = s.split_whitespace().next().unwrap_or_default();
+
+        match first {
+            "1" => Ok(Self(true)),
+            "0" => Ok(Self(false)),
+            _ => Err(ParseSettingsError::OnOff(s.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for OnOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0 { "1" } else { "0" })
+    }
+}
+
+/// Returns the command data for writing an [`OnOff`] setting: `"1"` or
+/// `"0"`.
+pub fn on_off_command_data(value: bool) -> &'static str {
     if value { "1" } else { "0" }
 }
 
@@ -706,6 +755,34 @@ mod tests {
         assert_eq!(split_u16_command_data(0), "0 0");
         assert_eq!(split_u16_command_data(255), "255 0");
         assert_eq!(split_u16_command_data(65_535), "255 255");
+    }
+
+    #[test]
+    fn on_off_reads_the_first_decimal_token() {
+        // The real `led.fade` response of the shipped Sonsei backup:
+        // TWO tokens. Bazecor's `parseInt` reads the first; so does
+        // this type, or that real capture could not be read.
+        assert_eq!("1 0".parse::<OnOff>().unwrap(), OnOff(true));
+        assert_eq!("0 ".parse::<OnOff>().unwrap(), OnOff(false));
+        assert_eq!("1".parse::<OnOff>().unwrap(), OnOff(true));
+
+        // A partial token is a different value, not a tolerated form.
+        assert!(matches!(
+            "10".parse::<OnOff>(),
+            Err(ParseSettingsError::OnOff(_))
+        ));
+        assert!(matches!(
+            "true".parse::<OnOff>(),
+            Err(ParseSettingsError::OnOff(_))
+        ));
+        assert!(matches!(
+            "".parse::<OnOff>(),
+            Err(ParseSettingsError::OnOff(_))
+        ));
+
+        // The wire form and display agree: 1/0.
+        assert_eq!(OnOff(true).to_string(), "1");
+        assert_eq!(on_off_command_data(false), "0");
     }
 
     #[test]

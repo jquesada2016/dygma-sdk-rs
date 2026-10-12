@@ -5,8 +5,9 @@
 //! This is the SDK's replacement for Bazecor's *virtual keyboard*
 //! mode (its offline `restoreVirtual` flow): rather than simulating a
 //! device, it hands the user that device's default config as editable
-//! files — `keymap.json`, `superkeys.json`, `macros.json` — which the
-//! existing apply paths accept as-is.
+//! files — `keymap.json`, `superkeys.json`, `macros.json`,
+//! `palette.json`, and `colormap.json` — which the existing apply
+//! paths accept as-is.
 //!
 //! ## Where a default comes from (the evidence map)
 //!
@@ -61,9 +62,13 @@
 //!   simulation holds them. They are recorded in the expectations
 //!   file and not modeled here — this SDK has no settings file
 //!   format; settings live on the device (`settings get`/`set`).
-//! - The default **palette** and **colormap** are recorded in the
-//!   expectations file too, and are not modeled as files here: this
-//!   SDK has no human-readable colormap/palette format yet (WS-C).
+//! - The default **palette** and **colormap** are modeled as typed
+//!   files too (`palette.json`, `colormap.json`) — WS-C gave them
+//!   human-readable formats. The embedded strings are the recorded
+//!   Bazecor data verbatim (the palette's trailing separator space
+//!   included), the types parse them, and the serializers emit the
+//!   same tokens without the trailing separator the device attaches
+//!   to reads.
 //!
 //! Per-product status:
 //!
@@ -86,7 +91,8 @@
 //!   them is thin.
 
 use crate::devices::conversions::Product;
-use crate::devices::defy::{DefyKeymap, MacroMap, SuperkeyMap};
+use crate::devices::defy::{DefyColormap, DefyKeymap, MacroMap, SuperkeyMap};
+use crate::focus_api::parsing::palette::Palette;
 pub use error::*;
 
 mod error {
@@ -123,6 +129,10 @@ pub struct DefaultConfig {
     pub superkeys: SuperkeyMap,
     /// The default macro map.
     pub macros: MacroMap,
+    /// The default 16-color RGBW palette.
+    pub palette: Palette,
+    /// The default ten-layer colormap.
+    pub colormap: DefyColormap,
 }
 
 /// The default configuration of a Dygma product, in this SDK's
@@ -175,6 +185,25 @@ const DEFY_DEFAULT_SUPERKEYS_DATA: &str = "262 281 2329 283 1 0 0";
 const DEFY_DEFAULT_MACROS_DATA: &str =
     "6 229 8 11 7 229 8 8 8 28 8 54 8 44 6 229 8 7 7 229 8 28 8 10 8 16 8 4 8 23 8 8 0 0";
 
+/// The Defy's default palette, verbatim: the 16 factory RGBW colors,
+/// 64 decimals, exactly as recorded (the recorded wireless virtual
+/// keyboard's string, trailing separator space included — the device
+/// ends every value it sends with one; the wired virtual's copy is
+/// token-identical without it).
+///
+/// Color 0 is the warm amber framing the factory Base layer, color 2
+/// is pure white through the white channel alone (`0 0 0 255`), and
+/// every color here carries a zero in at least one colored channel —
+/// which is also why Bazecor's lossy app round trip happens to
+/// reproduce these exact bytes (see the
+/// [`RgbwColor`][crate::focus_api::parsing::palette::RgbwColor] docs).
+const DEFY_DEFAULT_PALETTE_DATA: &str = "255 196 0 0 0 254 24 0 0 0 0 255 231 255 0 0 0 254 234 0 0 52 255 0 255 0 232 0 0 77 168 87 125 0 235 19 20 0 36 219 85 0 126 129 255 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ";
+
+/// The Defy's default colormap, verbatim: ten layers of 178 palette
+/// indices painting the factory theme — the amber/silver Base layer,
+/// and the per-layer accent colors the factory ships.
+const DEFY_DEFAULT_COLORMAP_DATA: &str = "10 4 4 4 4 4 7 10 4 4 4 4 4 7 2 4 4 4 4 4 0 2 4 4 4 4 4 10 3 1 5 8 2 0 0 5 4 4 4 4 4 7 11 4 4 4 4 4 7 7 7 4 4 4 4 7 2 7 7 7 4 4 10 2 1 3 8 2 6 6 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 10 12 12 12 12 12 12 10 12 9 3 9 10 12 12 1 3 3 3 10 12 2 12 12 12 12 12 12 12 1 6 5 2 12 12 5 0 0 0 12 11 12 12 0 3 3 3 12 12 12 0 3 0 3 12 12 12 6 3 3 3 3 12 12 9 3 12 12 12 12 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 7 4 8 8 8 8 8 8 15 12 15 7 7 9 15 15 12 3 0 1 9 15 15 15 15 15 15 9 15 8 15 12 15 15 15 15 15 8 8 8 8 8 8 15 15 15 12 3 15 15 15 12 11 0 3 12 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 3 6 6 6 6 6 3 3 6 6 6 6 6 3 3 6 6 6 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15";
+
 /// Builds the Defy's typed default config from the embedded evidence
 /// data.
 ///
@@ -195,6 +224,14 @@ fn defy_default_config() -> DefaultConfig {
         ),
         macros: DEFY_DEFAULT_MACROS_DATA.parse().expect(
             "the embedded default macros data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        palette: DEFY_DEFAULT_PALETTE_DATA.parse().expect(
+            "the embedded default palette data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        colormap: DEFY_DEFAULT_COLORMAP_DATA.parse().expect(
+            "the embedded default colormap data is the differentially-validated \
              Bazecor default, pinned by the defaults tests",
         ),
     }

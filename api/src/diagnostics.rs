@@ -21,10 +21,12 @@ use std::path::Path;
 
 use dygma_cli::devices::conversions::{ConversionError, LayeredWireError, LayeredWireErrorKind};
 use dygma_cli::devices::defy::{
-    BackupEntryError, BackupValidationError, CaptureFailure, DefyKeymap, MacroMap,
-    ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
+    BackupEntryError, BackupValidationError, CaptureFailure, DefyColormap, DefyKeymap, MacroMap,
+    ParseColormapError, ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
 };
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
+use dygma_cli::focus_api::parsing::palette::Palette;
+use dygma_cli::focus_api::parsing::palette::ParsePaletteError;
 use dygma_cli::names::NeuronNameStore;
 use error_stack::{AttachmentKind, FrameKind, IntoReport};
 use miette::{
@@ -343,6 +345,20 @@ impl JsonDomainHint for DefyBackup {
     );
 }
 
+impl JsonDomainHint for Palette {
+    const HINT: Option<&'static str> = Some(
+        "a palette is 16 RGBW colors — `{\"r\",\"g\",\"b\",\"w\"}` channel objects, \
+         each 0-255",
+    );
+}
+
+impl JsonDomainHint for DefyColormap {
+    const HINT: Option<&'static str> = Some(
+        "a colormap is 10 layers of `{keyboard: [70 indices], underglow: [108 \
+         indices]}`; indices are palette positions 0-15",
+    );
+}
+
 impl JsonDomainHint for NeuronNameStore {
     const HINT: Option<&'static str> =
         Some("the names store maps chip ids to neuron names — see `dygma-cli names list`");
@@ -437,6 +453,26 @@ pub(super) enum WireFormat {
     Superkeys,
     /// A `macros.map` data string (bytes per macro).
     Macros,
+    /// A `palette` data string (4 RGBW decimals per color).
+    Palette,
+    /// A `colormap.map` data string (178 palette indices per layer).
+    Colormap,
+}
+
+/// How many wire values one layer of each layered format carries, for
+/// the failure-site arithmetic that names the layer.
+impl WireFormat {
+    /// Values per layer, when the format is layered (None for the
+    /// unlayered `palette`, and for superkeys/macros, whose layers are
+    /// not uniform).
+    fn values_per_layer(self) -> Option<usize> {
+        match self {
+            Self::Keymap => Some(80),
+            Self::Palette => None,
+            Self::Colormap => Some(178),
+            Self::Superkeys | Self::Macros => None,
+        }
+    }
 }
 
 impl WireFormat {
@@ -446,6 +482,8 @@ impl WireFormat {
             Self::Keymap => "--keymap",
             Self::Superkeys => "--superkeys",
             Self::Macros => "--macros",
+            Self::Palette => "--palette",
+            Self::Colormap => "--colormap",
         }
     }
 
@@ -455,6 +493,8 @@ impl WireFormat {
             Self::Keymap => "keymap",
             Self::Superkeys => "superkeys",
             Self::Macros => "macros",
+            Self::Palette => "palette",
+            Self::Colormap => "colormap",
         }
     }
 
@@ -464,6 +504,8 @@ impl WireFormat {
             Self::Keymap => "dygma-cli::keymap::wire-parse",
             Self::Superkeys => "dygma-cli::superkeys::wire-parse",
             Self::Macros => "dygma-cli::macros::wire-parse",
+            Self::Palette => "dygma-cli::palette::wire-parse",
+            Self::Colormap => "dygma-cli::colormap::wire-parse",
         }
     }
 
@@ -481,6 +523,14 @@ impl WireFormat {
             Self::Macros => {
                 "macros wire data is space-separated u8 values — one byte per action, \
                  ending with a `0` terminator"
+            }
+            Self::Palette => {
+                "palette wire data is space-separated decimals — 4 RGBW channels per \
+                 color, 16 colors per palette"
+            }
+            Self::Colormap => {
+                "colormap wire data is space-separated palette indices (0-15) — 178 \
+                 per layer, 10 layers per colormap.map write"
             }
         }
     }
@@ -543,6 +593,38 @@ impl WireFailure {
                 reason: err.to_string(),
             },
             ParseMacroMapError::TooManyMacros(_) => Self {
+                offset: None,
+                consumed_offender: false,
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    /// Extracts the failure from a palette parse.
+    pub(super) fn palette(err: &ParsePaletteError) -> Self {
+        match err {
+            ParsePaletteError::MalformedData { offset, .. } => Self {
+                offset: Some(*offset),
+                consumed_offender: false,
+                reason: err.to_string(),
+            },
+            ParsePaletteError::WrongColorCount { .. } => Self {
+                offset: None,
+                consumed_offender: false,
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    /// Extracts the failure from a Defy colormap parse.
+    pub(super) fn colormap(err: &ParseColormapError) -> Self {
+        match err {
+            ParseColormapError::MalformedData(inner) => Self {
+                offset: Some(inner.offset),
+                consumed_offender: inner.consumed_offender,
+                reason: err.to_string(),
+            },
+            ParseColormapError::IncorrectLayerCount(_) => Self {
                 offset: None,
                 consumed_offender: false,
                 reason: err.to_string(),
@@ -672,19 +754,21 @@ fn wire_snippet(
             // spaces) keeps the layer number right for device
             // captures, which end every layer with a trailing
             // space, and for any mixed separator runs.
-            let layer = match format {
-                WireFormat::Keymap => format!(
+            let layer = match format.values_per_layer() {
+                Some(per_layer) => format!(
                     " (layer {})",
-                    input[..offset].split_whitespace().count() / 80 + 1
+                    input[..offset].split_whitespace().count() / per_layer + 1
                 ),
-                _ => String::new(),
+                None => String::new(),
             };
 
             let label = if !token.bytes().all(|byte| byte.is_ascii_digit()) {
                 "not a number".to_owned()
             } else {
                 match format {
-                    WireFormat::Macros => "out of range for a u8".to_owned(),
+                    WireFormat::Macros | WireFormat::Palette | WireFormat::Colormap => {
+                        "out of range for a u8".to_owned()
+                    }
                     _ => "out of range for a u16".to_owned(),
                 }
             };
@@ -744,6 +828,23 @@ fn wire_snippet(
                         "{numbers} codes = {} layers; a `keymap.custom` write \
                          carries exactly 800 = 10",
                         numbers / 80
+                    )
+                }
+                WireFormat::Colormap => {
+                    let numbers = input.split_whitespace().count();
+
+                    format!(
+                        "{numbers} indices = {} layers; a `colormap.map` write \
+                         carries exactly 1780 = 10",
+                        numbers / 178
+                    )
+                }
+                WireFormat::Palette => {
+                    let numbers = input.split_whitespace().count();
+
+                    format!(
+                        "{numbers} values; a Defy palette carries exactly 64 = \
+                         16 colors × 4 RGBW channels"
                     )
                 }
                 _ => format!("the `{}` argument", format.argument()),
@@ -983,6 +1084,12 @@ fn wire_failure(source: &BackupEntryError) -> Option<(WireFormat, usize, bool)> 
         }
         BackupEntryError::Macros(ParseMacroMapError::MalformedData(inner)) => {
             Some((WireFormat::Macros, inner.offset, inner.unsupported_kind))
+        }
+        BackupEntryError::Palette(ParsePaletteError::MalformedData { offset, .. }) => {
+            Some((WireFormat::Palette, *offset, false))
+        }
+        BackupEntryError::Colormap(ParseColormapError::MalformedData(inner)) => {
+            Some((WireFormat::Colormap, inner.offset, inner.consumed_offender))
         }
         _ => None,
     }
@@ -1253,7 +1360,14 @@ fn wire_offender(text: &str, offset: usize, format: WireFormat) -> Option<(usize
 
     while let Some((token_start, token)) = token_at(text, cursor) {
         let invalid = match format {
-            WireFormat::Macros => token.parse::<u8>().is_err(),
+            // Macros are bytes, palette channels are bytes; a token
+            // past u8 is the failure. (A colormap index of 16..255
+            // never reaches this scan — the range rejection consumed
+            // it and reports consumed-offender — so the u8 check is
+            // what remains: a 3+ digit token.)
+            WireFormat::Macros | WireFormat::Palette | WireFormat::Colormap => {
+                token.parse::<u8>().is_err()
+            }
             WireFormat::Keymap | WireFormat::Superkeys => token.parse::<u16>().is_err(),
         };
 

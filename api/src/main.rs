@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::conversions;
 use dygma_cli::devices::defaults;
 use dygma_cli::devices::defy::{
-    CreateBackupError, DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap,
+    CreateBackupError, DefyColormap, DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap,
 };
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
+use dygma_cli::focus_api::parsing::palette::Palette;
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
 use error_stack::{IntoReport, ResultExt};
@@ -49,6 +50,10 @@ enum Cli {
     /// Commands for working with device settings and identity.
     #[command(subcommand)]
     Settings(SettingsCommands),
+    /// Commands for working with LEDs: the palette, the colormap, and
+    /// the brightness/idle/fade settings.
+    #[command(subcommand)]
+    Leds(LedsCommands),
     /// Commands for working with device backups.
     #[command(subcommand)]
     Backup(BackupCommands),
@@ -76,6 +81,7 @@ impl Cli {
             Self::Macros(cmd) => cmd.perform().await,
             Self::Config(cmd) => cmd.perform().await,
             Self::Settings(cmd) => cmd.perform().await,
+            Self::Leds(cmd) => cmd.perform().await,
             Self::Backup(cmd) => cmd.perform().await,
             Self::Names { store, command } => command.perform(store.as_deref()).await,
             Self::KeyCode(cmd) => cmd.perform(),
@@ -599,6 +605,24 @@ enum ReadableSetting {
     MouseSpeedLimit,
     /// The macro map memory size (probed and sanitized).
     MacrosMemory,
+    /// The keyboard LED brightness (0-255).
+    LedBrightness,
+    /// The underglow LED brightness (0-255).
+    LedBrightnessUG,
+    /// The wireless keyboard LED brightness (0-255).
+    LedBrightnessWireless,
+    /// The wireless underglow LED brightness (0-255).
+    LedBrightnessUGWireless,
+    /// Whether the LEDs fade in on layer changes.
+    LedFade,
+    /// The wired LED idle timeout, in seconds.
+    IdleLedsTimeLimit,
+    /// The wireless LED idle timeout, in seconds.
+    IdleLedsWireless,
+    /// Whether true sleep is enabled.
+    TrueSleep,
+    /// The true-sleep timeout, in seconds.
+    TrueSleepTime,
 }
 
 /// A single setting that can be written to the device.
@@ -640,6 +664,24 @@ enum WritableSetting {
     MouseWheelDelay,
     /// The mouse cursor speed limit.
     MouseSpeedLimit,
+    /// The keyboard LED brightness (0-255).
+    LedBrightness,
+    /// The underglow LED brightness (0-255).
+    LedBrightnessUG,
+    /// The wireless keyboard LED brightness (0-255).
+    LedBrightnessWireless,
+    /// The wireless underglow LED brightness (0-255).
+    LedBrightnessUGWireless,
+    /// Whether the LEDs fade in on layer changes (`1`/`0`/`true`/`false`).
+    LedFade,
+    /// The wired LED idle timeout, in seconds (`0` disables it).
+    IdleLedsTimeLimit,
+    /// The wireless LED idle timeout, in seconds (`0` disables it).
+    IdleLedsWireless,
+    /// Whether true sleep is enabled (`1`/`0`/`true`/`false`).
+    TrueSleep,
+    /// The true-sleep timeout, in seconds.
+    TrueSleepTime,
 }
 
 /// The products `config init` knows, as CLI arguments.
@@ -668,10 +710,11 @@ impl From<ConfigProduct> for conversions::Product {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
-    /// Writes a product's default configuration as three human-readable
-    /// config files: `keymap.json`, `superkeys.json`, and `macros.json`
-    /// — the factory default, ready to edit and to apply (`keymap
-    /// apply`, `superkeys apply`, `macros apply`).
+    /// Writes a product's default configuration as five human-readable
+    /// config files: `keymap.json`, `superkeys.json`, `macros.json`,
+    /// `palette.json`, and `colormap.json` — the factory default,
+    /// ready to edit and to apply (`keymap apply`, `superkeys apply`,
+    /// `macros apply`, `leds palette apply`, `leds colormap apply`).
     ///
     /// The defaults are evidence-backed, not invented: they match
     /// Bazecor's shipped Defy defaults, whose two independent sources —
@@ -741,6 +784,16 @@ impl ConfigCommands {
             ConfigFile {
                 path: out_dir.join("macros.json"),
                 description: "the factory macro: macro 1, typing \"Hey, dygmate\"",
+            },
+            ConfigFile {
+                path: out_dir.join("palette.json"),
+                description: "the factory palette: 16 RGBW colors (amber accents, silver keys, \
+                              pure white)",
+            },
+            ConfigFile {
+                path: out_dir.join("colormap.json"),
+                description: "the factory colormap: 10 layers of palette indices, 178 LEDs each \
+                              (70 keyboard + 108 underglow)",
             },
         ];
 
@@ -816,6 +869,14 @@ impl ConfigCommands {
             .await
             .change_context(Error)
             .attach_with(|| format!("writing {}", files[2].path.display()))?;
+        safe_pretty_json_file(&config.palette, &files[3].path)
+            .await
+            .change_context(Error)
+            .attach_with(|| format!("writing {}", files[3].path.display()))?;
+        safe_pretty_json_file(&config.colormap, &files[4].path)
+            .await
+            .change_context(Error)
+            .attach_with(|| format!("writing {}", files[4].path.display()))?;
 
         println!(
             "Wrote the {product:?} default config (matching Bazecor's \
@@ -840,12 +901,11 @@ impl ConfigCommands {
 /// evidence but have no file format here.
 fn print_evidence_note() {
     println!(
-        "Note: the default LED palette/colormap and the default \
-         settings (qukeys, superkeys timings, LED brightness, mouse) \
-         are recorded in the project source (the bazecor-differential \
-         expectations) but are not written: this CLI has no file \
-         format for them — settings live on the device \
-         (`settings get`/`set`)."
+        "Note: the default LED settings (brightness, fade, idle and \
+         true-sleep timers) are recorded in the project source (the \
+         bazecor-differential expectations) but are not written: this \
+         CLI has no settings file format — settings live on the device \
+         (`settings get`/`set`, `leds status`)."
     );
 }
 
@@ -1088,6 +1148,60 @@ impl SettingsCommands {
                         .change_context(Error)
                         .attach("reading `macros.memory` from the Defy")?
                         .to_string(),
+                    ReadableSetting::LedBrightness => defy
+                        .get_led_brightness()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `led.brightness` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::LedBrightnessUG => defy
+                        .get_led_underglow_brightness()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `led.brightnessUG` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::LedBrightnessWireless => defy
+                        .get_wireless_led_brightness()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `led.brightness.wireless` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::LedBrightnessUGWireless => defy
+                        .get_wireless_led_underglow_brightness()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `led.brightnessUG.wireless` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::LedFade => defy
+                        .get_led_fade()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `led.fade` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::IdleLedsTimeLimit => defy
+                        .get_idle_leds_time_limit()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `idleleds.time_limit` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::IdleLedsWireless => defy
+                        .get_wireless_idle_leds_time_limit()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `idleleds.wireless` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::TrueSleep => defy
+                        .get_true_sleep()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `idleleds.true_sleep` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::TrueSleepTime => defy
+                        .get_true_sleep_time()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `idleleds.true_sleep_time` from the Defy")?
+                        .to_string(),
                 };
 
                 println!("{value}");
@@ -1141,6 +1255,437 @@ impl SettingsCommands {
 
                 Ok(())
             }
+        }
+    }
+}
+
+/// The LED commands: the palette and colormap (each with the same
+/// new/format/to-command-data/apply file workflow the keymap group
+/// has), plus `leds status` for the scalar LED settings.
+#[derive(Subcommand)]
+enum LedsCommands {
+    /// Reads every LED setting from the device: wired and wireless
+    /// brightness, fade, and the idle/true-sleep timers.
+    Status,
+    /// Commands for working with the device's 16-color palette.
+    #[command(subcommand)]
+    Palette(PaletteCommands),
+    /// Commands for working with the per-layer colormap.
+    #[command(subcommand)]
+    Colormap(ColormapCommands),
+}
+
+#[derive(Subcommand)]
+enum PaletteCommands {
+    /// Create a new palette config file.
+    ///
+    /// If omitted, the palette is read from the keyboard.
+    New {
+        /// The raw palette data string found in a backup file.
+        ///
+        /// 64 space-separated decimals: 4 RGBW channels per color, 16
+        /// colors.
+        #[clap(short, long)]
+        palette: Option<String>,
+        /// The path the palette will be saved to.
+        #[clap(default_value = "palette.json")]
+        path: PathBuf,
+    },
+    /// Formats the palette file.
+    Format {
+        /// The path of the palette JSON file.
+        #[clap(default_value = "palette.json")]
+        path: PathBuf,
+    },
+    /// Reads a palette file and outputs it as a raw palette data string
+    /// that can be used to send to the keyboard.
+    ToCommandData {
+        /// The path of the palette JSON file.
+        path: PathBuf,
+    },
+    /// Apply the palette to the keyboard.
+    Apply {
+        /// The path of the palette file.
+        path: PathBuf,
+        /// Do not rewrite the palette file after applying.
+        ///
+        /// By default, the file is rewritten canonically after a
+        /// successful apply, keeping it prettified. This flag leaves
+        /// your file untouched.
+        #[clap(long, default_value_t = false)]
+        no_write: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ColormapCommands {
+    /// Create a new colormap config file.
+    ///
+    /// If omitted, the colormap is read from the keyboard.
+    New {
+        /// The raw colormap data string found in a backup file.
+        ///
+        /// 1780 space-separated palette indices: 178 per layer, 10
+        /// layers.
+        #[clap(short, long)]
+        colormap: Option<String>,
+        /// The path the colormap will be saved to.
+        #[clap(default_value = "colormap.json")]
+        path: PathBuf,
+    },
+    /// Formats the colormap file.
+    Format {
+        /// The path of the colormap JSON file.
+        #[clap(default_value = "colormap.json")]
+        path: PathBuf,
+    },
+    /// Reads a colormap file and outputs it as a raw colormap data
+    /// string that can be used to send to the keyboard.
+    ToCommandData {
+        /// The path of the colormap JSON file.
+        path: PathBuf,
+    },
+    /// Apply the colormap to the keyboard.
+    Apply {
+        /// The path of the colormap file.
+        path: PathBuf,
+        /// Do not rewrite the colormap file after applying.
+        #[clap(long, default_value_t = false)]
+        no_write: bool,
+    },
+}
+
+/// The typed value behind a `leds palette`/`leds colormap` file
+/// command: parsing, canonical writing, and the wire form are uniform,
+/// only the value type differs.
+enum LedFileValue {
+    /// A 16-color RGBW palette.
+    Palette(Palette),
+    /// A ten-layer colormap.
+    Colormap(Box<DefyColormap>),
+}
+
+impl LedFileValue {
+    /// Writes the value's JSON file, canonically.
+    async fn write(&self, path: &Path) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Palette(palette) => safe_pretty_json_file(palette, path).await,
+            Self::Colormap(colormap) => safe_pretty_json_file(colormap, path).await,
+        }
+    }
+
+    /// The value's raw wire form (the `palette`/`colormap.map` command
+    /// data).
+    fn to_command_data(&self) -> String {
+        match self {
+            Self::Palette(palette) => palette.to_string(),
+            Self::Colormap(colormap) => colormap.to_colormap_map_data(),
+        }
+    }
+
+    /// Sends the value to the device.
+    async fn apply(&self, defy: &mut DefyKeyboard) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Palette(palette) => defy
+                .apply_palette(palette)
+                .await
+                .change_context(Error)
+                .attach("applying the palette to the Defy"),
+            Self::Colormap(colormap) => defy
+                .apply_colormap(colormap)
+                .await
+                .change_context(Error)
+                .attach("applying the colormap to the Defy"),
+        }
+    }
+}
+
+/// The two LED file formats the `leds` group edits. Everything that
+/// needs to know WHICH format an operation works on — and nothing else
+/// — lives here.
+#[derive(Clone, Copy)]
+enum LedFileFormat {
+    /// The 16-color RGBW palette.
+    Palette,
+    /// The ten-layer colormap.
+    Colormap,
+}
+
+impl LedFileFormat {
+    /// The #16 diagnostics vocabulary for this format's wire failures.
+    fn wire_format(self) -> diagnostics::WireFormat {
+        match self {
+            Self::Palette => diagnostics::WireFormat::Palette,
+            Self::Colormap => diagnostics::WireFormat::Colormap,
+        }
+    }
+
+    /// Parses raw wire data, rendering a failure through the #16
+    /// diagnostics bridge for this format.
+    fn parse_wire(self, raw: &str) -> Result<LedFileValue, error_stack::Report<Error>> {
+        match self {
+            Self::Palette => match raw.parse::<Palette>() {
+                Ok(palette) => Ok(LedFileValue::Palette(palette)),
+                Err(err) => Err(diagnostics::wire_parse_report(
+                    self.wire_format(),
+                    raw,
+                    diagnostics::WireFailure::palette(&err),
+                )),
+            },
+            Self::Colormap => match raw.parse::<DefyColormap>() {
+                Ok(colormap) => Ok(LedFileValue::Colormap(Box::new(colormap))),
+                Err(err) => Err(diagnostics::wire_parse_report(
+                    self.wire_format(),
+                    raw,
+                    diagnostics::WireFailure::colormap(&err),
+                )),
+            },
+        }
+    }
+
+    /// Reads the format's JSON file.
+    async fn read(self, path: &Path) -> Result<LedFileValue, error_stack::Report<Error>> {
+        match self {
+            Self::Palette => Ok(LedFileValue::Palette(
+                read_json_file::<Palette>(path).await?,
+            )),
+            Self::Colormap => Ok(LedFileValue::Colormap(Box::new(
+                read_json_file::<DefyColormap>(path).await?,
+            ))),
+        }
+    }
+}
+
+impl LedsCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Status => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                let brightness = defy
+                    .get_led_brightness()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `led.brightness` from the Defy")?;
+                let underglow = defy
+                    .get_led_underglow_brightness()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `led.brightnessUG` from the Defy")?;
+                let wireless_brightness = defy
+                    .get_wireless_led_brightness()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `led.brightness.wireless` from the Defy")?;
+                let wireless_underglow = defy
+                    .get_wireless_led_underglow_brightness()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `led.brightnessUG.wireless` from the Defy")?;
+                let fade = defy
+                    .get_led_fade()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `led.fade` from the Defy")?;
+                let idle = defy
+                    .get_idle_leds_time_limit()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `idleleds.time_limit` from the Defy")?;
+                let wireless_idle = defy
+                    .get_wireless_idle_leds_time_limit()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `idleleds.wireless` from the Defy")?;
+                let true_sleep = defy
+                    .get_true_sleep()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `idleleds.true_sleep` from the Defy")?;
+                let true_sleep_time = defy
+                    .get_true_sleep_time()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `idleleds.true_sleep_time` from the Defy")?;
+
+                // The percentage is Bazecor's UI mapping, round-half-up
+                // (`Math.round((value * 100) / 255)`); the math runs in
+                // u16 — a u8 multiply overflows at the top brightness.
+                println!(
+                    "brightness: {brightness} ({}%)",
+                    brightness_percent(brightness)
+                );
+                println!(
+                    "underglow brightness: {underglow} ({}%)",
+                    brightness_percent(underglow)
+                );
+                println!(
+                    "wireless brightness: {wireless_brightness} ({}%)",
+                    brightness_percent(wireless_brightness)
+                );
+                println!(
+                    "wireless underglow brightness: {wireless_underglow} ({}%)",
+                    brightness_percent(wireless_underglow)
+                );
+                println!("fade on layer change: {fade}");
+                println!("idle LEDs timeout: {idle} s{}", describe_minutes(idle));
+                println!(
+                    "wireless idle LEDs timeout: {wireless_idle} s{}",
+                    describe_minutes(wireless_idle)
+                );
+                println!("true sleep: {true_sleep}");
+                println!(
+                    "true sleep timeout: {true_sleep_time} s{}",
+                    describe_minutes(true_sleep_time)
+                );
+
+                Ok(())
+            }
+            Self::Palette(command) => command.perform(LedFileFormat::Palette).await,
+            Self::Colormap(command) => command.perform(LedFileFormat::Colormap).await,
+        }
+    }
+}
+
+/// A brightness byte as Bazecor's UI shows it: the percentage of 255,
+/// rounded half-up (`Math.round((value * 100) / 255)` in
+/// `LEDSettings.tsx`). The multiply runs in u16 — a `u8` overflows at
+/// 255 long before 255 × 100.
+fn brightness_percent(brightness: u8) -> u16 {
+    (u16::from(brightness) * 100 + 127) / 255
+}
+
+/// Describes a seconds value in whole minutes, for `leds status`.
+fn describe_minutes(seconds: u16) -> String {
+    if seconds.is_multiple_of(60) {
+        format!(" ({} min)", seconds / 60)
+    } else {
+        String::new()
+    }
+}
+
+impl PaletteCommands {
+    async fn perform(self, format: LedFileFormat) -> Result<(), error_stack::Report<Error>> {
+        // The palette and colormap subcommands are the same workflow;
+        // only the format vocabulary differs. `PaletteCommands::perform`
+        // and `ColormapCommands::perform` each dispatch
+        // `shared_led_file_command` directly with their own format.
+        shared_led_file_command(
+            match self {
+                PaletteCommands::New { palette, path } => {
+                    LedFileCommand::New { raw: palette, path }
+                }
+                PaletteCommands::Format { path } => LedFileCommand::Format { path },
+                PaletteCommands::ToCommandData { path } => LedFileCommand::ToCommandData { path },
+                PaletteCommands::Apply { path, no_write } => {
+                    LedFileCommand::Apply { path, no_write }
+                }
+            },
+            format,
+        )
+        .await
+    }
+}
+
+impl ColormapCommands {
+    async fn perform(self, format: LedFileFormat) -> Result<(), error_stack::Report<Error>> {
+        shared_led_file_command(
+            match self {
+                ColormapCommands::New { colormap, path } => LedFileCommand::New {
+                    raw: colormap,
+                    path,
+                },
+                ColormapCommands::Format { path } => LedFileCommand::Format { path },
+                ColormapCommands::ToCommandData { path } => LedFileCommand::ToCommandData { path },
+                ColormapCommands::Apply { path, no_write } => {
+                    LedFileCommand::Apply { path, no_write }
+                }
+            },
+            format,
+        )
+        .await
+    }
+}
+
+/// One `leds palette`/`leds colormap` file workflow, format-agnostic.
+enum LedFileCommand {
+    New { raw: Option<String>, path: PathBuf },
+    Format { path: PathBuf },
+    ToCommandData { path: PathBuf },
+    Apply { path: PathBuf, no_write: bool },
+}
+
+/// Runs one palette/colormap file workflow against its wire format.
+/// Never writes to the device except through `Apply`, and `New` without
+/// a raw string reads the device (a read, never a write).
+async fn shared_led_file_command(
+    command: LedFileCommand,
+    format: LedFileFormat,
+) -> Result<(), error_stack::Report<Error>> {
+    match command {
+        LedFileCommand::New { raw, path } => {
+            let value = if let Some(raw) = raw {
+                format.parse_wire(&raw)?
+            } else {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                match format {
+                    LedFileFormat::Palette => LedFileValue::Palette(
+                        defy.get_palette()
+                            .await
+                            .change_context(Error)
+                            .attach("getting the palette from the Defy")?,
+                    ),
+                    LedFileFormat::Colormap => LedFileValue::Colormap(Box::new(
+                        defy.get_colormap()
+                            .await
+                            .change_context(Error)
+                            .attach("getting the colormap from the Defy")?,
+                    )),
+                }
+            };
+
+            value.write(&path).await?;
+
+            Ok(())
+        }
+        LedFileCommand::Format { path } => {
+            let value = format.read(&path).await?;
+
+            value.write(&path).await?;
+
+            Ok(())
+        }
+        LedFileCommand::ToCommandData { path } => {
+            let value = format.read(&path).await?;
+
+            println!("{}", value.to_command_data());
+
+            Ok(())
+        }
+        LedFileCommand::Apply { path, no_write } => {
+            let value = format.read(&path).await?;
+
+            let mut defy = DefyKeyboard::new()
+                .await
+                .change_context(Error)
+                .attach("connecting to the Defy keyboard")?;
+
+            value.apply(&mut defy).await?;
+
+            if !no_write {
+                // Overwrite the file to ensure it remains prettified,
+                // exactly like `keymap apply` does.
+                value.write(&path).await?;
+            }
+
+            Ok(())
         }
     }
 }
@@ -1968,6 +2513,15 @@ enum SettingWrite {
     MouseWheelSpeed(u8),
     MouseWheelDelay(u16),
     MouseSpeedLimit(u8),
+    LedBrightness(u8),
+    LedBrightnessUG(u8),
+    LedBrightnessWireless(u8),
+    LedBrightnessUGWireless(u8),
+    LedFade(bool),
+    IdleLedsTimeLimit(u16),
+    IdleLedsWireless(u16),
+    TrueSleep(bool),
+    TrueSleepTime(u16),
 }
 
 /// Parses a setting write from its command-line value string. This
@@ -2067,6 +2621,51 @@ fn parse_setting_write(
                 .change_context(Error)
                 .attach("parsing the value; expected a number")?,
         ),
+        WritableSetting::LedBrightness => SettingWrite::LedBrightness(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number 0-255")?,
+        ),
+        WritableSetting::LedBrightnessUG => SettingWrite::LedBrightnessUG(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number 0-255")?,
+        ),
+        WritableSetting::LedBrightnessWireless => SettingWrite::LedBrightnessWireless(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number 0-255")?,
+        ),
+        WritableSetting::LedBrightnessUGWireless => SettingWrite::LedBrightnessUGWireless(
+            parse_u8_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a number 0-255")?,
+        ),
+        WritableSetting::LedFade => SettingWrite::LedFade(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::IdleLedsTimeLimit => SettingWrite::IdleLedsTimeLimit(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected seconds (`0` disables the timeout)")?,
+        ),
+        WritableSetting::IdleLedsWireless => SettingWrite::IdleLedsWireless(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected seconds (`0` disables the timeout)")?,
+        ),
+        WritableSetting::TrueSleep => SettingWrite::TrueSleep(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::TrueSleepTime => SettingWrite::TrueSleepTime(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected seconds")?,
+        ),
     };
 
     Ok(write)
@@ -2094,6 +2693,15 @@ impl SettingWrite {
             Self::MouseWheelSpeed(_) => "mouse.wheelSpeed",
             Self::MouseWheelDelay(_) => "mouse.wheelDelay",
             Self::MouseSpeedLimit(_) => "mouse.speedLimit",
+            Self::LedBrightness(_) => "led.brightness",
+            Self::LedBrightnessUG(_) => "led.brightnessUG",
+            Self::LedBrightnessWireless(_) => "led.brightness.wireless",
+            Self::LedBrightnessUGWireless(_) => "led.brightnessUG.wireless",
+            Self::LedFade(_) => "led.fade",
+            Self::IdleLedsTimeLimit(_) => "idleleds.time_limit",
+            Self::IdleLedsWireless(_) => "idleleds.wireless",
+            Self::TrueSleep(_) => "idleleds.true_sleep",
+            Self::TrueSleepTime(_) => "idleleds.true_sleep_time",
         }
     }
 
@@ -2190,6 +2798,51 @@ impl SettingWrite {
                 .await
                 .change_context(Error)
                 .attach("writing `mouse.speedLimit` to the Defy"),
+            Self::LedBrightness(value) => defy
+                .set_led_brightness(value)
+                .await
+                .change_context(Error)
+                .attach("writing `led.brightness` to the Defy"),
+            Self::LedBrightnessUG(value) => defy
+                .set_led_underglow_brightness(value)
+                .await
+                .change_context(Error)
+                .attach("writing `led.brightnessUG` to the Defy"),
+            Self::LedBrightnessWireless(value) => defy
+                .set_wireless_led_brightness(value)
+                .await
+                .change_context(Error)
+                .attach("writing `led.brightness.wireless` to the Defy"),
+            Self::LedBrightnessUGWireless(value) => defy
+                .set_wireless_led_underglow_brightness(value)
+                .await
+                .change_context(Error)
+                .attach("writing `led.brightnessUG.wireless` to the Defy"),
+            Self::LedFade(value) => defy
+                .set_led_fade(value)
+                .await
+                .change_context(Error)
+                .attach("writing `led.fade` to the Defy"),
+            Self::IdleLedsTimeLimit(value) => defy
+                .set_idle_leds_time_limit(value)
+                .await
+                .change_context(Error)
+                .attach("writing `idleleds.time_limit` to the Defy"),
+            Self::IdleLedsWireless(value) => defy
+                .set_wireless_idle_leds_time_limit(value)
+                .await
+                .change_context(Error)
+                .attach("writing `idleleds.wireless` to the Defy"),
+            Self::TrueSleep(value) => defy
+                .set_true_sleep(value)
+                .await
+                .change_context(Error)
+                .attach("writing `idleleds.true_sleep` to the Defy"),
+            Self::TrueSleepTime(value) => defy
+                .set_true_sleep_time(value)
+                .await
+                .change_context(Error)
+                .attach("writing `idleleds.true_sleep_time` to the Defy"),
         }
     }
 }
@@ -2635,5 +3288,44 @@ mod tests {
 
         std::fs::remove_dir(&path).unwrap();
         std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn brightness_percent_is_bazecors_round_half_up_for_every_byte() {
+        // Bazecor shows `Math.round((value * 100) / 255)` (round half
+        // up), which in exact arithmetic is `floor((v·200 + 255) /
+        // 510)`. The integer form here equals `floor((v·200 + 254) /
+        // 510)`; the two can only diverge when some `510n` lands in
+        // `(v·200 + 254, v·200 + 255]`, i.e. `510n = v·200 + 255` — an
+        // even number equalling an odd one, impossible by parity — so
+        // every byte must agree.
+        let round_half_up = |v: u8| (u16::from(v) * 200 + 255) / 510;
+
+        for v in u8::MIN..=u8::MAX {
+            assert_eq!(
+                brightness_percent(v),
+                round_half_up(v),
+                "brightness {v} rounds differently than Bazecor"
+            );
+        }
+
+        // Pin the endpooints and a mid value against the UI mapping.
+        assert_eq!(brightness_percent(0), 0);
+        assert_eq!(brightness_percent(128), 50);
+        assert_eq!(brightness_percent(255), 100);
+    }
+
+    #[test]
+    fn describe_minutes_names_only_whole_minutes() {
+        assert_eq!(describe_minutes(0), " (0 min)");
+        assert_eq!(describe_minutes(60), " (1 min)");
+        assert_eq!(describe_minutes(300), " (5 min)");
+        assert_eq!(describe_minutes(7200), " (120 min)");
+
+        // Anything not a whole minute gets no suffix — `leds status`
+        // already printed the seconds.
+        assert_eq!(describe_minutes(1), "");
+        assert_eq!(describe_minutes(90), "");
+        assert_eq!(describe_minutes(u16::MAX), "");
     }
 }

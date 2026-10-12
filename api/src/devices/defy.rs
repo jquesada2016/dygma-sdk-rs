@@ -9,6 +9,7 @@ use crate::{
     keycode_tables::KeyKind,
 };
 pub use error::*;
+use parsing::colormap::{KEYBOARD_LEDS, UNDERGLOW_LEDS};
 use std::{array, str::FromStr};
 
 mod error {
@@ -52,6 +53,25 @@ mod error {
         #[display("{_0}")]
         TooManyMacros(MacroMapTooLargeError),
     }
+
+    /// Error when parsing a colormap from a string slice.
+    #[derive(Clone, Debug, Display, From, Error)]
+    pub enum ParseColormapError {
+        /// The colormap data is not valid wire data.
+        #[display("failed to parse colormap map: {_0}")]
+        MalformedData(parsing::colormap::ParseColormapError),
+        /// The colormap data is valid wire data but does not hold
+        /// exactly the ten layers every Defy colormap holds.
+        #[display("{_0}")]
+        IncorrectLayerCount(ColormapDoesNotHave10LayersError),
+    }
+
+    /// Error returned when building a [`DefyColormap`] from anything
+    /// but exactly 10 layers (the number every Defy colormap holds and
+    /// every `colormap.map` write carries).
+    #[derive(Clone, Copy, Debug, Display, Error)]
+    #[display("colormap does not have exactly 10 layers")]
+    pub struct ColormapDoesNotHave10LayersError;
 
     /// Error returned when a [`MacroMap`] holds more macros than the
     /// firmware can address.
@@ -104,6 +124,37 @@ mod error {
         /// Keymap returned by the keyboard failed to parse.
         KeymapParsingFailure(ParseKeymapError),
     }
+
+    /// Error returned from [`DefyKeyboard::get_palette`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetPaletteError {
+        /// Failed to run command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// Palette returned by the keyboard failed to parse.
+        #[display("{_0}")]
+        PaletteParsingFailure(parsing::palette::ParsePaletteError),
+    }
+
+    /// Error returned from [`DefyKeyboard::apply_palette`].
+    #[derive(Debug, Display, From, Error)]
+    #[display("{_0}")]
+    pub struct ApplyPaletteError(RunCommandError);
+
+    /// Error returned from [`DefyKeyboard::get_colormap`].
+    #[derive(Debug, Display, From, Error)]
+    pub enum GetColormapError {
+        /// Failed to run command.
+        #[display("{_0}")]
+        CommandFailed(RunCommandError),
+        /// Colormap returned by the keyboard failed to parse.
+        ColormapParsingFailure(ParseColormapError),
+    }
+
+    /// Error returned from [`DefyKeyboard::apply_colormap`].
+    #[derive(Debug, Display, From, Error)]
+    #[display("{_0}")]
+    pub struct ApplyColormapError(RunCommandError);
 
     /// Error returned from [`DefyKeyboard::get_superkeys`].
     #[derive(Debug, Display, From, Error)]
@@ -292,10 +343,11 @@ mod error {
         },
         /// One of the backup's captured commands carries data this
         /// crate can prove is not valid Defy wire data. The keymap,
-        /// superkeys, and macros maps are validated by parsing them;
-        /// captured commands without a wire parser yet (LED and
-        /// colormap data, say) pass through verbatim, exactly the way
-        /// Bazecor's restore sends them.
+        /// superkeys, macros, palette, and colormap entries are each
+        /// validated by parsing them against their wire formats (the
+        /// map types also enforce the write shapes); captured commands
+        /// without a wire parser yet pass through verbatim, exactly
+        /// the way Bazecor's restore sends them.
         #[display("the `{command}` entry failed restore validation: {source}")]
         InvalidEntry {
             /// The captured command whose data failed validation.
@@ -336,6 +388,18 @@ mod error {
         /// The `macros.map` data is not a valid macros map.
         #[display("{_0}")]
         Macros(ParseMacroMapError),
+        /// The `palette` data is not a valid Defy palette — either not
+        /// valid wire data at all, or not the exactly 64 decimals (16
+        /// RGBW colors) a Defy palette carries.
+        #[display("{_0}")]
+        Palette(parsing::palette::ParsePaletteError),
+        /// The `colormap.map` data is not a valid Defy colormap —
+        /// either not valid wire data at all, or not the exactly ten
+        /// layers every `colormap.map` write carries (the wire parser
+        /// itself accepts any layer count, so the [`DefyColormap`] type
+        /// enforces the count at construction).
+        #[display("{_0}")]
+        Colormap(ParseColormapError),
     }
 
     /// Error returned from [`DefyKeyboard::restore_backup`].
@@ -462,6 +526,17 @@ impl DefyKeyboard {
     const MOUSE_SPEED_LIMIT_COMMAND_NAME: &str = "mouse.speedLimit";
     const MACROS_MEMORY_COMMAND_NAME: &str = "macros.memory";
     const EEPROM_CONTENTS_COMMAND_NAME: &str = "eeprom.contents";
+    const PALETTE_COMMAND_NAME: &str = "palette";
+    const COLORMAP_MAP_COMMAND_NAME: &str = "colormap.map";
+    const LED_BRIGHTNESS_COMMAND_NAME: &str = "led.brightness";
+    const LED_BRIGHTNESS_UG_COMMAND_NAME: &str = "led.brightnessUG";
+    const LED_BRIGHTNESS_WIRELESS_COMMAND_NAME: &str = "led.brightness.wireless";
+    const LED_BRIGHTNESS_UG_WIRELESS_COMMAND_NAME: &str = "led.brightnessUG.wireless";
+    const LED_FADE_COMMAND_NAME: &str = "led.fade";
+    const IDLELEDS_TIME_LIMIT_COMMAND_NAME: &str = "idleleds.time_limit";
+    const IDLELEDS_WIRELESS_COMMAND_NAME: &str = "idleleds.wireless";
+    const IDLELEDS_TRUE_SLEEP_COMMAND_NAME: &str = "idleleds.true_sleep";
+    const IDLELEDS_TRUE_SLEEP_TIME_COMMAND_NAME: &str = "idleleds.true_sleep_time";
     /// The command Bazecor's restore sends after every backup entry
     /// (`noCacheCommand("led.mode 0")` in `Backup.ts`
     /// `restoreBackup`), switching the LEDs out of whatever state the
@@ -593,6 +668,68 @@ impl DefyKeyboard {
             .map(|value| value.0);
 
         Ok(parsing::settings::MacroMemorySize::sanitize(value))
+    }
+
+    /// Get the device's 16-color palette (the `palette` command).
+    ///
+    /// The Defy's palette is RGBW: each color carries an independent
+    /// white channel, and it is read verbatim — unlike Bazecor's app,
+    /// which converts each color to display RGB at parse time (its
+    /// `rgbw2b`) and drops the white channel, this returns the bytes
+    /// the device stores. Rendering a color the way Bazecor's UI does
+    /// is [`RgbwColor::to_rgb`](parsing::palette::RgbwColor::to_rgb).
+    pub async fn get_palette(&mut self) -> Result<parsing::palette::Palette, GetPaletteError> {
+        let palette = self
+            .run_command(Self::PALETTE_COMMAND_NAME, None)
+            .await?
+            .parse()?;
+
+        Ok(palette)
+    }
+
+    /// Apply the palette to the keyboard (the `palette` command).
+    ///
+    /// The palette is sent verbatim — all 16 RGBW colors, in palette
+    /// order. Bazecor's app writes a *re-derived* palette instead (its
+    /// in-app palette has no white channel, so it guesses one back with
+    /// `rgb2w` on every save, which rewrites colors whose colored
+    /// channels are all positive); a palette that came from
+    /// [`DefyKeyboard::get_palette`] round-trips here byte for byte.
+    pub async fn apply_palette(
+        &mut self,
+        palette: &parsing::palette::Palette,
+    ) -> Result<(), ApplyPaletteError> {
+        self.run_command(Self::PALETTE_COMMAND_NAME, Some(&palette.to_string()))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Get the device's colormap (the `colormap.map` command): all ten
+    /// layers of palette indices, one per LED.
+    pub async fn get_colormap(&mut self) -> Result<DefyColormap, GetColormapError> {
+        let colormap = self
+            .run_command(Self::COLORMAP_MAP_COMMAND_NAME, None)
+            .await?
+            .parse()?;
+
+        Ok(colormap)
+    }
+
+    /// Apply the colormap to the keyboard (the `colormap.map`
+    /// command): all ten layers, layer-major, one palette index per
+    /// LED.
+    pub async fn apply_colormap(
+        &mut self,
+        colormap: &DefyColormap,
+    ) -> Result<(), ApplyColormapError> {
+        self.run_command(
+            Self::COLORMAP_MAP_COMMAND_NAME,
+            Some(&colormap.to_colormap_map_data()),
+        )
+        .await?;
+
+        Ok(())
     }
 
     /// Get the firmware version triple (`version` command): the
@@ -972,6 +1109,222 @@ impl DefyKeyboard {
             .await
     }
 
+    /// Get the keyboard LED brightness (`led.brightness` command).
+    ///
+    /// The wire value is one byte, 0–255; Bazecor's UI maps it onto a
+    /// 0–100% slider (`Math.round((value * 100) / 255)`).
+    pub async fn get_led_brightness(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::LED_BRIGHTNESS_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the keyboard LED brightness (`led.brightness` command).
+    ///
+    /// The wire value is one byte, so the 0–255 range of the `u8`
+    /// parameter is the whole domain; the firmware's write path reads
+    /// one decimal (`kaleidoscope/plugin/LEDControl.cpp`, BRIGHTNESS).
+    pub async fn set_led_brightness(&mut self, brightness: u8) -> Result<(), SetSettingError> {
+        self.set_setting(Self::LED_BRIGHTNESS_COMMAND_NAME, &brightness.to_string())
+            .await
+    }
+
+    /// Get the underglow LED brightness (`led.brightnessUG` command).
+    ///
+    /// One byte, 0–255, like [`DefyKeyboard::get_led_brightness`].
+    pub async fn get_led_underglow_brightness(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::LED_BRIGHTNESS_UG_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the underglow LED brightness (`led.brightnessUG` command).
+    pub async fn set_led_underglow_brightness(
+        &mut self,
+        brightness: u8,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::LED_BRIGHTNESS_UG_COMMAND_NAME,
+            &brightness.to_string(),
+        )
+        .await
+    }
+
+    /// Get the keyboard LED brightness used when the keyboard runs on
+    /// battery (`led.brightness.wireless` command).
+    ///
+    /// One byte, 0–255. This command is served by the wireless
+    /// Neuron's firmware, which is not in the local Kaleidoscope
+    /// checkout; the evidence is Bazecor (it reads and writes a single
+    /// decimal, `Preferences.tsx`) and the shipped Defy backups'
+    /// `led.brightness.wireless` captures (single decimals, 0–255).
+    pub async fn get_wireless_led_brightness(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(Self::LED_BRIGHTNESS_WIRELESS_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the wireless keyboard LED brightness
+    /// (`led.brightness.wireless` command).
+    pub async fn set_wireless_led_brightness(
+        &mut self,
+        brightness: u8,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::LED_BRIGHTNESS_WIRELESS_COMMAND_NAME,
+            &brightness.to_string(),
+        )
+        .await
+    }
+
+    /// Get the underglow LED brightness used when the keyboard runs on
+    /// battery (`led.brightnessUG.wireless` command).
+    ///
+    /// One byte, 0–255; same evidence class as
+    /// [`DefyKeyboard::get_wireless_led_brightness`].
+    pub async fn get_wireless_led_underglow_brightness(&mut self) -> Result<u8, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU8>(
+            Self::LED_BRIGHTNESS_UG_WIRELESS_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the wireless underglow LED brightness
+    /// (`led.brightnessUG.wireless` command).
+    pub async fn set_wireless_led_underglow_brightness(
+        &mut self,
+        brightness: u8,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::LED_BRIGHTNESS_UG_WIRELESS_COMMAND_NAME,
+            &brightness.to_string(),
+        )
+        .await
+    }
+
+    /// Get whether the LEDs fade in on layer changes
+    /// (`led.fade` command).
+    ///
+    /// A wireless-side power optimization (Bazecor exposes it under
+    /// energy management, "highlight layer changing"). The read
+    /// tolerates trailing tokens after the first decimal, because the
+    /// only real `led.fade` response ever captured from a Dygma
+    /// firmware reads `"1 0"` (see
+    /// [`OnOff`](parsing::settings::OnOff)).
+    pub async fn get_led_fade(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::OnOff>(Self::LED_FADE_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set whether the LEDs fade in on layer changes (`led.fade`
+    /// command).
+    pub async fn set_led_fade(&mut self, fade: bool) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::LED_FADE_COMMAND_NAME,
+            parsing::settings::on_off_command_data(fade),
+        )
+        .await
+    }
+
+    /// Get the keyboard LED idle timeout in seconds
+    /// (`idleleds.time_limit` command): how long the keyboard waits
+    /// without key presses before turning its LEDs off. `0` disables
+    /// the timeout.
+    ///
+    /// The firmware reads and writes the value as one decimal into a
+    /// `uint16_t` (`kaleidoscope/plugin/IdleLEDs.cpp`) — NOT the
+    /// low-byte/high-byte pair the qukeys and mouse-delay writes need.
+    /// Its default is 600 (10 minutes); Bazecor's UI bounds the slider
+    /// at 60 minutes (3600), which is a UI choice, not the wire's
+    /// domain.
+    pub async fn get_idle_leds_time_limit(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::IDLELEDS_TIME_LIMIT_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the keyboard LED idle timeout in seconds
+    /// (`idleleds.time_limit` command).
+    pub async fn set_idle_leds_time_limit(&mut self, seconds: u16) -> Result<(), SetSettingError> {
+        self.set_setting(Self::IDLELEDS_TIME_LIMIT_COMMAND_NAME, &seconds.to_string())
+            .await
+    }
+
+    /// Get the wireless LED idle timeout in seconds (`idleleds.wireless`
+    /// command) — the timeout that applies when the keyboard runs on
+    /// battery. `0` disables it.
+    ///
+    /// One decimal, like the wired timeout; served by the wireless
+    /// Neuron's firmware (not in the local checkout), evidenced by
+    /// Bazecor and the shipped Defy backups' `idleleds.wireless`
+    /// captures.
+    pub async fn get_wireless_idle_leds_time_limit(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::IDLELEDS_WIRELESS_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set the wireless LED idle timeout in seconds
+    /// (`idleleds.wireless` command).
+    pub async fn set_wireless_idle_leds_time_limit(
+        &mut self,
+        seconds: u16,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(Self::IDLELEDS_WIRELESS_COMMAND_NAME, &seconds.to_string())
+            .await
+    }
+
+    /// Get whether true sleep is enabled (`idleleds.true_sleep`
+    /// command): when set, the keyboard enters a deeper sleep state
+    /// after its wireless LED idle timeout has elapsed.
+    ///
+    /// One decimal, 0/1, read through
+    /// [`OnOff`](parsing::settings::OnOff) (first-token tolerance).
+    /// Boards whose firmware does not serve the command are a Bazecor
+    /// concern (it hides the card and pins the setting off); this API
+    /// surfaces whatever the connected device answers.
+    pub async fn get_true_sleep(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::OnOff>(Self::IDLELEDS_TRUE_SLEEP_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Set whether true sleep is enabled (`idleleds.true_sleep`
+    /// command).
+    pub async fn set_true_sleep(&mut self, true_sleep: bool) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::IDLELEDS_TRUE_SLEEP_COMMAND_NAME,
+            parsing::settings::on_off_command_data(true_sleep),
+        )
+        .await
+    }
+
+    /// Get the true-sleep timeout in seconds (`idleleds.true_sleep_time`
+    /// command): how long after the LEDs turn off the keyboard waits
+    /// before entering true sleep. Only meaningful when
+    /// [`DefyKeyboard::get_true_sleep`] answers `true`.
+    ///
+    /// One decimal; Bazecor's UI bounds it at 1–60 minutes (60–3600).
+    pub async fn get_true_sleep_time(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(
+            Self::IDLELEDS_TRUE_SLEEP_TIME_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the true-sleep timeout in seconds
+    /// (`idleleds.true_sleep_time` command).
+    pub async fn set_true_sleep_time(&mut self, seconds: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::IDLELEDS_TRUE_SLEEP_TIME_COMMAND_NAME,
+            &seconds.to_string(),
+        )
+        .await
+    }
+
     /// Reset every plugin setting stored in the device's EEPROM to the
     /// erased state.
     ///
@@ -1112,10 +1465,11 @@ impl DefyKeyboard {
     ///
     /// Validation, before anything is returned: every captured command
     /// this crate can prove things about is parsed against its wire
-    /// format — `keymap.custom`, `superkeys.map`, and `macros.map`
-    /// through the map types, which also enforce the firmware's
-    /// addressing limits and (for the keymap) the exactly-ten-layer
-    /// write shape by construction — and the backup's device
+    /// format — `keymap.custom`, `superkeys.map`, `macros.map`,
+    /// `palette`, and `colormap.map` — the maps through the typed
+    /// shapes, which also enforce the firmware's addressing limits and
+    /// (for the keymap and the colormap) the exactly-ten-layer write
+    /// shape by construction — and the backup's device
     /// descriptor, when it carries one, must name the Defy. Everything
     /// else passes through verbatim the way Bazecor's restore sends it.
     /// An invalid backup fails here with a typed error, so
@@ -1186,6 +1540,17 @@ impl DefyKeyboard {
                     .map(|_| ()),
                 Self::MACRO_MAP_COMMAND_NAME => MacroMap::from_str(&entry.data)
                     .map_err(BackupEntryError::Macros)
+                    .map(|_| ()),
+                // A Defy `palette` write is exactly 16 RGBW colors;
+                // the type cannot be constructed from anything else.
+                Self::PALETTE_COMMAND_NAME => parsing::palette::Palette::from_str(&entry.data)
+                    .map_err(BackupEntryError::Palette)
+                    .map(|_| ()),
+                // A `colormap.map` write carries exactly the ten
+                // layers; [`DefyColormap`] cannot be constructed from
+                // anything else.
+                Self::COLORMAP_MAP_COMMAND_NAME => DefyColormap::from_str(&entry.data)
+                    .map_err(BackupEntryError::Colormap)
                     .map(|_| ()),
                 _ => Ok(()),
             };
@@ -2327,6 +2692,318 @@ impl From<MacroAction> for parsing::macros::MacroAction {
     }
 }
 
+/// Full Defy colormap: the palette indices painting every LED, on
+/// every layer.
+///
+/// A Defy colormap holds exactly
+/// [`KEYMAP_CUSTOM_COMMAND_LAYERS`] layers — the device stores and
+/// reports exactly that many, and every `colormap.map` write carries
+/// them — so a [`DefyColormap`] cannot hold a different number of
+/// layers by construction. Building one from a count that is not known
+/// at compile time (wire data, a JSON file) is fallible: it goes
+/// through [`TryFrom<Vec<DefyColormapLayer>>`](TryFrom) and fails with
+/// [`ColormapDoesNotHave10LayersError`] when the count is wrong.
+///
+/// Each layer splits at the hardware's LED boundary: the first
+/// [`KEYBOARD_LEDS`](parsing::colormap::KEYBOARD_LEDS) positions paint
+/// the keyboard's keys, the remaining
+/// [`UNDERGLOW_LEDS`](parsing::colormap::UNDERGLOW_LEDS) the
+/// underglow.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deref, DerefMut, From)]
+pub struct DefyColormap {
+    /// The colormap's ten layers, in wire order (layer 1 first).
+    pub layers: [DefyColormapLayer; KEYMAP_CUSTOM_COMMAND_LAYERS],
+}
+
+impl TryFrom<Vec<DefyColormapLayer>> for DefyColormap {
+    type Error = ColormapDoesNotHave10LayersError;
+
+    fn try_from(layers: Vec<DefyColormapLayer>) -> Result<Self, Self::Error> {
+        let layers = layers
+            .try_into()
+            .map_err(|_| ColormapDoesNotHave10LayersError)?;
+
+        Ok(Self { layers })
+    }
+}
+
+impl FromStr for DefyColormap {
+    type Err = ParseColormapError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let layers: Vec<DefyColormapLayer> = s
+            .parse::<parsing::colormap::Colormap>()?
+            .iter()
+            .map(DefyColormapLayer::from)
+            .collect();
+
+        Ok(Self::try_from(layers)?)
+    }
+}
+
+impl serde::Serialize for DefyColormap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.layers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, layer)| DefyColormapLayer {
+                layer_number: i as u8 + 1,
+                ..layer
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DefyColormap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let layers = <Vec<DefyColormapLayer> as serde::Deserialize>::deserialize(deserializer)?;
+
+        // Checked at the JSON boundary like `FromStr` checks it at the
+        // wire boundary: a config file holding a different number of
+        // layers cannot come into existence as a [`DefyColormap`]
+        // either, so every consumer of the type can rely on the write
+        // shape.
+        Self::try_from(layers).map_err(serde::de::Error::custom)
+    }
+}
+
+impl DefyColormap {
+    /// Converts this colormap into a form suitable for sending over to
+    /// the keyboard as the data of a `colormap.map` command.
+    ///
+    /// Infallible by construction: a [`DefyColormap`] holds exactly
+    /// the ten layers the command requires.
+    pub fn to_colormap_map_data(&self) -> String {
+        parsing::colormap::Colormap(
+            self.layers
+                .iter()
+                .map(parsing::colormap::ColormapLayer::from)
+                .collect(),
+        )
+        .to_string()
+    }
+}
+
+/// A single human-readable Defy colormap layer.
+///
+/// Serialized as a JSON object of three fields; `layer_number` is a
+/// write-only UX aid like the keymap layers' (a file carrying one has
+/// it ignored on the way in), and the `keyboard`/`underglow` arrays
+/// are length-checked on the way in — exactly 70 and 108 indices.
+/// (Hand-written serde because serde's array impls stop at 64
+/// elements.)
+#[derive(Clone, Copy, Debug, Eq)]
+pub struct DefyColormapLayer {
+    /// A human-readable label for knowing what layer you're editing in
+    /// the JSON file.
+    ///
+    /// **Note**: This number is only a UX aid, and is not taken
+    /// into account when deserializing from the config file.
+    pub layer_number: u8,
+    /// The keyboard LEDs' palette indices, in wire order (positions
+    /// 0–69 of the layer).
+    pub keyboard: [parsing::colormap::PaletteIndex; KEYBOARD_LEDS],
+    /// The underglow LEDs' palette indices, in wire order (positions
+    /// 70–177 of the layer).
+    pub underglow: [parsing::colormap::PaletteIndex; UNDERGLOW_LEDS],
+}
+
+impl serde::Serialize for DefyColormapLayer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("DefyColormapLayer", 3)?;
+
+        state.serialize_field("layer_number", &self.layer_number)?;
+        state.serialize_field("keyboard", &&self.keyboard[..])?;
+        state.serialize_field("underglow", &&self.underglow[..])?;
+
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DefyColormapLayer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        enum Field {
+            Keyboard,
+            Underglow,
+            /// A present `layer_number` — accepted and discarded, the
+            /// way the derived skip-deserializing keymap layers treat
+            /// theirs (it is a write-only UX aid).
+            LayerNumber,
+            /// Any other field — ignored, the way derived structs
+            /// tolerate unknown fields (`deny_unknown_fields` is not
+            /// the derived default).
+            Other,
+        }
+
+        const FIELDS: &[&str] = &["layer_number", "keyboard", "underglow"];
+
+        impl<'de> serde::Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl serde::de::Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("`keyboard` or `underglow`")
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Field, E> {
+                        match value {
+                            "keyboard" => Ok(Field::Keyboard),
+                            "underglow" => Ok(Field::Underglow),
+                            "layer_number" => Ok(Field::LayerNumber),
+                            _ => Ok(Field::Other),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct LayerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LayerVisitor {
+            type Value = DefyColormapLayer;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a colormap layer of {KEYBOARD_LEDS} keyboard and {UNDERGLOW_LEDS} \
+                     underglow palette indices"
+                )
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut keyboard: Option<Vec<parsing::colormap::PaletteIndex>> = None;
+                let mut underglow: Option<Vec<parsing::colormap::PaletteIndex>> = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Keyboard => {
+                            if keyboard.is_some() {
+                                return Err(serde::de::Error::duplicate_field("keyboard"));
+                            }
+
+                            keyboard =
+                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
+                        }
+                        Field::Underglow => {
+                            if underglow.is_some() {
+                                return Err(serde::de::Error::duplicate_field("underglow"));
+                            }
+
+                            underglow =
+                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
+                        }
+                        Field::LayerNumber | Field::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let keyboard = keyboard
+                    .ok_or_else(|| serde::de::Error::missing_field("keyboard"))?
+                    .try_into()
+                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
+                        // serde's `invalid_length` names the FOUND count,
+                        // not the required one (`TryFrom<Vec<T>> for
+                        // [T; N]` hands the vec back as its error).
+                        serde::de::Error::invalid_length(
+                            found.len(),
+                            &format!("a `keyboard` array of exactly {KEYBOARD_LEDS} indices")
+                                .as_str(),
+                        )
+                    })?;
+                let underglow = underglow
+                    .ok_or_else(|| serde::de::Error::missing_field("underglow"))?
+                    .try_into()
+                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
+                        serde::de::Error::invalid_length(
+                            found.len(),
+                            &format!("an `underglow` array of exactly {UNDERGLOW_LEDS} indices")
+                                .as_str(),
+                        )
+                    })?;
+
+                Ok(Self::Value {
+                    layer_number: 0,
+                    keyboard,
+                    underglow,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct("DefyColormapLayer", FIELDS, LayerVisitor)
+    }
+}
+
+impl PartialEq for DefyColormapLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.keyboard == other.keyboard && self.underglow == other.underglow
+    }
+}
+
+impl std::hash::Hash for DefyColormapLayer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.keyboard.hash(state);
+        self.underglow.hash(state);
+    }
+}
+
+impl From<&parsing::colormap::ColormapLayer> for DefyColormapLayer {
+    fn from(layer: &parsing::colormap::ColormapLayer) -> Self {
+        let (keyboard, underglow) = layer.0.split_at(KEYBOARD_LEDS);
+
+        Self {
+            layer_number: 0,
+            keyboard: keyboard
+                .try_into()
+                .expect("the wire layer carries exactly KEYBOARD_LEDS keyboard positions"),
+            underglow: underglow
+                .try_into()
+                .expect("the wire layer carries exactly UNDERGLOW_LEDS underglow positions"),
+        }
+    }
+}
+
+impl From<&DefyColormapLayer> for parsing::colormap::ColormapLayer {
+    fn from(layer: &DefyColormapLayer) -> Self {
+        Self(
+            layer
+                .keyboard
+                .into_iter()
+                .chain(layer.underglow)
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("keyboard + underglow are exactly one wire layer's worth of positions"),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -3057,10 +3734,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_passes_through_commands_without_a_wire_parser() {
-        // LED and colormap data have no parser in this crate yet
-        // (WS-C); like Bazecor's restore, the plan sends them verbatim
-        // — here with the real shipped data at full size.
+    fn plan_carries_the_real_palette_and_colormap_through_verbatim() {
+        // The real shipped palette and colormap data validate through
+        // the WS-C wire types (exactly 16 RGBW colors; exactly ten
+        // layers of 178 indices) and the plan sends them verbatim, the
+        // way Bazecor's restore sends captures.
         let plan = DefyKeyboard::backup_restore_plan(&real_ordered_backup()).unwrap();
 
         let colormap = plan
@@ -3074,6 +3752,242 @@ mod tests {
 
         assert_eq!(colormap.data, REAL_COLORMAP_DATA);
         assert_eq!(palette.data, REAL_PALETTE_DATA);
+    }
+
+    #[test]
+    fn plan_rejects_corrupt_palette_data() {
+        // Three colors short of a palette: not a Defy state, refused
+        // before anything is sent.
+        let mut backup = real_ordered_backup();
+
+        backup
+            .backup
+            .iter_mut()
+            .find(|entry| entry.command == "palette")
+            .unwrap()
+            .data = REAL_PALETTE_DATA.split(' ').take(60).join(" ");
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::Palette(_),
+            } if command == "palette"
+        ));
+        assert!(err.to_string().contains("palette"));
+        assert!(err.to_string().contains("60"));
+    }
+
+    #[test]
+    fn plan_rejects_a_colormap_with_the_wrong_layer_count() {
+        // Nine *whole* layers parse as wire data (the wire parser
+        // accepts any layer count), but a `DefyColormap` cannot be
+        // built from anything but the exactly ten layers every
+        // `colormap.map` write carries.
+        let mut backup = real_ordered_backup();
+
+        backup
+            .backup
+            .iter_mut()
+            .find(|entry| entry.command == "colormap.map")
+            .unwrap()
+            .data = REAL_COLORMAP_DATA.split(' ').take(178 * 9).join(" ");
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::Colormap(
+                    ParseColormapError::IncorrectLayerCount(_)
+                ),
+            } if command == "colormap.map"
+        ));
+        assert!(err.to_string().contains("colormap.map"));
+        assert!(err.to_string().contains("exactly 10 layers"));
+    }
+
+    #[test]
+    fn plan_rejects_colormap_data_with_an_out_of_domain_index() {
+        // A `16` is a well-formed number but not a storable palette
+        // index (the firmware packs indices two per EEPROM byte); the
+        // parse catches it, so no restore can corrupt a neighboring
+        // LED's color.
+        let mut backup = real_ordered_backup();
+
+        backup
+            .backup
+            .iter_mut()
+            .find(|entry| entry.command == "colormap.map")
+            .unwrap()
+            .data = REAL_COLORMAP_DATA.replacen("10 4", "10 16", 1);
+
+        let err = DefyKeyboard::backup_restore_plan(&backup).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupValidationError::InvalidEntry {
+                ref command,
+                source: BackupEntryError::Colormap(_),
+            } if command == "colormap.map"
+        ));
+        assert!(err.to_string().contains("palette index (0-15)"));
+    }
+
+    /// A full [`DefyColormap`] built from the real shipped colormap
+    /// data — the only shape a `DefyColormap` can have.
+    fn real_colormap() -> DefyColormap {
+        REAL_COLORMAP_DATA.parse().unwrap()
+    }
+
+    #[test]
+    fn colormap_round_trips_from_str() {
+        let colormap = real_colormap();
+
+        let data = colormap.to_colormap_map_data();
+
+        assert_eq!(data.split(' ').count(), 10 * 178);
+        assert_eq!(data.parse::<DefyColormap>().unwrap(), colormap);
+    }
+
+    #[test]
+    fn colormap_from_layers_of_the_wrong_count_is_unrepresentable() {
+        let colormap = real_colormap();
+
+        // Nine layers parse as wire data but no such colormap exists:
+        // the type rejects the count at construction.
+        let nine = DefyColormap::try_from(colormap.layers[..9].to_vec());
+
+        assert!(matches!(nine, Err(ColormapDoesNotHave10LayersError)));
+        assert_eq!(
+            nine.unwrap_err().to_string(),
+            "colormap does not have exactly 10 layers"
+        );
+
+        // So does eleven.
+        let mut eleven = colormap.layers.to_vec();
+        eleven.push(colormap.layers[0]);
+
+        assert!(DefyColormap::try_from(eleven).is_err());
+    }
+
+    #[test]
+    fn colormap_json_round_trips_with_layer_numbers() {
+        // The hand-written `Deserialize` impl keeps accepting exactly
+        // the JSON the `Serialize` impl (and a config file) carries,
+        // with the UX layer numbers skipped on the way in, and the
+        // keyboard/underglow split pinned to the hardware's LED
+        // boundary.
+        let colormap = real_colormap();
+
+        let json = serde_json::to_string(&colormap).unwrap();
+
+        for number in 1..=KEYMAP_CUSTOM_COMMAND_LAYERS as u8 {
+            assert!(json.contains(&format!(r#""layer_number":{number}"#)));
+        }
+
+        // Layer 1's keyboard array is the wire's first 70 indices; its
+        // underglow the remaining 108.
+        assert!(json.contains(&format!(
+                r#""keyboard":[{}],"#,
+                REAL_COLORMAP_DATA
+                    .split(' ')
+                    .take(70)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )));
+
+        let parsed: DefyColormap = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, colormap);
+
+        // A file carrying the wrong keyboard-array length fails at the
+        // JSON boundary, with the counts named.
+        let wrong = json.replacen(
+            &format!(
+                r#""keyboard":[{}]"#,
+                REAL_COLORMAP_DATA
+                    .split(' ')
+                    .take(70)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            "\"keyboard\":[0]",
+            1,
+        );
+
+        let err = serde_json::from_str::<DefyColormap>(&wrong).unwrap_err();
+
+        // serde's exact shape: the FOUND length first, then the
+        // expected one.
+        assert!(
+            err.to_string()
+                .contains("invalid length 1, expected a `keyboard` array of exactly 70 indices")
+        );
+
+        // Derived-struct serde tolerance, hand-written faithfully: an
+        // unknown field is ignored wholesale (the derived default is
+        // NOT `deny_unknown_fields`).
+        let decorated = json.replacen(
+            r#"{"layer_number":1,"#,
+            r#"{"note":"ignored","layer_number":1,"#,
+            1,
+        );
+
+        let parsed: DefyColormap = serde_json::from_str(&decorated).unwrap();
+
+        assert_eq!(parsed, colormap);
+
+        // And a file omitting the write-only `layer_number`s entirely
+        // reads back the same colormap: they are restored from layer
+        // position on serialization.
+        let stripped = (1..=KEYMAP_CUSTOM_COMMAND_LAYERS as u8)
+            .fold(json.clone(), |json, number| {
+                json.replace(&format!(r#""layer_number":{number},"#,), "")
+            });
+
+        let parsed: DefyColormap = serde_json::from_str(&stripped).unwrap();
+
+        assert_eq!(parsed, colormap);
+    }
+
+    #[test]
+    fn colormap_json_rejects_duplicate_fields_like_the_derive() {
+        // serde-derive parity for the hand-written visitor: a repeated
+        // `keyboard`/`underglow` field is a `duplicate field` error, not
+        // a silent last-one-wins overwrite. (The error fires on
+        // re-sighting the KEY, so the duplicate value is never parsed.)
+        let layer_json = serde_json::to_string(&real_colormap().layers[0]).unwrap();
+
+        let duplicated_keyboard =
+            layer_json.replacen(r#""keyboard":["#, r#""keyboard":[0],"keyboard":["#, 1);
+
+        let err = serde_json::from_str::<DefyColormapLayer>(&duplicated_keyboard).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate field `keyboard`"));
+
+        let duplicated_underglow =
+            layer_json.replacen(r#""underglow":["#, r#""underglow":[0],"underglow":["#, 1);
+
+        let err = serde_json::from_str::<DefyColormapLayer>(&duplicated_underglow).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate field `underglow`"));
+
+        // A repeated write-only `layer_number` stays tolerated, the way
+        // the derived skip-deserializing fields are: it is discarded
+        // either time.
+        let duplicated_number = layer_json.replacen(
+            r#"{"layer_number":1,"#,
+            r#"{"layer_number":9,"layer_number":1,"#,
+            1,
+        );
+
+        let parsed = serde_json::from_str::<DefyColormapLayer>(&duplicated_number).unwrap();
+
+        assert_eq!(parsed, real_colormap().layers[0]);
     }
 
     // =================================================================================
