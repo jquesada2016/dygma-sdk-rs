@@ -5,6 +5,7 @@ mod diagnostics;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::conversions;
+use dygma_cli::devices::defaults;
 use dygma_cli::devices::defy::{
     CreateBackupError, DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap,
 };
@@ -42,6 +43,9 @@ enum Cli {
     /// Commands for working with macros.
     #[command(subcommand)]
     Macros(MacroCommands),
+    /// Commands for working with config files.
+    #[command(subcommand)]
+    Config(ConfigCommands),
     /// Commands for working with device settings and identity.
     #[command(subcommand)]
     Settings(SettingsCommands),
@@ -70,6 +74,7 @@ impl Cli {
             Self::Keymap(cmd) => cmd.perform().await,
             Self::Superkeys(cmd) => cmd.perform().await,
             Self::Macros(cmd) => cmd.perform().await,
+            Self::Config(cmd) => cmd.perform().await,
             Self::Settings(cmd) => cmd.perform().await,
             Self::Backup(cmd) => cmd.perform().await,
             Self::Names { store, command } => command.perform(store.as_deref()).await,
@@ -635,6 +640,213 @@ enum WritableSetting {
     MouseWheelDelay,
     /// The mouse cursor speed limit.
     MouseSpeedLimit,
+}
+
+/// The products `config init` knows, as CLI arguments.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfigProduct {
+    /// The Dygma Defy.
+    Defy,
+    /// The Dygma Sonsei.
+    Sonsei,
+    /// The Dygma Raise (first generation).
+    Raise,
+    /// The Dygma Raise 2.
+    Raise2,
+}
+
+impl From<ConfigProduct> for conversions::Product {
+    fn from(product: ConfigProduct) -> Self {
+        match product {
+            ConfigProduct::Defy => Self::Defy,
+            ConfigProduct::Sonsei => Self::Sonsei,
+            ConfigProduct::Raise => Self::Raise,
+            ConfigProduct::Raise2 => Self::Raise2,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Writes a product's default configuration as three human-readable
+    /// config files: `keymap.json`, `superkeys.json`, and `macros.json`
+    /// — the factory default, ready to edit and to apply (`keymap
+    /// apply`, `superkeys apply`, `macros apply`).
+    ///
+    /// The defaults are evidence-backed, not invented: they match
+    /// Bazecor's shipped Defy defaults, whose two independent sources —
+    /// the app's virtual keyboards and its shipped default backups —
+    /// agree, and are differentially validated against a recording of
+    /// them (tools/bazecor-differential). Refuses to overwrite existing
+    /// files unless `--force` is passed.
+    Init {
+        /// The product to write the default config of.
+        #[clap(long, default_value = "defy")]
+        product: ConfigProduct,
+        /// The directory the config files are written to.
+        ///
+        /// Created when missing.
+        #[clap(long)]
+        out_dir: Option<PathBuf>,
+        /// Overwrite existing config files.
+        #[clap(long, default_value_t = false)]
+        force: bool,
+        /// Print what would be written without writing any file.
+        #[clap(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+/// One config file `config init` writes: its path and the default
+/// value it holds.
+struct ConfigFile {
+    path: PathBuf,
+    /// What the file holds, for the preview and the summary.
+    description: &'static str,
+}
+
+impl ConfigCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        let Self::Init {
+            product,
+            out_dir,
+            force,
+            dry_run,
+        } = self;
+
+        // Offline by construction: the defaults are pure data, and
+        // every check below runs before any file is written. No
+        // device connection is ever opened.
+        let config = defaults::default_config(product.into()).map_err(|err| {
+            err.into_report().change_context(Error).attach(format!(
+                "initializing a default config for the {product:?}; \
+                     the defaults that exist for it are recorded in \
+                     tools/bazecor-differential/expectations/default-configs.json"
+            ))
+        })?;
+
+        let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("."));
+
+        let files = [
+            ConfigFile {
+                path: out_dir.join("keymap.json"),
+                description: "the factory keymap: 10 layers (Base / Navigation / FKeys, then \
+                              blank), 70 keys each",
+            },
+            ConfigFile {
+                path: out_dir.join("superkeys.json"),
+                description: "the factory superkey: superkey 1, the clipboard keys (tap \
+                              Ctrl+C, hold Ctrl+V, tap-hold Ctrl+Shift+V, double-tap Ctrl+X)",
+            },
+            ConfigFile {
+                path: out_dir.join("macros.json"),
+                description: "the factory macro: macro 1, typing \"Hey, dygmate\"",
+            },
+        ];
+
+        // A real run refuses to clobber; the dry run reports the same
+        // refusal a real run would produce, so it previews reality.
+        let mut existing = Vec::new();
+
+        for file in &files {
+            match tokio::fs::try_exists(&file.path).await {
+                Ok(true) => existing.push(file.path.display().to_string()),
+                Ok(false) => {}
+                Err(err) => {
+                    return Err(err
+                        .into_report()
+                        .change_context(Error)
+                        .attach("checking for an existing config file")
+                        .attach(file.path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+
+        if !existing.is_empty() && !force {
+            return Err(Error
+                .into_report()
+                .attach(format!(
+                    "initializing a default config in {}",
+                    out_dir.display()
+                ))
+                .attach(format!(
+                    "refusing to overwrite {} existing file(s): {}. \
+                     Move them aside, or pass --force to overwrite",
+                    existing.len(),
+                    existing.join(", ")
+                )));
+        }
+
+        if dry_run {
+            println!(
+                "Would write the {product:?} default config (matching \
+                 Bazecor's shipped defaults) to {}:",
+                out_dir.display()
+            );
+
+            for file in &files {
+                println!("  {} — {}", file.path.display(), file.description);
+            }
+
+            println!("Dry run: nothing was written.");
+            print_evidence_note();
+
+            return Ok(());
+        }
+
+        tokio::fs::create_dir_all(&out_dir)
+            .await
+            .change_context(Error)
+            .attach("creating the output directory")
+            .attach_with(|| out_dir.to_string_lossy().into_owned())?;
+
+        // Serialize-then-write, the #22 atomic helper: each file lands
+        // whole or not at all. A failure part-way leaves the earlier
+        // files written (each is independently valid); the error names
+        // the file that failed.
+        safe_pretty_json_file(&config.keymap, &files[0].path)
+            .await
+            .change_context(Error)
+            .attach_with(|| format!("writing {}", files[0].path.display()))?;
+        safe_pretty_json_file(&config.superkeys, &files[1].path)
+            .await
+            .change_context(Error)
+            .attach_with(|| format!("writing {}", files[1].path.display()))?;
+        safe_pretty_json_file(&config.macros, &files[2].path)
+            .await
+            .change_context(Error)
+            .attach_with(|| format!("writing {}", files[2].path.display()))?;
+
+        println!(
+            "Wrote the {product:?} default config (matching Bazecor's \
+             shipped defaults) to {}:",
+            out_dir.display()
+        );
+
+        for file in &files {
+            println!("  {} — {}", file.path.display(), file.description);
+        }
+
+        print_evidence_note();
+
+        Ok(())
+    }
+}
+
+/// Prints the recorded-but-unwritten defaults disclosure, shared by
+/// the dry-run preview and the real write so both paths are equally
+/// informative about what a default config does NOT carry: the
+/// palette/colormap and settings defaults exist in the recorded
+/// evidence but have no file format here.
+fn print_evidence_note() {
+    println!(
+        "Note: the default LED palette/colormap and the default \
+         settings (qukeys, superkeys timings, LED brightness, mouse) \
+         are recorded in the project source (the bazecor-differential \
+         expectations) but are not written: this CLI has no file \
+         format for them — settings live on the device \
+         (`settings get`/`set`)."
+    );
 }
 
 #[derive(Subcommand)]

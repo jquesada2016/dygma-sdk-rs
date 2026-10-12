@@ -21,12 +21,19 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STUB_RENDERER_TYPES = pathToFileURL(path.join(here, "stubs", "renderer-types.mjs")).href;
+const STUB_VIRTUAL_TYPES = pathToFileURL(path.join(here, "stubs", "virtual-types.mjs")).href;
 const STUB_KEYMAP_DB = pathToFileURL(path.join(here, "stubs", "keymap-db.mjs")).href;
 const STUB_COLOR_TYPES = pathToFileURL(path.join(here, "stubs", "color-types.mjs")).href;
 
 export async function resolve(specifier, context, nextResolve) {
   if (specifier === "@Renderer/types/layout") {
     return { url: STUB_RENDERER_TYPES, shortCircuit: true };
+  }
+
+  // The hardware-virtual keyboard files' type-only `VirtualType`
+  // import (record-defaults.mjs loads them verbatim).
+  if (specifier === "@Renderer/types/virtual") {
+    return { url: STUB_VIRTUAL_TYPES, shortCircuit: true };
   }
 
   const parent = context.parentURL ?? "";
