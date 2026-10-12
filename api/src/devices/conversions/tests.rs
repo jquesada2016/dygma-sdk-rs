@@ -727,4 +727,64 @@ mod differential {
         assert_eq!(to_sonsei.neuron_id, defy_wireless_backup().neuron_id);
         assert_eq!(to_sonsei.neuron.name, defy_wireless_backup().neuron.name);
     }
+
+    #[test]
+    fn a_partial_capture_stays_marked_through_a_conversion() {
+        // The marker is data, not damage: converting a partial capture
+        // rewrites wire shapes, never adds the missing commands, so
+        // the converted file keeps the marker (and its missing list)
+        // verbatim — it must not become unmistakable for complete.
+        let mut partial = defy_wireless_backup();
+
+        partial.partial = Some(crate::focus_api::parsing::backup::PartialCapture {
+            missing: vec!["led.fade".to_owned(), "mouse.speed".to_owned()],
+        });
+
+        let (converted, _) = convert_defy_backup_to_sonsei(&partial).unwrap();
+
+        assert_eq!(
+            converted.partial,
+            Some(crate::focus_api::parsing::backup::PartialCapture {
+                missing: vec!["led.fade".to_owned(), "mouse.speed".to_owned()],
+            })
+        );
+        assert!(converted.is_partial());
+
+        // The control: converting the unmarked source stays unmarked.
+        let (complete, _) = convert_defy_backup_to_sonsei(&defy_wireless_backup()).unwrap();
+
+        assert!(complete.partial.is_none());
+        assert!(!complete.is_partial());
+    }
+
+    #[test]
+    fn a_partial_capture_stays_marked_through_the_sonsei_to_defy_conversion() {
+        // The reverse direction of the carry-through above: the
+        // conversion's shared `backup.clone()` makes both directions
+        // safe today, but a future per-field rewrite of the Sonsei →
+        // Defy path could silently drop the marker on the way into
+        // Defy shape — so the marker (and its missing list) is pinned
+        // through this direction too.
+        let mut partial = sonsei_backup();
+
+        partial.partial = Some(crate::focus_api::parsing::backup::PartialCapture {
+            missing: vec!["led.fade".to_owned(), "mouse.speed".to_owned()],
+        });
+
+        let (converted, _) = convert_sonsei_backup_to_defy(&partial).unwrap();
+
+        assert_eq!(
+            converted.partial,
+            Some(crate::focus_api::parsing::backup::PartialCapture {
+                missing: vec!["led.fade".to_owned(), "mouse.speed".to_owned()],
+            })
+        );
+        assert!(converted.is_partial());
+
+        // The control: converting the unmarked source stays unmarked.
+        let (complete, _) = convert_sonsei_backup_to_defy(&sonsei_backup()).unwrap();
+
+        assert!(complete.partial.is_none());
+        assert!(!complete.is_partial());
+    }
 }

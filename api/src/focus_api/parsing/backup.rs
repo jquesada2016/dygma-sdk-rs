@@ -30,6 +30,19 @@
 //!   artifact. Foreign files carrying that artifact still parse, and
 //!   the restore sequence drops such entries (an empty command carries
 //!   no state to restore).
+//! - A backup saved from a capture that failed partway carries a
+//!   `partial` marker field ([`PartialCapture`]) that Bazecor's own
+//!   files never have. It is absent on complete captures. Bazecor's
+//!   import is inert to the key (plain `JSON.parse`, no schema
+//!   validation), but its restore is not: it replaces Bazecor's own
+//!   persisted neuron entry for the connected neuron with the
+//!   file's name-less neuron, then — a partial file's neuron
+//!   carries no `device` — throws a TypeError before anything
+//!   reaches the device. The device is never touched; most of
+//!   Bazecor's flows swallow the error silently, and only the flows
+//!   calling its restore directly surface it (one toasts it, one
+//!   logs it). This crate's own tooling refuses such files up
+//!   front, naming the missing commands.
 
 /// The commands a backup does **not** capture, as substring patterns
 /// over the device's `help` output.
@@ -127,6 +140,91 @@ impl BackupCommand {
     pub fn new(command: String, data: String) -> Self {
         Self { command, data }
     }
+}
+
+/// The partial-capture marker of a backup file that was saved from a
+/// capture that failed partway
+/// ([`DefyKeyboard::create_backup`]'s failure path), serialized as the
+/// backup file's `partial` field.
+///
+/// The field is **present only on partial captures** — a complete
+/// capture serializes without it, so the file stays byte-identical to
+/// what earlier versions of this crate (and Bazecor) write, and a
+/// `partial` field is an unmistakable "this file is incomplete" bit
+/// everywhere the format travels. Bazecor's import is inert to the
+/// key: its files are read through plain `JSON.parse` with no schema
+/// validation (`Backup.ts` `getLatestBackup`,
+/// `renderer/modules/Settings/BackupSettings.tsx` `GetBackup`) and
+/// its import gate is the presence of the `backup` array
+/// (`isBackupType` is `"backup" in backup`). Its restore, though, is
+/// not inert: it replaces Bazecor's own persisted neuron entry for
+/// the connected neuron with the file's neuron, then — a partial
+/// file's neuron carries no `device` — throws a TypeError at the
+/// restore's first read of that descriptor, before anything reaches
+/// the device. The device is never touched; most of Bazecor's flows
+/// swallow the error silently, and only the flows calling its
+/// restore directly surface it (one toasts it, one logs it).
+///
+/// [`DefyKeyboard::create_backup`]:
+///     crate::devices::defy::DefyKeyboard::create_backup
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialCapture {
+    /// The commands of the capture list this file does not carry, in
+    /// capture-list order: what a successful capture would have
+    /// captured in addition to the entries the file holds.
+    ///
+    /// Empty when the capture stopped after every command was captured
+    /// but before the backup could be assembled completely (the
+    /// `version`/`hardware.chip_id`/`hardware.wireless` probes) — the
+    /// marker alone still says the file came from a failed capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
+}
+
+impl PartialCapture {
+    /// Builds the marker for a capture that holds `captured` entries
+    /// of the `expected` capture list: the missing-command list of
+    /// [`missing_capture_commands`].
+    pub fn from_capture(expected: &[String], captured: &[BackupCommand]) -> Self {
+        Self {
+            missing: missing_capture_commands(expected, captured),
+        }
+    }
+
+    /// Whether the marker names any missing commands.
+    pub fn has_missing(&self) -> bool {
+        !self.missing.is_empty()
+    }
+}
+
+/// Computes the commands of the `expected` capture list that
+/// `captured` does not hold, in `expected` order.
+///
+/// The comparison is a multiset difference: a command the `help`
+/// output lists twice is captured twice (Bazecor's behavior), so one
+/// captured occurrence satisfies only one expected one. Entries of
+/// `captured` the expected list does not mention (a foreign file's
+/// extra commands) count against nothing.
+pub fn missing_capture_commands(expected: &[String], captured: &[BackupCommand]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut uncaptured: HashMap<&str, usize> = HashMap::new();
+
+    for entry in captured {
+        *uncaptured.entry(entry.command.as_str()).or_default() += 1;
+    }
+
+    expected
+        .iter()
+        .filter(|command| match uncaptured.get_mut(command.as_str()) {
+            Some(remaining @ 1..) => {
+                *remaining -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 /// Computes the command sequence a restore sends for a backup's
@@ -315,9 +413,33 @@ pub struct DefyBackup {
     /// The captured device state: `{command, data}` pairs in capture
     /// order.
     pub backup: Vec<BackupCommand>,
+    /// The partial-capture marker, present only when this file was
+    /// saved from a capture that failed partway (see
+    /// [`PartialCapture`]). Absent — and omitted when serializing — on
+    /// every complete capture, so complete files keep their
+    /// Bazecor-identical shape. A foreign file that carries a `partial`
+    /// field parses into it, and it round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialCapture>,
 }
 
 impl DefyBackup {
+    /// Whether this file was saved from a capture that failed partway:
+    /// it carries the [`PartialCapture`] marker. Restore validation
+    /// refuses such files by default.
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_some()
+    }
+
+    /// The missing commands the partial-capture marker names, or an
+    /// empty slice for a complete capture.
+    pub fn missing_commands(&self) -> &[String] {
+        self.partial
+            .as_ref()
+            .map(|partial| partial.missing.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Assembles a backup file of the shape a fresh capture produces:
     /// the neuron store entry carries the chip id but no names yet
     /// (names are app-side; there is no store in this crate yet), and
@@ -337,6 +459,28 @@ impl DefyBackup {
             },
             versions,
             backup,
+            partial: None,
+        }
+    }
+
+    /// Assembles the backup file a failed capture saves: whatever was
+    /// captured before the failure, with the neuron object left at the
+    /// empty store shape (no chip id, and no device descriptor — the
+    /// probes that fill them never ran) and the [`PartialCapture`]
+    /// marker set.
+    ///
+    /// The marker is set even when `missing` comes out empty (the
+    /// capture stopped after every command but before the identity
+    /// probes): the marker is the file's "this capture failed" bit.
+    pub fn partial_capture(captured: Vec<BackupCommand>, expected: &[String]) -> Self {
+        let partial = PartialCapture::from_capture(expected, &captured);
+
+        Self {
+            neuron_id: String::new(),
+            neuron: BackupNeuron::default(),
+            versions: BackupVersions::default(),
+            backup: captured,
+            partial: Some(partial),
         }
     }
 }
@@ -1097,6 +1241,212 @@ mod tests {
                 ..BackupNeuron::default()
             }
             .has_names()
+        );
+    }
+
+    fn capture_list(commands: &[&str]) -> Vec<String> {
+        commands
+            .iter()
+            .map(|command| (*command).to_owned())
+            .collect()
+    }
+
+    fn captured_entries(commands: &[&str]) -> Vec<BackupCommand> {
+        commands
+            .iter()
+            .map(|command| BackupCommand::new((*command).to_owned(), String::new()))
+            .collect()
+    }
+
+    #[test]
+    fn missing_commands_are_the_expected_ones_not_captured() {
+        let expected = capture_list(&["keymap.custom", "palette", "superkeys.map", "macros.map"]);
+
+        // Everything captured: nothing missing.
+        assert_eq!(
+            missing_capture_commands(
+                &expected,
+                &captured_entries(&["keymap.custom", "palette", "superkeys.map", "macros.map",])
+            ),
+            Vec::<String>::new()
+        );
+
+        // The capture stopped after `palette`: the rest is missing, in
+        // expected order.
+        assert_eq!(
+            missing_capture_commands(&expected, &captured_entries(&["keymap.custom", "palette"])),
+            capture_list(&["superkeys.map", "macros.map"])
+        );
+
+        // Nothing captured at all: the whole list is missing.
+        assert_eq!(missing_capture_commands(&expected, &[]), expected);
+
+        // A foreign entry the expected list never mentions counts
+        // against nothing and is not reported missing.
+        assert_eq!(
+            missing_capture_commands(
+                &expected,
+                &captured_entries(&["keymap.custom", "wireless.rf.power"])
+            ),
+            capture_list(&["palette", "superkeys.map", "macros.map"])
+        );
+    }
+
+    #[test]
+    fn missing_commands_are_counted_per_expected_occurrence() {
+        // A command `help` lists twice is captured twice (Bazecor's
+        // behavior), so one captured occurrence satisfies only one
+        // expected one.
+        let expected = capture_list(&["led.fade", "led.fade", "palette"]);
+
+        assert_eq!(
+            missing_capture_commands(&expected, &captured_entries(&["led.fade"])),
+            capture_list(&["led.fade", "palette"])
+        );
+
+        assert_eq!(
+            missing_capture_commands(&expected, &captured_entries(&["led.fade", "led.fade"])),
+            capture_list(&["palette"])
+        );
+    }
+
+    #[test]
+    fn partial_marker_serializes_only_when_present() {
+        // A complete capture — the shape every capture produced before
+        // partial recovery existed — serializes without any `partial`
+        // field, byte-identical to the older shape: Bazecor must not
+        // see a marker on complete files.
+        let backup = DefyBackup::capture(
+            "8ed7f33db024a5b5",
+            BackupVersions::default(),
+            captured_entries(&["keymap.custom"]),
+            defy_wireless_device_value(),
+        );
+
+        let json = serde_json::to_string(&backup).unwrap();
+
+        assert!(!json.contains(r#""partial""#));
+
+        // And the partial file's marker round-trips: parse, serialize,
+        // parse — the missing list survives exactly.
+        let partial = serde_json::from_str::<DefyBackup>(
+            r#"{
+                "neuronID": "8ed7f33db024a5b5",
+                "neuron": {},
+                "versions": {},
+                "backup": [
+                    { "command": "keymap.custom", "data": "41 30 31" }
+                ],
+                "partial": { "missing": ["palette", "colormap.map"] }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            partial.partial,
+            Some(PartialCapture {
+                missing: capture_list(&["palette", "colormap.map"]),
+            })
+        );
+        assert!(partial.is_partial());
+        assert_eq!(partial.missing_commands(), ["palette", "colormap.map"]);
+
+        let json = serde_json::to_string(&partial).unwrap();
+        let reparsed = serde_json::from_str::<DefyBackup>(&json).unwrap();
+
+        assert_eq!(reparsed, partial);
+    }
+
+    #[test]
+    fn partial_marker_parses_without_a_missing_list() {
+        // `"partial": {}` is the marker of a capture that stopped
+        // after every command but before the identity probes.
+        let partial = serde_json::from_str::<DefyBackup>(
+            r#"{
+                "neuronID": "",
+                "neuron": {},
+                "versions": {},
+                "backup": [],
+                "partial": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            partial.partial,
+            Some(PartialCapture {
+                missing: Vec::new(),
+            })
+        );
+        assert!(partial.is_partial());
+        assert!(!partial.partial.as_ref().unwrap().has_missing());
+    }
+
+    #[test]
+    fn partial_capture_assembles_the_empty_store_shape_and_the_marker() {
+        let expected = capture_list(&["keymap.custom", "palette", "superkeys.map"]);
+        let captured = captured_entries(&["keymap.custom"]);
+
+        let partial = DefyBackup::partial_capture(captured.clone(), &expected);
+
+        // The neuron object is the empty store shape: no chip id, and
+        // no device descriptor — the probes that fill them never ran.
+        assert_eq!(partial.neuron_id, "");
+        assert_eq!(partial.neuron, BackupNeuron::default());
+        assert_eq!(partial.versions, BackupVersions::default());
+        assert_eq!(partial.backup, captured);
+        assert_eq!(
+            partial.partial,
+            Some(PartialCapture {
+                missing: capture_list(&["palette", "superkeys.map"]),
+            })
+        );
+
+        // Serialized, the marker is the only field a Bazecor file does
+        // not carry. (serde_json object keys iterate sorted; compare
+        // as a set.)
+        let json = serde_json::to_value(&partial).unwrap();
+
+        assert_eq!(
+            json["partial"],
+            serde_json::json!({ "missing": ["palette", "superkeys.map"] })
+        );
+
+        let mut keys = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        keys.sort();
+
+        assert_eq!(
+            keys,
+            ["backup", "neuron", "neuronID", "partial", "versions"]
+        );
+    }
+
+    #[test]
+    fn partial_capture_after_every_command_still_carries_the_marker() {
+        // The capture stopped at the identity probes: every command is
+        // in the file, but the file is not a complete capture's
+        // product. The marker serializes as `{}` — present, unmistakable.
+        let expected = capture_list(&["keymap.custom", "palette"]);
+
+        let partial =
+            DefyBackup::partial_capture(captured_entries(&["keymap.custom", "palette"]), &expected);
+
+        assert_eq!(
+            partial.partial,
+            Some(PartialCapture {
+                missing: Vec::new(),
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap()["partial"],
+            serde_json::json!({})
         );
     }
 }

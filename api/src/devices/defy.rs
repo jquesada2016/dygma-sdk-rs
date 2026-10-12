@@ -195,16 +195,48 @@ mod error {
     #[derive(Debug, Display, Error)]
     pub enum CreateBackupError {
         /// Querying the device's `help` command list failed, so the
-        /// capture list could not be computed.
+        /// capture list could not be computed and nothing was
+        /// captured. There is nothing to recover a partial capture
+        /// from.
         #[display("failed to list the device's commands: {_0}")]
         ListCommands(GetCommandsError),
+        /// The capture was interrupted before it could complete, so the
+        /// file this run would have produced is a *partial* capture:
+        /// [`DefyBackup::partial_capture`] in `partial` holds every
+        /// command captured before the failure and the
+        /// [`parsing::backup::PartialCapture`] marker naming the
+        /// capture-list commands it is missing. The backup still saves
+        /// (and later completes, with
+        /// [`DefyKeyboard::complete_backup`]) — it is never mistaken
+        /// for a complete one: restore validation refuses it by
+        /// default.
+        #[display("the backup capture was interrupted, a partial capture was preserved: {source}")]
+        IncompleteCapture {
+            /// The partial backup: everything captured before the
+            /// failure, marked with the commands it is missing. Boxed —
+            /// the payload dwarfs the other variants, and errors are
+            /// returned everywhere.
+            partial: Box<parsing::backup::DefyBackup>,
+            /// What failed, and at which step of the capture.
+            source: CaptureFailure,
+        },
+    }
+
+    /// The step of a backup capture that failed and interrupted it —
+    /// the [`CreateBackupError::IncompleteCapture::source`] of an
+    /// interrupted capture. The capture-list command reads run first;
+    /// the identity probes (`hardware.chip_id`, `version`,
+    /// `hardware.wireless`) run after them, so a probe failure means
+    /// every command was captured and the partial file's missing list
+    /// is empty.
+    #[derive(Debug, Display, Error)]
+    pub enum CaptureFailure {
         /// Capturing the response of one of the backup's commands
-        /// failed.
+        /// failed. The capture stopped here; the commands listed after
+        /// this one are the partial file's missing list.
         #[display("failed to capture the `{command}` response: {source}")]
         Command {
-            /// The command whose response could not be captured. The
-            /// capture stopped here; everything listed before it was
-            /// captured and is lost with this error.
+            /// The command whose response could not be captured.
             command: String,
             /// The error the command failed with.
             source: RunCommandError,
@@ -218,6 +250,28 @@ mod error {
         /// Reading `hardware.wireless` failed.
         #[display("failed to read whether this is the wireless variant: {_0}")]
         Wireless(GetSettingError),
+    }
+
+    /// The Display message of [`BackupValidationError::PartialCapture`]:
+    /// names the missing commands, or — for a marker with an empty
+    /// missing list (a capture interrupted at the identity probes) —
+    /// says why the list is empty, never "0 command(s) missing: "
+    /// with a dangling separator. The single source of the refusal's
+    /// wording: the CLI's validation snippet renders this `Display`
+    /// directly.
+    fn partial_capture_display(missing: &[String]) -> String {
+        if missing.is_empty() {
+            "the backup is a partial capture: the capture was interrupted \
+             after every command, before the backup could be assembled \
+             completely"
+                .to_owned()
+        } else {
+            format!(
+                "the backup is a partial capture: {} command(s) missing: {}",
+                missing.len(),
+                missing.join(", ")
+            )
+        }
     }
 
     /// Error returned when a backup fails restore validation.
@@ -248,6 +302,19 @@ mod error {
             command: String,
             /// The parse failure.
             source: BackupEntryError,
+        },
+        /// The backup carries the partial-capture marker
+        /// ([`parsing::backup::PartialCapture`]): it was saved from a
+        /// capture that failed partway, so it does not hold the whole
+        /// device state a capture captures. Restoring it would write a
+        /// half-captured configuration to the device and is refused
+        /// unless explicitly allowed (see
+        /// [`DefyKeyboard::backup_restore_plan_allowing_partial`]).
+        #[display("{}", partial_capture_display(missing))]
+        PartialCapture {
+            /// The commands the capture list expects and the file does
+            /// not hold — what restoring it would leave uncaptured.
+            missing: Vec<String>,
         },
     }
 
@@ -953,48 +1020,58 @@ impl DefyKeyboard {
     /// device descriptor, but no names yet: layer, macro, and superkey
     /// names are app-side in Bazecor, and this crate has no name store
     /// (see [`parsing::backup::BackupNeuron`]).
+    ///
+    /// # Interrupted captures
+    ///
+    /// When any step after the `help` query fails — a command read, or
+    /// one of the identity probes — the error carries the *partial
+    /// capture* in
+    /// [`CreateBackupError::IncompleteCapture`]: everything captured
+    /// before the failure, marked
+    /// ([`parsing::backup::PartialCapture`]) with the capture-list
+    /// commands it is missing. Save it (the CLI does
+    /// automatically); it is never mistaken for a complete capture
+    /// because the marker is on it, and it can be completed later with
+    /// [`DefyKeyboard::complete_backup`] (capture commands are
+    /// idempotent reads, so re-capturing the missing ones is safe).
     pub async fn create_backup(
         &mut self,
     ) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
-        let help_commands = self
-            .available_commands()
-            .await
-            .map_err(CreateBackupError::ListCommands)?;
-        let capture_list = parsing::backup::backup_capture_commands(&help_commands);
+        capture_backup(&mut self.focus_api, &[]).await
+    }
 
-        // Sequential on purpose: each command is a device round-trip,
-        // and the capture order is the `help` order the format keeps.
-        let mut captured = Vec::with_capacity(capture_list.len());
-        for command in capture_list {
-            let data = self.run_command(&command, None).await.map_err(|source| {
-                CreateBackupError::Command {
-                    command: command.clone(),
-                    source,
-                }
-            })?;
-
-            captured.push(parsing::backup::BackupCommand::new(command, data));
-        }
-
-        let chip_id = self
-            .get_chip_id()
-            .await
-            .map_err(CreateBackupError::ChipId)?;
-        let version_response = self
-            .run_command(Self::VERSION_COMMAND_NAME, None)
-            .await
-            .map_err(CreateBackupError::Version)?;
-        let wireless = self
-            .is_wireless()
-            .await
-            .map_err(CreateBackupError::Wireless)?;
-
-        Ok(parsing::backup::DefyBackup::capture(
-            chip_id.as_str(),
-            parsing::backup::BackupVersions::from_version_response(&version_response),
-            captured,
-            Self::backup_device_descriptor(wireless, chip_id.as_str()),
-        ))
+    /// Completes a partial capture: captures **only the commands the
+    /// partial file is missing**, merges them into the file's entries,
+    /// re-reads the identity probes, and recomputes the partial marker
+    /// against the device's *current* capture list.
+    ///
+    /// Every capture command is an idempotent read, so re-capturing
+    /// the missing ones never writes to the device and cannot corrupt
+    /// anything — completing a partial capture is exactly as safe as
+    /// creating one. The file's existing entries are kept verbatim, in
+    /// their original capture order; the newly captured ones are
+    /// appended in the current capture order. A command the file holds
+    /// that the current capture list does not mention (the device's
+    /// `help` changed, say) is kept and counts against nothing.
+    ///
+    /// On success the returned backup is complete: the marker is gone
+    /// and the identity fields describe this device. When the
+    /// completion is itself interrupted the error carries the updated
+    /// partial capture — same shape as
+    /// [`DefyKeyboard::create_backup`]'s failure, with the missing
+    /// list recomputed against the current capture list.
+    ///
+    /// The identity fields (chip id, versions, device descriptor) are
+    /// always re-read from the connected device — they replace
+    /// whatever the partial file carried (which, for a file an
+    /// interrupted [`DefyKeyboard::create_backup`] saved, is the empty
+    /// store shape anyway: the interrupted probes are exactly what
+    /// completion re-runs).
+    pub async fn complete_backup(
+        &mut self,
+        partial: &parsing::backup::DefyBackup,
+    ) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+        capture_backup(&mut self.focus_api, &partial.backup).await
     }
 
     /// Builds the Defy device descriptor a backup's neuron object
@@ -1020,6 +1097,12 @@ impl DefyKeyboard {
     /// the backup first — **without opening a connection to the
     /// device**.
     ///
+    /// A backup carrying the partial-capture marker
+    /// ([`parsing::backup::PartialCapture`]) is refused: it does not
+    /// hold the whole device state a capture captures. See
+    /// [`DefyKeyboard::backup_restore_plan_allowing_partial`] for the
+    /// explicit override.
+    ///
     /// The plan is Bazecor's restore order
     /// ([`restore_command_sequence`][seq]: `superkeys.map` entries
     /// before `keymap.custom`, empty-command capture artifacts dropped)
@@ -1043,6 +1126,40 @@ impl DefyKeyboard {
     pub fn backup_restore_plan(
         backup: &parsing::backup::DefyBackup,
     ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
+        Self::backup_restore_plan_with(backup, false)
+    }
+
+    /// [`DefyKeyboard::backup_restore_plan`] with the
+    /// partial-capture refusal lifted: an explicitly
+    /// `--allow-partial`-style restore of a marked backup gets its
+    /// plan computed like any other, after acknowledging it restores
+    /// only part of a captured state.
+    ///
+    /// Everything else — the product guard, the per-entry wire
+    /// validation, the ordering, the `led.mode 0` tail — is identical.
+    /// The marker is data, not damage: the plan restores exactly what
+    /// the file holds.
+    pub fn backup_restore_plan_allowing_partial(
+        backup: &parsing::backup::DefyBackup,
+    ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
+        Self::backup_restore_plan_with(backup, true)
+    }
+
+    /// The plan computation behind the refusal pair: `allow_partial`
+    /// says whether a backup carrying the partial-capture marker is
+    /// planned anyway.
+    fn backup_restore_plan_with(
+        backup: &parsing::backup::DefyBackup,
+        allow_partial: bool,
+    ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
+        if let Some(partial) = &backup.partial
+            && !allow_partial
+        {
+            return Err(BackupValidationError::PartialCapture {
+                missing: partial.missing.clone(),
+            });
+        }
+
         if let Some(product) = backup.neuron.device.as_ref().and_then(|device| {
             device
                 .get("info")
@@ -1094,6 +1211,11 @@ impl DefyKeyboard {
     /// planned command with its data, in Bazecor's restore order,
     /// ending with the `led.mode 0` tail Bazecor's restore sends.
     ///
+    /// A backup carrying the partial-capture marker is refused before
+    /// anything is sent — restoring it would write a half-captured
+    /// configuration to the device. The explicit override is
+    /// [`DefyKeyboard::restore_backup_allowing_partial`].
+    ///
     /// This **rewrites the captured parts of the device's
     /// configuration** — the keymap, superkeys, macros, settings, and
     /// LED state the backup holds. It cannot be undone except by
@@ -1111,7 +1233,32 @@ impl DefyKeyboard {
         &mut self,
         backup: &parsing::backup::DefyBackup,
     ) -> Result<(), RestoreBackupError> {
-        let plan = Self::backup_restore_plan(backup).map_err(RestoreBackupError::Validation)?;
+        self.send_restore_plan(Self::backup_restore_plan(backup))
+            .await
+    }
+
+    /// [`DefyKeyboard::restore_backup`] with the partial-capture
+    /// refusal lifted: the marked backup's plan is computed with
+    /// [`DefyKeyboard::backup_restore_plan_allowing_partial`] and sent
+    /// like any other. Everything the file holds is restored, in the
+    /// usual order; what the file is missing stays whatever it is —
+    /// the caller acknowledged the marker (the CLI prints the missing
+    /// list before this is reachable).
+    pub async fn restore_backup_allowing_partial(
+        &mut self,
+        backup: &parsing::backup::DefyBackup,
+    ) -> Result<(), RestoreBackupError> {
+        self.send_restore_plan(Self::backup_restore_plan_allowing_partial(backup))
+            .await
+    }
+
+    /// The device seam behind the restore pair: validate (the `Result`
+    /// carries the validation outcome), then send.
+    async fn send_restore_plan(
+        &mut self,
+        plan: Result<Vec<parsing::backup::BackupCommand>, BackupValidationError>,
+    ) -> Result<(), RestoreBackupError> {
+        let plan = plan.map_err(RestoreBackupError::Validation)?;
 
         // The device seam of the restore: the only place backup
         // commands are sent, a flat loop over the validated plan —
@@ -1140,12 +1287,7 @@ impl DefyKeyboard {
     where
         T: std::str::FromStr<Err = parsing::settings::ParseSettingsError>,
     {
-        let res = self
-            .run_command(command, None)
-            .await
-            .map_err(GetSettingError::CommandFailed)?;
-
-        T::from_str(&res).map_err(GetSettingError::ParsingFailure)
+        read_setting::<T>(&mut self.focus_api, command).await
     }
 
     /// Runs a settings command with the given write data.
@@ -1153,6 +1295,170 @@ impl DefyKeyboard {
         self.run_command(command, Some(data)).await?;
 
         Ok(())
+    }
+}
+
+/// Runs a single-value settings command over any connection and parses
+/// its response — [`DefyKeyboard::get_setting`]'s body, shared with
+/// the backup capture core so the probes read exactly one way.
+async fn read_setting<T>(
+    connection: &mut impl FocusApiConnection,
+    command: &str,
+) -> Result<T, GetSettingError>
+where
+    T: std::str::FromStr<Err = parsing::settings::ParseSettingsError>,
+{
+    let res = connection
+        .run_command(command, None)
+        .await
+        .map_err(GetSettingError::CommandFailed)?;
+
+    T::from_str(&res).map_err(GetSettingError::ParsingFailure)
+}
+
+/// The capture core of [`DefyKeyboard::create_backup`] and
+/// [`DefyKeyboard::complete_backup`], over any connection so tests can
+/// drive it against scripted responses.
+///
+/// `already_captured` is the entries a partial file being completed
+/// already holds (empty for a fresh capture). The steps, in order:
+/// query `help` and compute the capture list; capture only the
+/// capture-list commands the file does not hold yet (multiset
+/// semantics — a twice-listed command needs two captures); then probe
+/// the identity fields. Any failure after the `help` query assembles
+/// the partial capture — everything captured so far, plus the
+/// [`parsing::backup::PartialCapture`] marker naming what is missing —
+/// and returns it in
+/// [`CreateBackupError::IncompleteCapture`]; a failure before any
+/// command is captured cannot produce one worth keeping, so only the
+/// error remains.
+async fn capture_backup(
+    connection: &mut impl FocusApiConnection,
+    already_captured: &[parsing::backup::BackupCommand],
+) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+    let help_commands = connection
+        .available_commands()
+        .await
+        .map_err(CreateBackupError::ListCommands)?;
+    let capture_list = parsing::backup::backup_capture_commands(&help_commands);
+    let missing = parsing::backup::missing_capture_commands(&capture_list, already_captured);
+
+    // Sequential on purpose: each command is a device round-trip, and
+    // the capture order is the `help` order the format keeps.
+    let mut captured = Vec::with_capacity(missing.len());
+
+    for command in &missing {
+        // A failed read contributes no entry: the partial marker is
+        // recomputed from what actually was captured, and names the
+        // failed command among the missing.
+        let data = match connection.run_command(command, None).await {
+            Ok(data) => data,
+            Err(source) => {
+                return Err(interrupted(
+                    &capture_list,
+                    already_captured,
+                    &captured,
+                    CaptureFailure::Command {
+                        command: command.clone(),
+                        source,
+                    },
+                ));
+            }
+        };
+
+        captured.push(parsing::backup::BackupCommand::new(command.clone(), data));
+    }
+
+    let chip_id = read_setting::<parsing::settings::ChipId>(
+        connection,
+        DefyKeyboard::HARDWARE_CHIP_ID_COMMAND_NAME,
+    )
+    .await
+    .map_err(|source| {
+        interrupted(
+            &capture_list,
+            already_captured,
+            &captured,
+            CaptureFailure::ChipId(source),
+        )
+    })?;
+
+    let version_response = connection
+        .run_command(DefyKeyboard::VERSION_COMMAND_NAME, None)
+        .await
+        .map_err(|source| {
+            interrupted(
+                &capture_list,
+                already_captured,
+                &captured,
+                CaptureFailure::Version(source),
+            )
+        })?;
+
+    let wireless = read_setting::<parsing::settings::BoolWord>(
+        connection,
+        DefyKeyboard::HARDWARE_WIRELESS_COMMAND_NAME,
+    )
+    .await
+    .map_err(|source| {
+        interrupted(
+            &capture_list,
+            already_captured,
+            &captured,
+            CaptureFailure::Wireless(source),
+        )
+    })?;
+
+    let mut entries = already_captured.to_owned();
+    entries.extend(captured);
+
+    // The final marker is computed against the current capture list:
+    // if the device's `help` changed since the partial file was
+    // captured, the file's marker describes the capture it belongs to,
+    // this one the device answers now.
+    let partial = parsing::backup::PartialCapture::from_capture(&capture_list, &entries);
+
+    // The complete capture's assembly — chip id, descriptor, versions
+    // — is `DefyBackup::capture`'s shape; the marker is this path's
+    // only addition, present only when something is still missing.
+    let mut backup = parsing::backup::DefyBackup::capture(
+        chip_id.as_str(),
+        parsing::backup::BackupVersions::from_version_response(&version_response),
+        entries,
+        DefyKeyboard::backup_device_descriptor(wireless.0, chip_id.as_str()),
+    );
+
+    backup.partial = partial.has_missing().then_some(partial);
+
+    // The multiset invariant: `has_missing` was computed from exactly
+    // these `entries` against the capture list, so a success return
+    // (only taken when nothing is missing) provably carries no marker
+    // — a marked file here would let a partial capture print as a
+    // complete one downstream.
+    debug_assert!(!backup.is_partial());
+
+    Ok(backup)
+}
+
+/// Assembles the interrupted-capture error: the partial backup holding
+/// `already_captured` (the completed file's entries) plus `captured`
+/// (this run's entries, in capture order), marked against the capture
+/// list.
+fn interrupted(
+    capture_list: &[String],
+    already_captured: &[parsing::backup::BackupCommand],
+    captured: &[parsing::backup::BackupCommand],
+    source: CaptureFailure,
+) -> CreateBackupError {
+    let mut entries = already_captured.to_owned();
+    entries.extend(captured.iter().cloned());
+
+    CreateBackupError::IncompleteCapture {
+        partial: Box::new(parsing::backup::DefyBackup::partial_capture(
+            entries,
+            capture_list,
+        )),
+        source,
     }
 }
 
@@ -2603,6 +2909,7 @@ mod tests {
                     parsing::backup::BackupCommand::new((*command).to_owned(), (*data).to_owned())
                 })
                 .collect(),
+            partial: None,
         }
     }
 
@@ -2767,5 +3074,466 @@ mod tests {
 
         assert_eq!(colormap.data, REAL_COLORMAP_DATA);
         assert_eq!(palette.data, REAL_PALETTE_DATA);
+    }
+
+    // =================================================================================
+    // Partial-capture recovery: `create_backup`/`complete_backup`
+    // against a scripted connection (no hardware), and the restore
+    // plan's partial refusal.
+    // =================================================================================
+
+    /// A scripted Focus API connection: each `run_command` checks the
+    /// command against the next script entry and hands back its
+    /// response. The capture's command sequence is deterministic
+    /// (`help`, then the uncaptured capture-list commands, then the
+    /// identity probes), so a script is the whole conversation.
+    ///
+    /// The capture core ([`capture_backup`]) is generic over
+    /// [`FocusApiConnection`], so the tests drive it through this
+    /// double — no hardware, no transports.
+    #[derive(Debug)]
+    struct ScriptedConnection {
+        script: std::collections::VecDeque<(&'static str, Result<String, RunCommandError>)>,
+    }
+
+    impl ScriptedConnection {
+        /// A `help` response whose capture list is exactly three
+        /// commands (`led.brightnessUG` is force-appended by the
+        /// filter, so a full capture runs four reads).
+        fn help() -> String {
+            "keymap.custom\npalette\nmouse.speed\n".to_owned()
+        }
+
+        fn ok(
+            command: &'static str,
+            response: &str,
+        ) -> (&'static str, Result<String, RunCommandError>) {
+            (command, Ok(response.to_owned()))
+        }
+
+        fn failed(command: &'static str) -> (&'static str, Result<String, RunCommandError>) {
+            (
+                command,
+                Err(RunCommandError::ResponseStreamTerminatedPrematurely),
+            )
+        }
+
+        /// The full successful capture script: `help`, the four
+        /// capture reads, then the three identity probes.
+        fn full_capture() -> Self {
+            Self {
+                script: [
+                    Self::ok("help", &Self::help()),
+                    Self::ok("keymap.custom", "41 30 31"),
+                    Self::ok("palette", "255 196 0 0"),
+                    Self::ok("mouse.speed", "20"),
+                    Self::ok("led.brightnessUG", "255"),
+                    Self::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                    Self::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                    Self::ok("hardware.wireless", "true"),
+                ]
+                .into(),
+            }
+        }
+
+        /// The proof a test's script covered exactly the conversation
+        /// the capture ran: once the capture has returned, every entry
+        /// must be consumed — a leftover means the capture under-ran
+        /// (a scripted command was never issued), and the test must
+        /// not pass over that.
+        fn assert_spent(&self) {
+            assert!(
+                self.script.is_empty(),
+                "the script was not fully consumed, {:?} left",
+                self.script
+            );
+        }
+    }
+
+    impl FocusApiConnection for ScriptedConnection {
+        async fn run_command(
+            &mut self,
+            command: &str,
+            _data: Option<&str>,
+        ) -> Result<String, RunCommandError> {
+            let (expected, response) = self
+                .script
+                .pop_front()
+                .expect("the script must cover every command the capture runs");
+
+            assert_eq!(command, expected, "the capture ran an unscripted command");
+
+            response
+        }
+    }
+
+    /// A partial-capture backup holding `captured` of the scripted
+    /// three-command capture list, as an interrupted capture leaves
+    /// one.
+    fn partial_of(captured: &[&str]) -> parsing::backup::DefyBackup {
+        let expected: Vec<String> = [
+            "keymap.custom",
+            "palette",
+            "mouse.speed",
+            "led.brightnessUG",
+        ]
+        .iter()
+        .map(|command| (*command).to_owned())
+        .collect();
+
+        let entries: Vec<parsing::backup::BackupCommand> = captured
+            .iter()
+            .map(|command| {
+                parsing::backup::BackupCommand::new((*command).to_owned(), String::new())
+            })
+            .collect();
+
+        parsing::backup::DefyBackup::partial_capture(entries, &expected)
+    }
+
+    #[tokio::test]
+    async fn create_backup_captures_the_whole_list_and_carries_no_marker() {
+        let mut connection = ScriptedConnection::full_capture();
+
+        let backup = capture_backup(&mut connection, &[]).await.unwrap();
+
+        // The entries in `help` order, the force-add last.
+        let commands: Vec<&str> = backup.backup.iter().map(|e| e.command.as_str()).collect();
+
+        assert_eq!(
+            commands,
+            [
+                "keymap.custom",
+                "palette",
+                "mouse.speed",
+                "led.brightnessUG"
+            ]
+        );
+
+        // The probes filled the identity fields, and no partial marker
+        // exists: a complete capture, byte-shaped like Bazecor's.
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(backup.neuron.id, "8ed7f33db024a5b5");
+        assert_eq!(
+            backup.neuron.device.as_ref().unwrap()["info"]["product"],
+            "Defy"
+        );
+        assert_eq!(backup.versions.bazecor.as_deref(), Some("v2.2.0"));
+        assert!(!backup.is_partial());
+        assert!(backup.partial.is_none());
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn create_backup_preserves_a_partial_when_a_command_fails() {
+        // The `mouse.speed` read fails: everything before it is kept,
+        // everything from it on is the missing list.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::failed("mouse.speed"),
+            ]
+            .into(),
+        };
+
+        let err = capture_backup(&mut connection, &[]).await.unwrap_err();
+
+        let CreateBackupError::IncompleteCapture { partial, source } = err else {
+            panic!("expected an interrupted capture, got {err:?}");
+        };
+
+        assert!(matches!(
+            source,
+            CaptureFailure::Command { ref command, .. } if command == "mouse.speed"
+        ));
+
+        // The partial holds exactly what was captured, and the marker
+        // names the rest of the capture list in order.
+        let commands: Vec<&str> = partial.backup.iter().map(|e| e.command.as_str()).collect();
+
+        assert_eq!(commands, ["keymap.custom", "palette"]);
+        assert_eq!(
+            partial.missing_commands(),
+            ["mouse.speed", "led.brightnessUG"]
+        );
+
+        // The probes never ran: empty identity, no descriptor.
+        assert_eq!(partial.neuron_id, "");
+        assert_eq!(partial.neuron.device, None);
+        assert_eq!(partial.versions, parsing::backup::BackupVersions::default());
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn create_backup_preserves_a_partial_when_a_probe_fails() {
+        // Every command captured, but the `version` probe dies: the
+        // file is still marked partial, with an empty missing list.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::failed("version"),
+            ]
+            .into(),
+        };
+
+        let err = capture_backup(&mut connection, &[]).await.unwrap_err();
+
+        let CreateBackupError::IncompleteCapture { partial, source } = err else {
+            panic!("expected an interrupted capture, got {err:?}");
+        };
+
+        assert!(matches!(source, CaptureFailure::Version(_)));
+        assert_eq!(partial.backup.len(), 4);
+        assert!(partial.is_partial());
+        assert!(!partial.partial.as_ref().unwrap().has_missing());
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn create_backup_help_failure_has_nothing_to_preserve() {
+        // `help` failing means no capture list and no captures: the
+        // plain error carries no partial, because there is nothing.
+        let mut connection = ScriptedConnection {
+            script: [ScriptedConnection::failed("help")].into(),
+        };
+
+        let err = capture_backup(&mut connection, &[]).await.unwrap_err();
+
+        assert!(matches!(err, CreateBackupError::ListCommands(_)));
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn complete_backup_captures_only_the_missing_commands() {
+        // A partial holding the first two commands of the four-command
+        // capture list. The completion script covers ONLY the missing
+        // two + the probes: a command the file holds is never re-read.
+        let partial = partial_of(&["keymap.custom", "palette"]);
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", "true"),
+            ]
+            .into(),
+        };
+
+        let backup = capture_backup(&mut connection, &partial.backup)
+            .await
+            .unwrap();
+
+        // Complete: the marker is gone, and the file's original
+        // entries kept their order with the recaptured ones appended.
+        let commands: Vec<&str> = backup.backup.iter().map(|e| e.command.as_str()).collect();
+
+        assert_eq!(
+            commands,
+            [
+                "keymap.custom",
+                "palette",
+                "mouse.speed",
+                "led.brightnessUG"
+            ]
+        );
+        assert!(!backup.is_partial());
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(
+            backup.neuron.device.as_ref().unwrap()["chipId"],
+            "8ed7f33db024a5b5"
+        );
+
+        // The file's original entries are verbatim; the recaptured
+        // ones carry the scripted responses.
+        assert_eq!(backup.backup[0].data, "");
+        assert_eq!(backup.backup[2].data, "20");
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn complete_backup_failure_yields_an_updated_partial() {
+        // The completion dies on `led.brightnessUG`: the updated
+        // partial holds the file's entries plus the one recapture, and
+        // the missing list shrank accordingly.
+        let partial = partial_of(&["keymap.custom", "palette"]);
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::failed("led.brightnessUG"),
+            ]
+            .into(),
+        };
+
+        let err = capture_backup(&mut connection, &partial.backup)
+            .await
+            .unwrap_err();
+
+        let CreateBackupError::IncompleteCapture { partial, source } = err else {
+            panic!("expected an interrupted capture, got {err:?}");
+        };
+
+        assert!(matches!(
+            source,
+            CaptureFailure::Command { ref command, .. } if command == "led.brightnessUG"
+        ));
+
+        let commands: Vec<&str> = partial.backup.iter().map(|e| e.command.as_str()).collect();
+
+        assert_eq!(commands, ["keymap.custom", "palette", "mouse.speed"]);
+        assert_eq!(partial.missing_commands(), ["led.brightnessUG"]);
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn complete_backup_of_a_marker_only_partial_runs_the_probes_only() {
+        // Probe-failure recovery: the original capture died at a probe
+        // with every command already in the file, so the marker's
+        // missing list is empty. Completion must run ZERO command
+        // reads — only the three probes — before the file is complete.
+        let partial = partial_of(&[
+            "keymap.custom",
+            "palette",
+            "mouse.speed",
+            "led.brightnessUG",
+        ]);
+
+        assert!(partial.is_partial());
+        assert!(!partial.partial.as_ref().unwrap().has_missing());
+
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", "true"),
+            ]
+            .into(),
+        };
+
+        let backup = capture_backup(&mut connection, &partial.backup)
+            .await
+            .unwrap();
+
+        connection.assert_spent();
+
+        // The probes alone completed it: the marker is gone, and the
+        // entries are exactly the file's, verbatim and in order.
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup, partial.backup);
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(
+            backup.neuron.device.as_ref().unwrap()["chipId"],
+            "8ed7f33db024a5b5"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_backup_recomputes_against_the_current_capture_list() {
+        // The device's `help` changed between the interrupted capture
+        // and the completion: `macros.map` is listed now (it was not
+        // in the original capture), and `mouse.speed` — the file's
+        // stale missing entry — is gone from `help`. The completion
+        // trusts the CURRENT list only: it captures `macros.map`,
+        // never re-reads `mouse.speed` (the script would reject the
+        // unscripted read), and the recomputed marker comes out empty.
+        let partial = partial_of(&["keymap.custom", "palette"]);
+
+        assert_eq!(
+            partial.missing_commands(),
+            ["mouse.speed", "led.brightnessUG"]
+        );
+
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", "keymap.custom\npalette\nmacros.map\n"),
+                ScriptedConnection::ok("macros.map", "4 1 2 3"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", "true"),
+            ]
+            .into(),
+        };
+
+        let backup = capture_backup(&mut connection, &partial.backup)
+            .await
+            .unwrap();
+
+        connection.assert_spent();
+
+        // The current capture list governed: the newly listed command
+        // was captured, the file's own entries kept their order, and
+        // nothing is missing against the list the device answers now.
+        let commands: Vec<&str> = backup.backup.iter().map(|e| e.command.as_str()).collect();
+
+        assert_eq!(
+            commands,
+            ["keymap.custom", "palette", "macros.map", "led.brightnessUG"]
+        );
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup[1].data, "");
+        assert_eq!(backup.backup[2].data, "4 1 2 3");
+    }
+
+    #[test]
+    fn restore_plan_refuses_a_partial_backup_and_the_override_plans_it() {
+        // A partial whose captured entries are the real-shaped backup:
+        // the default plan refuses it with the missing list; the
+        // explicit override plans exactly what the file holds (plus
+        // the `led.mode 0` tail).
+        let mut partial = real_ordered_backup();
+        partial.partial = Some(parsing::backup::PartialCapture {
+            missing: vec!["led.fade".to_owned()],
+        });
+
+        let err = DefyKeyboard::backup_restore_plan(&partial).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "the backup is a partial capture: 1 command(s) missing: led.fade"
+        );
+        assert!(matches!(err, BackupValidationError::PartialCapture { .. }));
+
+        let plan = DefyKeyboard::backup_restore_plan_allowing_partial(&partial).unwrap();
+
+        assert_eq!(plan.last().unwrap().command, "led.mode");
+        assert_eq!(plan.len(), real_ordered_backup().backup.len() + 1);
+    }
+
+    #[test]
+    fn a_partial_refusal_with_no_missing_commands_words_the_empty_case() {
+        // The empty-missing marker (a capture interrupted at the
+        // identity probes) must not render "0 command(s) missing: "
+        // with a dangling separator: the Display says why the list is
+        // empty instead.
+        let mut partial = real_ordered_backup();
+        partial.partial = Some(parsing::backup::PartialCapture {
+            missing: Vec::new(),
+        });
+
+        let err = DefyKeyboard::backup_restore_plan(&partial).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "the backup is a partial capture: the capture was interrupted \
+             after every command, before the backup could be assembled \
+             completely"
+        );
     }
 }

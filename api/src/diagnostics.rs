@@ -21,8 +21,8 @@ use std::path::Path;
 
 use dygma_cli::devices::conversions::{ConversionError, LayeredWireError, LayeredWireErrorKind};
 use dygma_cli::devices::defy::{
-    BackupEntryError, BackupValidationError, DefyKeymap, MacroMap, ParseKeymapError,
-    ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
+    BackupEntryError, BackupValidationError, CaptureFailure, DefyKeymap, MacroMap,
+    ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
 };
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::names::NeuronNameStore;
@@ -813,6 +813,46 @@ fn backup_validation_report_with_text(
     }
 }
 
+/// Builds the report for an interrupted `backup create`: the capture
+/// failure itself, plus the recovery story — the partial file that was
+/// saved, what it holds and misses, and how to complete or force it.
+/// `capture_context` is what was being attempted when the capture
+/// was interrupted ("capturing the backup from the Defy" for a fresh
+/// create, "completing the partial capture in <path>" for
+/// `--retry-missing`) — the caller computes it, so the story always
+/// matches the run that failed. A device failure has no source text to
+/// span, so this renders as the plain context chain.
+pub(super) fn interrupted_capture_report(
+    path: &Path,
+    partial: &DefyBackup,
+    source: CaptureFailure,
+    capture_context: String,
+) -> error_stack::Report<Error> {
+    let missing_line = match partial.missing_commands() {
+        [] => "the capture was interrupted after every command but before the \
+               backup could be assembled completely"
+            .to_owned(),
+        missing => format!("missing: {}", missing.join(", ")),
+    };
+
+    source
+        .into_report()
+        .change_context(Error)
+        .attach(capture_context)
+        .attach(format!(
+            "a PARTIAL capture was saved to {} ({} command(s) captured, {} missing)",
+            path.display(),
+            partial.backup.len(),
+            partial.missing_commands().len()
+        ))
+        .attach(missing_line)
+        .attach(
+            "`backup restore` refuses this file unless --allow-partial is passed; \
+             complete it with `dygma-cli backup create --retry-missing <file>` \
+             (the capture commands are reads, so this is safe)",
+        )
+}
+
 /// Locates a backup restore-validation failure in the raw JSON text.
 fn backup_validation_snippet(
     path: &Path,
@@ -835,6 +875,29 @@ fn backup_validation_snippet(
                     .to_owned(),
             ),
         },
+        BackupValidationError::PartialCapture { .. } => {
+            // The refusal's wording lives on the error type's Display
+            // (one source, including the empty-missing case); the
+            // snippet renders it verbatim.
+            let message = err.to_string();
+
+            ErrorSnippet {
+                code: "dygma-cli::backup::partial-capture",
+                message,
+                source_name: path.display().to_string(),
+                source_text: text.to_owned(),
+                span: locate_partial_marker(text).unwrap_or((0, 0)),
+                label: "this marker says the file was saved from a failed capture".to_owned(),
+                context,
+                help: Some(
+                    "restoring it would write a half-captured configuration to the \
+                     device — complete the capture first (`dygma-cli backup create \
+                     --retry-missing <file>`), re-capture, or pass `--allow-partial` \
+                     to restore what the file holds"
+                        .to_owned(),
+                ),
+            }
+        }
         BackupValidationError::InvalidEntry { command, source } => {
             let (span, label) = locate_data_value(text, command)
                 .map(|(start, len)| entry_span_and_label(&text[start..start + len], start, source))
@@ -1256,6 +1319,18 @@ fn locate_data_value(text: &str, command: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// The span of the backup JSON's top-level `partial` marker key — the
+/// thing the refusal is about. A plain first-occurrence search: the
+/// marker is a top-level key, and the only other place the exact
+/// `"partial"` byte sequence can occur is inside an opaque store
+/// string, where a misplaced highlight is cosmetic (the verdict never
+/// depends on the span).
+fn locate_partial_marker(text: &str) -> Option<(usize, usize)> {
+    let key = text.find("\"partial\"")?;
+
+    Some((key, "\"partial\"".len()))
+}
+
 /// The span (inside the quotes) of the JSON string value that follows
 /// the object key at `key`.
 fn json_string_value(text: &str, key: usize) -> Option<(usize, usize)> {
@@ -1420,6 +1495,31 @@ Error:
    ·                 ╰── 720 codes = 9 layers; a `keymap.custom` write carries exactly 800 = 10
    ╰────
   help: backups hold whole device maps — re-capture with `dygma-cli backup create`
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+
+    /// The exact no-color render for the partial-capture refusal
+    /// (golden): the span sits on the `partial` marker key, the
+    /// message names the missing commands, and the help names both
+    /// recovery paths (complete it, or `--allow-partial`).
+    const PARTIAL_REFUSAL_GOLDEN: &str = r#"dygma-cli::backup::partial-capture
+
+  × the backup is a partial capture: 2 command(s) missing: palette, colormap.map
+    ╭─[backup.json:34:3]
+ 33 │ ,
+ 34 │   "partial": { "missing": ["palette", "colormap.map"] }
+    ·   ────┬────
+    ·       ╰── this marker says the file was saved from a failed capture
+ 35 │ }
+    ╰────
+  help: restoring it would write a half-captured configuration to the device — complete the
+        capture first (`dygma-cli backup create --retry-missing <file>`), re-capture, or pass
+        `--allow-partial` to restore what the file holds
 
 Error: 
   × validating the backup in backup.json
@@ -1694,6 +1794,107 @@ Error:
         );
 
         assert_eq!(render_plain(&report), RAISE_GOLDEN);
+    }
+
+    /// Renders a backup carrying the partial-capture marker and pins
+    /// the exact no-color output: the span must sit on the marker key,
+    /// the message must name the missing commands, and the help must
+    /// name the completion and override paths.
+    #[test]
+    fn partial_capture_refusal_renders_the_marker() {
+        let mut text = backup_json("Defy", "Silver Defy", &keymap_wire(10));
+
+        // The interrupted-capture marker, as `backup create` writes it
+        // before the closing brace.
+        let marker = "  \"partial\": { \"missing\": [\"palette\", \"colormap.map\"] }\n";
+        text.insert_str(text.len() - 1, &format!(",\n{marker}"));
+
+        let backup: DefyBackup = serde_json::from_str::<DefyBackup>(&text).unwrap();
+        let report = backup_validation_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::defy::DefyKeyboard::backup_restore_plan(&backup).unwrap_err(),
+        );
+
+        let rendered = render_plain(&report);
+
+        // The marker is located, the missing list is the message, and
+        // the recovery paths are the help. Pinned exactly below.
+        assert_eq!(rendered, PARTIAL_REFUSAL_GOLDEN);
+    }
+
+    /// The interrupted-capture report renders as the plain context
+    /// chain (a device failure has no source text to span): the saved
+    /// path, the captured/missing counts, the missing list, and the
+    /// recovery paths, under the capture failure itself.
+    #[test]
+    fn interrupted_capture_report_carries_the_recovery_story() {
+        use dygma_cli::devices::defy::CaptureFailure;
+        use dygma_cli::focus_api::RunCommandError;
+
+        let expected: Vec<String> = ["keymap.custom", "palette", "mouse.speed"]
+            .iter()
+            .map(|command| (*command).to_owned())
+            .collect();
+        let captured = ["keymap.custom", "palette"]
+            .iter()
+            .map(|command| {
+                dygma_cli::focus_api::parsing::backup::BackupCommand::new(
+                    (*command).to_owned(),
+                    String::new(),
+                )
+            })
+            .collect();
+
+        let partial =
+            dygma_cli::focus_api::parsing::backup::DefyBackup::partial_capture(captured, &expected);
+
+        let report = interrupted_capture_report(
+            Path::new("backup.json"),
+            &partial,
+            CaptureFailure::Command {
+                command: "mouse.speed".to_owned(),
+                source: RunCommandError::ResponseStreamTerminatedPrematurely,
+            },
+            "capturing the backup from the Defy".to_owned(),
+        );
+
+        let rendered = render_plain(&report);
+
+        // The chain renders wrapped at the pinned width; the content
+        // assertions normalize the wrapping (including miette's `│`
+        // continuation markers) away — this report is the plain chain
+        // (no snippet), so the words are the whole story. The source
+        // renders like every source-chained error (the innermost
+        // reason as the headline, the full Display at the chain's
+        // end); the attachments carry the recovery story.
+        let flat = rendered
+            .split('│')
+            .flat_map(|part| part.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            flat.contains("response stream terminated while waiting for the response to complete")
+        );
+        assert!(flat.contains(
+            "failed to capture the `mouse.speed` response: response stream terminated \
+             while waiting for the response to complete"
+        ));
+
+        // The caller-supplied context is the run's only context frame:
+        // exactly once — a repeated frame would be a doubled headline,
+        // and a second, different one would contradict the run.
+        assert_eq!(
+            flat.matches("capturing the backup from the Defy").count(),
+            1
+        );
+        assert!(flat.contains(
+            "a PARTIAL capture was saved to backup.json (2 command(s) captured, 1 missing)"
+        ));
+        assert!(flat.contains("missing: mouse.speed"));
+        assert!(flat.contains("`backup restore` refuses this file unless --allow-partial"));
+        assert!(flat.contains("backup create --retry-missing <file>"));
     }
 
     /// Renders a backup whose `keymap.custom` entry holds nine layers

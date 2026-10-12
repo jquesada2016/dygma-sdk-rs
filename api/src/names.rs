@@ -185,6 +185,7 @@ mod tests {
                 "keymap.custom".to_owned(),
                 "41 30 31".to_owned(),
             )],
+            partial: None,
         }
     }
 

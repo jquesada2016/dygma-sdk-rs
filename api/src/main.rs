@@ -5,7 +5,9 @@ mod diagnostics;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dygma_cli::devices::conversions;
-use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
+use dygma_cli::devices::defy::{
+    CreateBackupError, DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap,
+};
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
 use dygma_cli::keycode_tables::{Blank, KeyKind};
@@ -942,10 +944,24 @@ enum BackupCommands {
     /// verbatim — capturing never writes to the keyboard, so it is
     /// safe to run at any time (e.g. before an apply). The file this
     /// writes loads into Bazecor's backup flow.
+    ///
+    /// If the capture is interrupted (the transport fails mid-way, or
+    /// an identity probe times out), a PARTIAL capture is still saved:
+    /// everything captured so far, marked with the commands it is
+    /// missing. `backup restore` refuses partial files unless
+    /// `--allow-partial` is passed; complete one with `--retry-missing`.
     Create {
         /// The path the backup JSON file will be saved to.
         #[clap(default_value = "backup.json")]
         path: PathBuf,
+        /// Complete a partial capture instead of capturing afresh: the
+        /// file at `path` must be a partial capture, and only the
+        /// commands it is missing are captured (they are reads, so
+        /// this is safe), merged into the file, which is then
+        /// rewritten complete. If the completion is itself
+        /// interrupted, the file is rewritten as the updated partial.
+        #[clap(long, default_value_t = false)]
+        retry_missing: bool,
     },
     /// Summarize a backup JSON file.
     ///
@@ -968,6 +984,13 @@ enum BackupCommands {
     /// sent last. Note the known Bluetooth limitation: large payloads
     /// fail over BLE, so restore wired or over RF.
     ///
+    /// A PARTIAL capture — a file `backup create` saved from an
+    /// interrupted run, marked `partial` — is refused: it does not
+    /// hold the whole captured state. Pass `--allow-partial` to restore
+    /// what the file holds anyway (the refused error and `--dry-run`
+    /// both name the missing commands), and prefer completing it first
+    /// with `backup create --retry-missing <file>`.
+    ///
     /// The backup's neuron object (its names) is applied to the names
     /// store under the connected device's `hardware.chip_id` after the
     /// device restore succeeds — names travel to the Neuron the backup
@@ -982,6 +1005,10 @@ enum BackupCommands {
         /// connection to the device.
         #[clap(long, default_value_t = false)]
         dry_run: bool,
+        /// Allow restoring a partial capture — a backup file carrying
+        /// the `partial` marker of an interrupted capture.
+        #[clap(long, default_value_t = false)]
+        allow_partial: bool,
         /// The path of the names store JSON file.
         ///
         /// Defaults to `$HOME/.dygma-sdk/names.json`.
@@ -1139,17 +1166,85 @@ fn describe_position_map(
 impl BackupCommands {
     async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
-            Self::Create { path } => {
+            Self::Create {
+                path,
+                retry_missing,
+            } => {
+                // The --retry-missing file check is fully offline and
+                // runs BEFORE the connection: a nonexistent, unparsable,
+                // or complete file fails without ever touching the
+                // device.
+                let partial = if retry_missing {
+                    let partial = read_json_file::<DefyBackup>(&path).await?;
+
+                    if !partial.is_partial() {
+                        return Err(Error
+                            .into_report()
+                            .attach(format!("completing the backup in {}", path.display()))
+                            .attach(
+                                "the file is not a partial capture: it carries no \
+                                 `partial` marker, so there is nothing to complete — \
+                                 run `backup create` without --retry-missing",
+                            ));
+                    }
+
+                    Some(partial)
+                } else {
+                    None
+                };
+
                 let mut defy = DefyKeyboard::new()
                     .await
                     .change_context(Error)
                     .attach("connecting to the Defy keyboard")?;
 
-                let backup = defy
-                    .create_backup()
-                    .await
-                    .change_context(Error)
-                    .attach("capturing the backup from the Defy")?;
+                // Typed first, report later: the interrupted-capture
+                // case carries the partial backup to save, and that
+                // payload only exists on the typed error.
+                let capture = if let Some(partial) = &partial {
+                    defy.complete_backup(partial).await
+                } else {
+                    defy.create_backup().await
+                };
+
+                let capture_context = if retry_missing {
+                    format!("completing the partial capture in {}", path.display())
+                } else {
+                    "capturing the backup from the Defy".to_owned()
+                };
+
+                let backup = match capture {
+                    Ok(backup) => backup,
+                    // The capture was interrupted: save the partial
+                    // capture it preserved — recoverable, never
+                    // mistaken for complete — and fail with the full
+                    // recovery story.
+                    Err(CreateBackupError::IncompleteCapture { partial, source }) => {
+                        // The partial save itself can fail (a full
+                        // disk, a bad path): the write error keeps the
+                        // capture story attached instead of discarding
+                        // it, so a double failure still narrates the
+                        // interrupted capture.
+                        if let Err(report) = safe_pretty_json_file(&*partial, &path).await {
+                            return Err(report
+                                .attach(format!("while saving the partial capture: {source}"))
+                                .attach(capture_context));
+                        }
+
+                        return Err(diagnostics::interrupted_capture_report(
+                            &path,
+                            &partial,
+                            source,
+                            capture_context,
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(err
+                            .into_report()
+                            .change_context(Error)
+                            .attach(capture_context));
+                    }
+                };
 
                 safe_pretty_json_file(&backup, &path).await?;
 
@@ -1160,6 +1255,9 @@ impl BackupCommands {
                     path.display()
                 );
 
+                // A success return never carries the partial marker
+                // (the capture core debug-asserts the invariant), so
+                // this output is always a complete capture's.
                 Ok(())
             }
             Self::Show { path } => {
@@ -1180,6 +1278,8 @@ impl BackupCommands {
 
                 println!("commands captured: {}", backup.backup.len());
 
+                describe_partial_capture(&backup, &path);
+
                 for entry in &backup.backup {
                     println!("  {} ({} bytes of data)", entry.command, entry.data.len());
                 }
@@ -1189,6 +1289,7 @@ impl BackupCommands {
             Self::Restore {
                 path,
                 dry_run,
+                allow_partial,
                 store,
             } => {
                 // Everything offline first: parse the file, validate the
@@ -1196,7 +1297,16 @@ impl BackupCommands {
                 // the device until all three succeeded.
                 let backup = read_json_file::<DefyBackup>(&path).await?;
 
-                let plan = match DefyKeyboard::backup_restore_plan(&backup) {
+                // A partial capture is refused by default; `--allow-partial`
+                // is the explicit acknowledgment that the file holds only
+                // part of a captured state.
+                let plan = if allow_partial {
+                    DefyKeyboard::backup_restore_plan_allowing_partial(&backup)
+                } else {
+                    DefyKeyboard::backup_restore_plan(&backup)
+                };
+
+                let plan = match plan {
                     Ok(plan) => plan,
                     Err(err) => {
                         return Err(diagnostics::backup_validation_report(&path, err));
@@ -1223,6 +1333,8 @@ impl BackupCommands {
                         );
                     }
 
+                    describe_partial_capture(&backup, &path);
+
                     println!("Dry run: nothing was sent, no device connection was opened.");
                     println!(
                         "On a real restore the backup's names are applied to the \
@@ -1232,6 +1344,15 @@ impl BackupCommands {
                     return Ok(());
                 }
 
+                // A real --allow-partial restore says what it is
+                // about to restore — and what it is not — before any
+                // device write: a partial capture's missing list
+                // prints here (a complete file prints nothing).
+                describe_partial_capture(&backup, &path);
+
+                // The device write itself: default restore refuses a
+                // partial capture (the plan above already validated
+                // the file under the caller's choice).
                 let mut defy = DefyKeyboard::new()
                     .await
                     .change_context(Error)
@@ -1261,8 +1382,17 @@ impl BackupCommands {
                     );
                 }
 
-                defy.restore_backup(&backup)
-                    .await
+                // The device write honors the caller's partial choice:
+                // the default refuses (already proven above, so this
+                // cannot fire for a non-partial failure), the override
+                // sends what the file holds.
+                let restore = if allow_partial {
+                    defy.restore_backup_allowing_partial(&backup).await
+                } else {
+                    defy.restore_backup(&backup).await
+                };
+
+                restore
                     .change_context(Error)
                     .attach_with(|| format!("restoring the backup in {}", path.display()))?;
 
@@ -1310,6 +1440,18 @@ impl BackupCommands {
                 };
 
                 describe_conversion_report(&report);
+
+                // The marker is data, not damage: the converted file
+                // keeps it (the conversion never adds the missing
+                // commands), so a converted partial stays unmistakable
+                // everywhere the file travels.
+                if let Some(partial) = &backup.partial {
+                    println!(
+                        "Warning: this backup is a PARTIAL capture ({} command(s) \
+                         missing); the converted file keeps the partial marker.",
+                        partial.missing.len()
+                    );
+                }
 
                 if dry_run {
                     println!("Dry run: nothing was written, no device connection was opened.");
@@ -1407,6 +1549,41 @@ fn describe_neuron_names(neuron: &parsing::backup::BackupNeuron) -> String {
             neuron.superkeys.len()
         ),
     }
+}
+
+/// Prints the partial-capture description of a backup file: the
+/// missing commands (or the why-none line for an empty missing list)
+/// and the two recovery paths. Shared by `backup show`, the
+/// `backup restore --dry-run` output, and the real `--allow-partial`
+/// restore — every path that acts on a partial file says exactly
+/// what it is missing first.
+fn describe_partial_capture(backup: &DefyBackup, path: &Path) {
+    let Some(partial) = &backup.partial else {
+        return;
+    };
+
+    println!(
+        "PARTIAL CAPTURE: this file was saved from an interrupted `backup create` \
+         and is missing {} command(s):",
+        partial.missing.len()
+    );
+
+    if partial.missing.is_empty() {
+        println!(
+            "  (none — the capture stopped after every command, before the \
+             backup could be assembled completely)"
+        );
+    } else {
+        for command in &partial.missing {
+            println!("  {command}");
+        }
+    }
+
+    println!(
+        "  Complete it with `backup create --retry-missing {}`, or pass \
+         --allow-partial to restore it anyway.",
+        path.display()
+    );
 }
 
 impl NamesCommands {
