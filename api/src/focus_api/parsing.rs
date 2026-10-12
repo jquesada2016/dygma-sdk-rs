@@ -8,6 +8,7 @@ pub mod macros;
 pub mod palette;
 pub mod settings;
 pub mod superkeys;
+pub mod wireless;
 
 /// The most specific expectation from a winnow context stack, for
 /// building a parse-failure message.

@@ -287,7 +287,8 @@ pub fn only_custom_command_data(value: bool) -> &'static str {
 }
 
 /// An on/off setting the firmware serves and accepts as the decimals
-/// `"1"` and `"0"`: `led.fade` and `idleleds.true_sleep`.
+/// `"1"` and `"0"`: `led.fade`, `idleleds.true_sleep`, and
+/// `wireless.battery.savingMode`.
 ///
 /// The first decimal token is the value; anything after the first
 /// separator is ignored, exactly like Bazecor's `parseInt` read of the

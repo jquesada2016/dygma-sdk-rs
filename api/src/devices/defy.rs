@@ -208,7 +208,11 @@ mod error {
     /// Error returned when reading one of the single-value identity or
     /// settings commands (`version`, `hardware.*`, `keymap.onlyCustom`,
     /// `settings.defaultLayer`, `qukeys.*`, `superkeys.*` timings,
-    /// `mouse.*`, `macros.memory`, `eeprom.contents`).
+    /// `mouse.*`, `macros.memory`, `eeprom.contents`) or one of the
+    /// wireless reads (`wireless.battery.{left,right}.{level,status}`,
+    /// `wireless.battery.savingMode`, `wireless.rf.power`,
+    /// `wireless.rf.channelHop`, `wireless.bluetooth.deviceName`,
+    /// `wireless.bluetooth.infoChannel`).
     #[derive(Debug, Display, From, Error)]
     pub enum GetSettingError {
         /// Failed to run the command.
@@ -217,6 +221,9 @@ mod error {
         /// The response could not be parsed.
         #[display("{_0}")]
         ParsingFailure(parsing::settings::ParseSettingsError),
+        /// A wireless command response could not be parsed.
+        #[display("{_0}")]
+        WirelessParsingFailure(parsing::wireless::ParseWirelessError),
     }
 
     /// Error returned when writing one of the single-value settings
@@ -537,6 +544,17 @@ impl DefyKeyboard {
     const IDLELEDS_WIRELESS_COMMAND_NAME: &str = "idleleds.wireless";
     const IDLELEDS_TRUE_SLEEP_COMMAND_NAME: &str = "idleleds.true_sleep";
     const IDLELEDS_TRUE_SLEEP_TIME_COMMAND_NAME: &str = "idleleds.true_sleep_time";
+    const WIRELESS_BATTERY_LEFT_LEVEL_COMMAND_NAME: &str = "wireless.battery.left.level";
+    const WIRELESS_BATTERY_RIGHT_LEVEL_COMMAND_NAME: &str = "wireless.battery.right.level";
+    const WIRELESS_BATTERY_LEFT_STATUS_COMMAND_NAME: &str = "wireless.battery.left.status";
+    const WIRELESS_BATTERY_RIGHT_STATUS_COMMAND_NAME: &str = "wireless.battery.right.status";
+    const WIRELESS_BATTERY_SAVING_MODE_COMMAND_NAME: &str = "wireless.battery.savingMode";
+    const WIRELESS_BATTERY_FORCE_READ_COMMAND_NAME: &str = "wireless.battery.forceRead";
+    const WIRELESS_RF_POWER_COMMAND_NAME: &str = "wireless.rf.power";
+    const WIRELESS_RF_CHANNEL_HOP_COMMAND_NAME: &str = "wireless.rf.channelHop";
+    const WIRELESS_RF_SYNC_PAIRING_COMMAND_NAME: &str = "wireless.rf.syncPairing";
+    const WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME: &str = "wireless.bluetooth.deviceName";
+    const WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME: &str = "wireless.bluetooth.infoChannel";
     /// The command Bazecor's restore sends after every backup entry
     /// (`noCacheCommand("led.mode 0")` in `Backup.ts`
     /// `restoreBackup`), switching the LEDs out of whatever state the
@@ -1325,6 +1343,247 @@ impl DefyKeyboard {
         .await
     }
 
+    /// Get one side's battery charge percentage
+    /// (`wireless.battery.left.level` / `wireless.battery.right.level`).
+    ///
+    /// The read hits the device every call — this SDK caches nothing —
+    /// which is the behavior Bazecor's battery poll needs (its
+    /// `noCacheCommand` reads). The commands are deny-listed from
+    /// backups (the `wireless.battery.left`/`right` prefixes in
+    /// `Backup.ts`), so no real capture exists; the value is typed as
+    /// the 0-100 percentage `FOCUS_API.md` documents, and a device
+    /// that answered outside that domain fails the read with the
+    /// value named instead of misreporting a charge. Wireless
+    /// commands are only served by wireless hardware
+    /// (`FOCUS_API.md`), so a wired Defy's firmware does not answer
+    /// them at all.
+    pub async fn get_battery_level(
+        &mut self,
+        side: parsing::wireless::BatterySide,
+    ) -> Result<parsing::wireless::BatteryLevel, GetSettingError> {
+        let command = match side {
+            parsing::wireless::BatterySide::Left => Self::WIRELESS_BATTERY_LEFT_LEVEL_COMMAND_NAME,
+            parsing::wireless::BatterySide::Right => {
+                Self::WIRELESS_BATTERY_RIGHT_LEVEL_COMMAND_NAME
+            }
+        };
+
+        self.get_wireless_setting(command).await
+    }
+
+    /// Get one side's battery status
+    /// (`wireless.battery.left.status` /
+    /// `wireless.battery.right.status`).
+    ///
+    /// The five documented codes are
+    /// [`BatteryStatus::Discharging`](parsing::wireless::BatteryStatus::Discharging),
+    /// [`Charging`](parsing::wireless::BatteryStatus::Charging),
+    /// [`Full`](parsing::wireless::BatteryStatus::Full),
+    /// [`Fault`](parsing::wireless::BatteryStatus::Fault), and
+    /// [`Disconnected`](parsing::wireless::BatteryStatus::Disconnected);
+    /// the firmware is also known to serve hex words in the wild,
+    /// which arrive as
+    /// [`BatteryStatus::Unknown`](parsing::wireless::BatteryStatus::Unknown)
+    /// with their parsed value — the same responses Bazecor's poll
+    /// collapses into one fatal-error state. Same evidence class as
+    /// [`DefyKeyboard::get_battery_level`].
+    pub async fn get_battery_status(
+        &mut self,
+        side: parsing::wireless::BatterySide,
+    ) -> Result<parsing::wireless::BatteryStatus, GetSettingError> {
+        let command = match side {
+            parsing::wireless::BatterySide::Left => Self::WIRELESS_BATTERY_LEFT_STATUS_COMMAND_NAME,
+            parsing::wireless::BatterySide::Right => {
+                Self::WIRELESS_BATTERY_RIGHT_STATUS_COMMAND_NAME
+            }
+        };
+
+        self.get_wireless_setting(command).await
+    }
+
+    /// Get whether the battery-saving mode is active
+    /// (`wireless.battery.savingMode` command). The firmware enables
+    /// it automatically at low charge; it can also be set manually.
+    pub async fn get_battery_saving_mode(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::OnOff>(
+            Self::WIRELESS_BATTERY_SAVING_MODE_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set the battery-saving mode (`wireless.battery.savingMode`
+    /// command).
+    ///
+    /// A write over the Bluetooth transport is subject to the upstream
+    /// BLE large-payload failure (issue #11) — prefer a wired or RF
+    /// connection for writes.
+    pub async fn set_battery_saving_mode(&mut self, enabled: bool) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_BATTERY_SAVING_MODE_COMMAND_NAME,
+            parsing::settings::on_off_command_data(enabled),
+        )
+        .await
+    }
+
+    /// Force the Neuron to re-read both sides' battery state
+    /// (`wireless.battery.forceRead` command).
+    ///
+    /// The command has no direct output (`FOCUS_API.md`); the sides'
+    /// level and status answers update a couple of seconds later, so
+    /// follow it with
+    /// [`DefyKeyboard::get_battery_level`] /
+    /// [`DefyKeyboard::get_battery_status`] — Bazecor's UI re-polls
+    /// immediately after sending it, retrying (up to five reads, 500 ms
+    /// apart) while a side still answers disconnected. No capture of
+    /// this command's response exists in any of Bazecor's data
+    /// sources, so no response shape is claimed here. Same write
+    /// caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn force_battery_read(&mut self) -> Result<(), RunCommandError> {
+        self.run_command(Self::WIRELESS_BATTERY_FORCE_READ_COMMAND_NAME, None)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Get the RF signal strength (`wireless.rf.power` command): how
+    /// strongly the Neuron talks to the sides. Lower means less range
+    /// and better battery life.
+    pub async fn get_rf_power(&mut self) -> Result<parsing::wireless::RfPower, GetSettingError> {
+        self.get_wireless_setting(Self::WIRELESS_RF_POWER_COMMAND_NAME)
+            .await
+    }
+
+    /// Set the RF signal strength (`wireless.rf.power` command).
+    ///
+    /// The three levels
+    /// ([`Low`](parsing::wireless::RfPower::Low) /
+    /// [`Medium`](parsing::wireless::RfPower::Medium) /
+    /// [`High`](parsing::wireless::RfPower::High)) are the documented
+    /// wire domain. Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_rf_power(
+        &mut self,
+        power: parsing::wireless::RfPower,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_RF_POWER_COMMAND_NAME,
+            power.to_command_data(),
+        )
+        .await
+    }
+
+    /// Get whether the RF link hops channels
+    /// (`wireless.rf.channelHop` command).
+    ///
+    /// The command is absent from `FOCUS_API.md` and from this
+    /// Bazecor's wireless UI (the view only reads it and writes the
+    /// value back), so the setting's observable semantics rest on the
+    /// command's name; the captured reads are a decimal `0` on real
+    /// devices and the bool word `false` on the app's virtual
+    /// keyboards — both parse.
+    pub async fn get_rf_channel_hop(&mut self) -> Result<bool, GetSettingError> {
+        self.get_wireless_setting::<parsing::wireless::RfChannelHop>(
+            Self::WIRELESS_RF_CHANNEL_HOP_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Set whether the RF link hops channels
+    /// (`wireless.rf.channelHop` command), as the decimal the real
+    /// devices read back. Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_rf_channel_hop(&mut self, enabled: bool) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_RF_CHANNEL_HOP_COMMAND_NAME,
+            parsing::wireless::rf_channel_hop_command_data(enabled),
+        )
+        .await
+    }
+
+    /// Re-sync the Neuron with both sides over the RF link
+    /// (`wireless.rf.syncPairing` command), rebuilding the shared
+    /// pairing identity.
+    ///
+    /// `FOCUS_API.md` documents the operation as usable only in wired
+    /// mode with all cables connected. The command has no direct
+    /// output; the shipped backups capture it as an empty response.
+    /// Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn sync_rf_pairing(&mut self) -> Result<(), RunCommandError> {
+        self.run_command(Self::WIRELESS_RF_SYNC_PAIRING_COMMAND_NAME, None)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Get the keyboard's Bluetooth device name
+    /// (`wireless.bluetooth.deviceName` command).
+    ///
+    /// The name travels on the wire unquoted and may be empty — every
+    /// shipped Defy backup captures the factory empty string. The
+    /// command is not in `FOCUS_API.md`; the read-and-write-verbatim
+    /// behavior is Bazecor's.
+    pub async fn get_bluetooth_device_name(
+        &mut self,
+    ) -> Result<parsing::wireless::DeviceName, GetSettingError> {
+        let res = self
+            .run_command(Self::WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME, None)
+            .await
+            .map_err(GetSettingError::CommandFailed)?;
+
+        Ok(parsing::wireless::DeviceName::new(res))
+    }
+
+    /// Set the keyboard's Bluetooth device name
+    /// (`wireless.bluetooth.deviceName` command), sent verbatim and
+    /// unquoted like Bazecor's write. How the firmware reads a
+    /// multi-word name back is unverified — no wireless firmware
+    /// source is in the local checkout, and `FOCUS_API.md` does not
+    /// document the command.
+    ///
+    /// An empty name writes an empty payload, which the firmware
+    /// answers as a read — a silent no-op, not a blank name. Same
+    /// write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_bluetooth_device_name(
+        &mut self,
+        name: &parsing::wireless::DeviceName,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME,
+            &name.to_command_data(),
+        )
+        .await
+    }
+
+    /// Read one of the five Bluetooth info channels
+    /// (`wireless.bluetooth.infoChannel <1..5>` command).
+    ///
+    /// The response is served verbatim, trimmed of the separator
+    /// whitespace a Focus response carries: Bazecor reads channels
+    /// 1-5, stores each answer as a raw string, and never renders or
+    /// interprets it, and no capture of any response exists in any of
+    /// its data sources — so this claims nothing about the content.
+    /// Same evidence class as
+    /// [`DefyKeyboard::get_bluetooth_device_name`].
+    pub async fn get_bluetooth_info_channel(
+        &mut self,
+        channel: parsing::wireless::BluetoothChannelId,
+    ) -> Result<String, GetSettingError> {
+        let res = self
+            .run_command(
+                Self::WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME,
+                Some(&channel.command_data()),
+            )
+            .await
+            .map_err(GetSettingError::CommandFailed)?;
+
+        Ok(res.trim().to_owned())
+    }
+
     /// Reset every plugin setting stored in the device's EEPROM to the
     /// erased state.
     ///
@@ -1655,6 +1914,18 @@ impl DefyKeyboard {
         read_setting::<T>(&mut self.focus_api, command).await
     }
 
+    /// Runs a single-value wireless command and parses its response —
+    /// [`DefyKeyboard::get_setting`] with the wireless parse-error
+    /// bound. Both it and [`DefyKeyboard::get_setting`] share the one
+    /// generic read helper ([`read_setting`]), which absorbs either
+    /// parser's error through `GetSettingError`'s `From` conversions.
+    async fn get_wireless_setting<T>(&mut self, command: &str) -> Result<T, GetSettingError>
+    where
+        T: std::str::FromStr<Err = parsing::wireless::ParseWirelessError>,
+    {
+        read_setting::<T>(&mut self.focus_api, command).await
+    }
+
     /// Runs a settings command with the given write data.
     async fn set_setting(&mut self, command: &str, data: &str) -> Result<(), SetSettingError> {
         self.run_command(command, Some(data)).await?;
@@ -1664,21 +1935,25 @@ impl DefyKeyboard {
 }
 
 /// Runs a single-value settings command over any connection and parses
-/// its response — [`DefyKeyboard::get_setting`]'s body, shared with
-/// the backup capture core so the probes read exactly one way.
+/// its response — [`DefyKeyboard::get_setting`]'s body, shared with the
+/// backup capture core and the wireless reads so every single-value
+/// command runs exactly one way. The parse error lands in
+/// [`GetSettingError`] through its `From` conversions, which cover
+/// every parse-error type the settings and wireless parsers produce.
 async fn read_setting<T>(
     connection: &mut impl FocusApiConnection,
     command: &str,
 ) -> Result<T, GetSettingError>
 where
-    T: std::str::FromStr<Err = parsing::settings::ParseSettingsError>,
+    T: std::str::FromStr,
+    T::Err: Into<GetSettingError>,
 {
     let res = connection
         .run_command(command, None)
         .await
         .map_err(GetSettingError::CommandFailed)?;
 
-    T::from_str(&res).map_err(GetSettingError::ParsingFailure)
+    T::from_str(&res).map_err(Into::into)
 }
 
 /// The capture core of [`DefyKeyboard::create_backup`] and
@@ -3028,6 +3303,93 @@ mod tests {
         let keymap = KEYMAP_DATA.parse::<DefyKeymap>().unwrap();
 
         (layer_data, keymap)
+    }
+
+    #[test]
+    fn wireless_command_spellings_match_the_wire() {
+        // The exact spellings Bazecor sends (`Wireless.tsx`,
+        // `BatteryStatus.tsx`) — the highest-risk strings in the
+        // wireless unit, pinned here because a typo'd command name
+        // would only fail on hardware otherwise.
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_LEFT_LEVEL_COMMAND_NAME,
+            "wireless.battery.left.level"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_RIGHT_LEVEL_COMMAND_NAME,
+            "wireless.battery.right.level"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_LEFT_STATUS_COMMAND_NAME,
+            "wireless.battery.left.status"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_RIGHT_STATUS_COMMAND_NAME,
+            "wireless.battery.right.status"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_SAVING_MODE_COMMAND_NAME,
+            "wireless.battery.savingMode"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BATTERY_FORCE_READ_COMMAND_NAME,
+            "wireless.battery.forceRead"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_RF_POWER_COMMAND_NAME,
+            "wireless.rf.power"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_RF_CHANNEL_HOP_COMMAND_NAME,
+            "wireless.rf.channelHop"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_RF_SYNC_PAIRING_COMMAND_NAME,
+            "wireless.rf.syncPairing"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME,
+            "wireless.bluetooth.deviceName"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME,
+            "wireless.bluetooth.infoChannel"
+        );
+    }
+
+    #[tokio::test]
+    async fn wireless_read_joins_command_spelling_response_and_parse_offline() {
+        // The unit's highest-risk join — the command spelled on the
+        // wire, the response served for it, the typed value parsed out
+        // — driven end-to-end over the scripted double, the same way
+        // the capture core is (the production command-name constants
+        // feed the same free read helper the methods use).
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("wireless.battery.left.level", "80 "),
+                ScriptedConnection::ok("wireless.rf.power", "2"),
+            ]
+            .into(),
+        };
+
+        let level: parsing::wireless::BatteryLevel = read_setting(
+            &mut connection,
+            DefyKeyboard::WIRELESS_BATTERY_LEFT_LEVEL_COMMAND_NAME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level.get(), 80);
+
+        let power: parsing::wireless::RfPower = read_setting(
+            &mut connection,
+            DefyKeyboard::WIRELESS_RF_POWER_COMMAND_NAME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(power, parsing::wireless::RfPower::High);
+
+        // Both scripted commands were actually issued, in order.
+        connection.assert_spent();
     }
 
     #[test]

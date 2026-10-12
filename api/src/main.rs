@@ -54,6 +54,15 @@ enum Cli {
     /// the brightness/idle/fade settings.
     #[command(subcommand)]
     Leds(LedsCommands),
+    /// Commands for working with the wireless side: the side batteries,
+    /// the RF link, and the Bluetooth identity.
+    ///
+    /// The battery level and status are live state, read here; the
+    /// persisted wireless settings (battery saving mode, RF power,
+    /// channel hop, the Bluetooth device name) ride
+    /// `settings get`/`settings set` like every other setting.
+    #[command(subcommand)]
+    Wireless(WirelessCommands),
     /// Commands for working with device backups.
     #[command(subcommand)]
     Backup(BackupCommands),
@@ -82,6 +91,7 @@ impl Cli {
             Self::Config(cmd) => cmd.perform().await,
             Self::Settings(cmd) => cmd.perform().await,
             Self::Leds(cmd) => cmd.perform().await,
+            Self::Wireless(cmd) => cmd.perform().await,
             Self::Backup(cmd) => cmd.perform().await,
             Self::Names { store, command } => command.perform(store.as_deref()).await,
             Self::KeyCode(cmd) => cmd.perform(),
@@ -623,6 +633,14 @@ enum ReadableSetting {
     TrueSleep,
     /// The true-sleep timeout, in seconds.
     TrueSleepTime,
+    /// Whether the battery-saving mode is active.
+    BatterySavingMode,
+    /// The RF signal strength (`0` low / `1` medium / `2` high).
+    RfPower,
+    /// Whether the RF link hops channels.
+    RfChannelHop,
+    /// The Bluetooth device name (possibly empty).
+    BluetoothDeviceName,
 }
 
 /// A single setting that can be written to the device.
@@ -682,6 +700,16 @@ enum WritableSetting {
     TrueSleep,
     /// The true-sleep timeout, in seconds.
     TrueSleepTime,
+    /// Whether the battery-saving mode is active (`1`/`0`/`true`/`false`).
+    BatterySavingMode,
+    /// The RF signal strength (`0` low / `1` medium / `2` high).
+    RfPower,
+    /// Whether the RF link hops channels (`1`/`0`/`true`/`false`).
+    RfChannelHop,
+    /// The Bluetooth device name (surrounding whitespace is trimmed,
+    /// so an all-whitespace value — like an empty one — writes
+    /// nothing: the firmware answers a data-less write as a read).
+    BluetoothDeviceName,
 }
 
 /// The products `config init` knows, as CLI arguments.
@@ -926,7 +954,10 @@ enum SettingsCommands {
         ///
         /// Numbers are plain decimals. `only-custom` accepts
         /// `1`/`0`/`true`/`false`. `default-layer` accepts a layer
-        /// number or `none`.
+        /// number or `none`. `battery-saving-mode` and
+        /// `rf-channel-hop` accept `1`/`0`/`true`/`false`, `rf-power`
+        /// accepts `0`/`1`/`2`, and `bluetooth-device-name` is sent
+        /// unquoted; surrounding whitespace is trimmed.
         value: String,
     },
     /// Resets every plugin setting stored in the device's EEPROM.
@@ -1202,6 +1233,30 @@ impl SettingsCommands {
                         .change_context(Error)
                         .attach("reading `idleleds.true_sleep_time` from the Defy")?
                         .to_string(),
+                    ReadableSetting::BatterySavingMode => defy
+                        .get_battery_saving_mode()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.battery.savingMode` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::RfPower => defy
+                        .get_rf_power()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.rf.power` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::RfChannelHop => defy
+                        .get_rf_channel_hop()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.rf.channelHop` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::BluetoothDeviceName => defy
+                        .get_bluetooth_device_name()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.bluetooth.deviceName` from the Defy")?
+                        .to_string(),
                 };
 
                 println!("{value}");
@@ -1219,13 +1274,32 @@ impl SettingsCommands {
                     .change_context(Error)
                     .attach("connecting to the Defy keyboard")?;
 
+                let command_name = write.command_name();
+
+                // An empty device name writes an empty payload, which
+                // the firmware answers as a read — a silent no-op, not
+                // a blank name, so "Wrote" would overstate it. The
+                // check runs before `apply` because the write is
+                // consumed by it.
+                let answered_as_read = matches!(
+                    &write,
+                    SettingWrite::BluetoothDeviceName(name) if name.as_str().is_empty()
+                );
+
                 write
                     .apply(&mut defy)
                     .await
                     .change_context(Error)
                     .attach("writing the setting to the Defy")?;
 
-                println!("Wrote `{}` to the Defy.", write.command_name());
+                if answered_as_read {
+                    println!(
+                        "Sent `{command_name}` with an empty payload; the firmware \
+                         answers an empty name as a read, not a blank name."
+                    );
+                } else {
+                    println!("Wrote `{command_name}` to the Defy.");
+                }
 
                 Ok(())
             }
@@ -1556,6 +1630,162 @@ impl LedsCommands {
 /// 255 long before 255 × 100.
 fn brightness_percent(brightness: u8) -> u16 {
     (u16::from(brightness) * 100 + 127) / 255
+}
+
+/// The wireless commands: the live side-battery state, and the two
+/// wireless actions. The persisted wireless settings ride
+/// `settings get`/`settings set`, exactly like the LED settings do.
+#[derive(Subcommand)]
+enum WirelessCommands {
+    /// Reads both sides' battery level and status, the battery-saving
+    /// mode, the RF power and channel hop, the Bluetooth device name,
+    /// and the five Bluetooth info channels.
+    ///
+    /// Like `leds status`, the reads run in sequence and the first
+    /// failure fails the command — there is no partial output. A wired
+    /// Defy serves none of these commands (`FOCUS_API.md`: wireless
+    /// commands enumerate on wireless hardware only), so on wired
+    /// hardware this fails at the first read.
+    Status,
+    /// Forces the Neuron to re-read both sides' battery state
+    /// (`wireless.battery.forceRead`). The sides' answers update a
+    /// couple of seconds later; run `wireless status` again after
+    /// that wait. (Bazecor's UI re-polls immediately and retries —
+    /// up to five reads, 500 ms apart, while a side still answers
+    /// disconnected.)
+    ForceBatteryRead,
+    /// Re-syncs the Neuron with both sides over the RF link
+    /// (`wireless.rf.syncPairing`), rebuilding the shared pairing
+    /// identity. `FOCUS_API.md` documents the operation as usable only
+    /// in wired mode with all cables connected.
+    SyncPairing,
+}
+
+impl WirelessCommands {
+    async fn perform(self) -> Result<(), error_stack::Report<Error>> {
+        match self {
+            Self::Status => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                // The `leds status` shape: every read runs to
+                // completion before the first print, so a mid-sequence
+                // failure leaves no partial output on stdout.
+                let mut batteries = Vec::new();
+                for side in [
+                    parsing::wireless::BatterySide::Left,
+                    parsing::wireless::BatterySide::Right,
+                ] {
+                    let level = defy
+                        .get_battery_level(side)
+                        .await
+                        .change_context(Error)
+                        .attach_with(|| {
+                            format!("reading `wireless.battery.{side}.level` from the Defy")
+                        })?;
+                    let status = defy
+                        .get_battery_status(side)
+                        .await
+                        .change_context(Error)
+                        .attach_with(|| {
+                            format!("reading `wireless.battery.{side}.status` from the Defy")
+                        })?;
+
+                    batteries.push((side, level, status));
+                }
+
+                let saving_mode = defy
+                    .get_battery_saving_mode()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.battery.savingMode` from the Defy")?;
+                let rf_power = defy
+                    .get_rf_power()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.rf.power` from the Defy")?;
+                let channel_hop = defy
+                    .get_rf_channel_hop()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.rf.channelHop` from the Defy")?;
+                let device_name = defy
+                    .get_bluetooth_device_name()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.bluetooth.deviceName` from the Defy")?;
+
+                let mut info_channels = Vec::new();
+                for channel in parsing::wireless::BluetoothChannelId::ALL {
+                    let info = defy
+                        .get_bluetooth_info_channel(channel)
+                        .await
+                        .change_context(Error)
+                        .attach_with(|| {
+                            format!(
+                                "reading `wireless.bluetooth.infoChannel {}` from the Defy",
+                                channel.get()
+                            )
+                        })?;
+
+                    info_channels.push((channel, info));
+                }
+
+                for (side, level, status) in batteries {
+                    println!("battery {side}: {}% ({})", level, status.description());
+                }
+                println!("battery saving mode: {saving_mode}");
+                println!("rf power: {rf_power} ({})", rf_power.description());
+                println!("rf channel hop: {channel_hop}");
+                println!("bluetooth device name: {device_name}");
+                for (channel, info) in info_channels {
+                    println!("bluetooth info channel {}: {info}", channel.get());
+                }
+
+                Ok(())
+            }
+            Self::ForceBatteryRead => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                defy.force_battery_read()
+                    .await
+                    .change_context(Error)
+                    .attach("sending `wireless.battery.forceRead` to the Defy")?;
+
+                println!(
+                    "Sent `wireless.battery.forceRead`; the sides' battery \
+                     answers update in a couple of seconds — run \
+                     `wireless status` again then."
+                );
+
+                Ok(())
+            }
+            Self::SyncPairing => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                defy.sync_rf_pairing()
+                    .await
+                    .change_context(Error)
+                    .attach("sending `wireless.rf.syncPairing` to the Defy")?;
+
+                println!(
+                    "Sent `wireless.rf.syncPairing` to the Defy; \
+                     `FOCUS_API.md` documents the operation as \
+                     rebuilding the shared RF pairing identity."
+                );
+
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Describes a seconds value in whole minutes, for `leds status`.
@@ -2493,7 +2723,10 @@ async fn save_names_store(
 
 /// A parsed setting write: the value has been validated from its
 /// command-line string, and only the device round-trip remains.
-#[derive(Clone, Copy, Debug)]
+/// (`Copy` was dropped when the wireless writes joined: the device
+/// name carries a `String`, and each write is consumed exactly once
+/// anyway.)
+#[derive(Clone, Debug)]
 enum SettingWrite {
     OnlyCustom(bool),
     DefaultLayer(parsing::settings::DefaultLayer),
@@ -2522,6 +2755,10 @@ enum SettingWrite {
     IdleLedsWireless(u16),
     TrueSleep(bool),
     TrueSleepTime(u16),
+    BatterySavingMode(bool),
+    RfPower(parsing::wireless::RfPower),
+    RfChannelHop(bool),
+    BluetoothDeviceName(parsing::wireless::DeviceName),
 }
 
 /// Parses a setting write from its command-line value string. This
@@ -2666,6 +2903,24 @@ fn parse_setting_write(
                 .change_context(Error)
                 .attach("parsing the value; expected seconds")?,
         ),
+        WritableSetting::BatterySavingMode => SettingWrite::BatterySavingMode(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::RfPower => SettingWrite::RfPower(
+            parse_rf_power_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 0 (low), 1 (medium), or 2 (high)")?,
+        ),
+        WritableSetting::RfChannelHop => SettingWrite::RfChannelHop(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::BluetoothDeviceName => {
+            SettingWrite::BluetoothDeviceName(parsing::wireless::DeviceName::new(value))
+        }
     };
 
     Ok(write)
@@ -2702,6 +2957,10 @@ impl SettingWrite {
             Self::IdleLedsWireless(_) => "idleleds.wireless",
             Self::TrueSleep(_) => "idleleds.true_sleep",
             Self::TrueSleepTime(_) => "idleleds.true_sleep_time",
+            Self::BatterySavingMode(_) => "wireless.battery.savingMode",
+            Self::RfPower(_) => "wireless.rf.power",
+            Self::RfChannelHop(_) => "wireless.rf.channelHop",
+            Self::BluetoothDeviceName(_) => "wireless.bluetooth.deviceName",
         }
     }
 
@@ -2843,8 +3102,33 @@ impl SettingWrite {
                 .await
                 .change_context(Error)
                 .attach("writing `idleleds.true_sleep_time` to the Defy"),
+            Self::BatterySavingMode(value) => defy
+                .set_battery_saving_mode(value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.battery.savingMode` to the Defy"),
+            Self::RfPower(value) => defy
+                .set_rf_power(value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.rf.power` to the Defy"),
+            Self::RfChannelHop(value) => defy
+                .set_rf_channel_hop(value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.rf.channelHop` to the Defy"),
+            Self::BluetoothDeviceName(value) => defy
+                .set_bluetooth_device_name(&value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.bluetooth.deviceName` to the Defy"),
         }
     }
+}
+
+/// Parses an RF power level from a `0`/`1`/`2` value string.
+fn parse_rf_power_value(value: &str) -> Result<parsing::wireless::RfPower, Error> {
+    value.parse().map_err(|_| Error)
 }
 
 /// Parses a u8 from a value string.
