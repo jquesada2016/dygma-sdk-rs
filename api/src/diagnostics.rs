@@ -19,6 +19,7 @@ use std::fmt;
 use std::io::IsTerminal;
 use std::path::Path;
 
+use dygma_cli::devices::conversions::{ConversionError, LayeredWireError, LayeredWireErrorKind};
 use dygma_cli::devices::defy::{
     BackupEntryError, BackupValidationError, DefyKeymap, MacroMap, ParseKeymapError,
     ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
@@ -925,6 +926,199 @@ fn wire_failure(source: &BackupEntryError) -> Option<(WireFormat, usize, bool)> 
 }
 
 // =====================================================================================
+// Cross-product conversion failures
+// =====================================================================================
+
+/// Builds the report for a backup that failed cross-product
+/// conversion, with the located snippet attached. The raw file text is
+/// re-read here because this is where the path is at hand; when it
+/// cannot be read, the diagnostic renders without a snippet.
+pub(super) fn conversion_report(path: &Path, err: ConversionError) -> error_stack::Report<Error> {
+    let text = std::fs::read_to_string(path).ok();
+
+    conversion_report_with_text(path, text.as_deref(), err)
+}
+
+/// Builds the conversion-failure report from file text the caller
+/// already holds, so it can be exercised without touching the
+/// filesystem; when the text is unavailable, the diagnostic renders
+/// without a snippet.
+fn conversion_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: ConversionError,
+) -> error_stack::Report<Error> {
+    let context_line = format!("converting the backup in {}", path.display());
+    let report = err
+        .clone()
+        .into_report()
+        .change_context(Error)
+        .attach(context_line.clone());
+
+    match text {
+        Some(text) => {
+            report.attach_opaque(conversion_snippet(path, text, &err, vec![context_line]))
+        }
+        None => report,
+    }
+}
+
+/// Locates a conversion failure in the raw backup JSON text.
+fn conversion_snippet(
+    path: &Path,
+    text: &str,
+    err: &ConversionError,
+    context: Vec<String>,
+) -> ErrorSnippet {
+    match err {
+        ConversionError::MissingDescriptor | ConversionError::NoProductName => ErrorSnippet {
+            code: "dygma-cli::backup-convert::no-product",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: (0, 0),
+            label: "this backup's neuron object carries no usable device descriptor".to_owned(),
+            context,
+            help: Some(
+                "a convertible backup must name its product in \
+                 `neuron.device.info.product`, the field Bazecor's own \
+                 restore switches its conversions on"
+                    .to_owned(),
+            ),
+        },
+        ConversionError::UnknownProduct { product } => ErrorSnippet {
+            code: "dygma-cli::backup-convert::unknown-product",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, product).unwrap_or((0, 0)),
+            label: format!("this backup names the unknown product `{product}`"),
+            context,
+            help: Some(supported_conversions_help().to_owned()),
+        },
+        ConversionError::UnsupportedConversion { from, to } => ErrorSnippet {
+            code: "dygma-cli::backup-convert::unsupported",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, from.name()).unwrap_or((0, 0)),
+            label: format!("this backup was captured from a `{from}`"),
+            context,
+            help: Some(format!(
+                "{}, so a {from} → {to} conversion needs its own mapping work",
+                supported_conversions_help()
+            )),
+        },
+        ConversionError::SameProduct { product } => ErrorSnippet {
+            code: "dygma-cli::backup-convert::same-product",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, product.name()).unwrap_or((0, 0)),
+            label: format!("this backup is already a `{product}` backup"),
+            context,
+            help: Some(supported_conversions_help().to_owned()),
+        },
+        ConversionError::MissingCommand { .. } => {
+            // The command is absent — there is nothing in the file to
+            // point at, so the diagnostic renders without a span.
+            ErrorSnippet {
+                code: "dygma-cli::backup-convert::missing-command",
+                message: err.to_string(),
+                source_name: path.display().to_string(),
+                source_text: text.to_owned(),
+                span: (0, 0),
+                label: "converting needs this captured command".to_owned(),
+                context,
+                help: Some(
+                    "a convertible backup must carry `keymap.custom`, \
+                     `colormap.map`, and `palette`; re-capture it with \
+                     `dygma-cli backup create` or in Bazecor"
+                        .to_owned(),
+                ),
+            }
+        }
+        ConversionError::DuplicateCommand { command, count } => {
+            // The multiplicity is the story, and it spans the whole
+            // capture list — there is no single byte to highlight, so
+            // the diagnostic renders without a span.
+            ErrorSnippet {
+                code: "dygma-cli::backup-convert::duplicate-command",
+                message: err.to_string(),
+                source_name: path.display().to_string(),
+                source_text: text.to_owned(),
+                span: (0, 0),
+                label: format!("the backup captures `{command}` {count} times"),
+                context,
+                help: Some(
+                    "a later duplicate would survive the conversion \
+                     unconverted (Bazecor's conversion takes the first \
+                     and silently drops the rest); remove the stale \
+                     duplicate or re-capture"
+                        .to_owned(),
+                ),
+            }
+        }
+        ConversionError::InvalidEntry { command, source } => {
+            let data_start = locate_data_value(text, command)
+                .map(|(start, _)| start)
+                .unwrap_or(0);
+            let (span, label) = entry_error_span_and_label(data_start, source);
+
+            // The `data` value is one huge line; show an excerpt
+            // around the span instead of the whole line.
+            let (source_text, span) = excerpt(text, span.0, span.1);
+
+            ErrorSnippet {
+                code: "dygma-cli::backup-convert::invalid-entry",
+                message: format!("the `{command}` entry is not convertible: {source}"),
+                source_name: format!("{} — `{command}` `data` (excerpt)", path.display()),
+                source_text,
+                span,
+                label,
+                context,
+                help: Some(
+                    "converting rewrites the entry into the target product's \
+                     layer shape, so the entry must hold the source product's \
+                     shape exactly"
+                        .to_owned(),
+                ),
+            }
+        }
+    }
+}
+
+/// The supported-conversions sentence shared by the product-shaped
+/// diagnostics.
+fn supported_conversions_help() -> &'static str {
+    "the supported conversions are Defy → Sonsei and Sonsei → Defy"
+}
+
+/// The span and label for a converted entry whose data failed the
+/// shape check, based at `data_start` (the beginning of the entry's
+/// `data` value in the file).
+fn entry_error_span_and_label(
+    data_start: usize,
+    source: &LayeredWireError,
+) -> ((usize, usize), String) {
+    match &source.kind {
+        LayeredWireErrorKind::TokenNotANumber { offset, token } => (
+            (data_start + offset, token.len()),
+            format!("`{token}` is not a number"),
+        ),
+        LayeredWireErrorKind::TokenOutOfRange { offset, token, max } => (
+            (data_start + offset, token.len()),
+            format!("`{token}` exceeds the {max} ceiling"),
+        ),
+        LayeredWireErrorKind::WrongValueCount { found, expected } => (
+            // No single token to point at — the counts are the story.
+            (data_start, 0),
+            format!("the data holds {found} values, not {expected}"),
+        ),
+    }
+}
+
+// =====================================================================================
 // Text-location helpers
 // =====================================================================================
 
@@ -1208,6 +1402,12 @@ Error:
 Error: 
   × something went wrong running the command
 "#;
+
+    /// The exact no-color render for the UNSUPPORTED_CONVERSION_GOLDEN (golden).
+    const UNSUPPORTED_CONVERSION_GOLDEN: &str = "dygma-cli::backup-convert::unsupported\n\n  × there is no conversion from Raise to Defy\n    ╭─[backup.json:12:21]\n 11 │         \"vendor\": \"Dygma\",\n 12 │         \"product\": \"Raise\",\n    ·                     ──┬──\n    ·                       ╰── this backup was captured from a `Raise`\n 13 │         \"keyboardType\": \"wireless\",\n    ╰────\n  help: the supported conversions are Defy → Sonsei and Sonsei → Defy, so a Raise → Defy\n        conversion needs its own mapping work\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
+
+    /// The exact no-color render for the CONVERSION_SHAPE_GOLDEN (golden).
+    const CONVERSION_SHAPE_GOLDEN: &str = "dygma-cli::backup-convert::invalid-entry\n\n  × the `keymap.custom` entry is not convertible: expected 10 layers of 60 values, the data holds\n  │ 800 values, not 600\n   ╭─[backup.json — `keymap.custom` `data` (excerpt):2:44]\n 1 │ \"backup\": [\n 2 │     { \"command\": \"keymap.custom\", \"data\": \"41 30 31 32 33 34 35 0 0 51518 37 38 39 45 46 42 43 20 \n   ·                                            ▲\n   ·                                            ╰── the data holds 800 values, not 600\n   ╰────\n  help: converting rewrites the entry into the target product's layer shape, so the entry must\n        hold the source product's shape exactly\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
 
     /// The exact no-color render for the nine failure (golden).
     const NINE_GOLDEN: &str = r#"dygma-cli::backup::invalid-entry
@@ -1510,6 +1710,75 @@ Error:
         );
 
         assert_eq!(render_plain(&report), NINE_GOLDEN);
+    }
+
+    /// Renders a Raise backup that `backup convert` cannot target and
+    /// pins the exact no-color output: the span must sit on the
+    /// product value, and the help must name the supported pairs.
+    #[test]
+    fn unsupported_conversion_renders_the_product_value() {
+        let text = backup_json("Raise", "Silver Raise", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = conversion_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::conversions::convert_backup(
+                &backup,
+                dygma_cli::devices::conversions::Product::Defy,
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), UNSUPPORTED_CONVERSION_GOLDEN);
+    }
+
+    /// Renders a backup claiming to be a Sonsei capture but carrying a
+    /// Defy-sized keymap, and pins the exact no-color output: the
+    /// label must state the found/expected counts.
+    #[test]
+    fn conversion_shape_failure_renders_the_counts() {
+        // A complete Sonsei-shaped capture except the keymap, which
+        // holds Defy-sized (800-token) data: the shape failure is the
+        // story, so the colormap and palette must be convertible.
+        let palette = std::iter::repeat_n(("1", "2", "3"), 16)
+            .flat_map(|(r, g, b)| [r, g, b])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let colormap = std::iter::repeat_n("0", 560).collect::<Vec<_>>().join(" ");
+        let text = format!(
+            r#"{{
+  "neuronID": "7f6a7facc35abff3",
+  "neuron": {{
+    "id": "7f6a7facc35abff3",
+    "name": "Dygman's Sonsei",
+    "layers": [],
+    "macros": [],
+    "superkeys": [],
+    "device": {{ "info": {{ "vendor": "Dygma", "product": "Sonsei" }} }}
+  }},
+  "versions": {{ "bazecor": "v1.0.0-beta.2" }},
+  "backup": [
+    {{ "command": "keymap.custom", "data": "{}" }},
+    {{ "command": "colormap.map", "data": "{}" }},
+    {{ "command": "palette", "data": "{}" }}
+  ]
+}}"#,
+            keymap_wire(10),
+            colormap,
+            palette
+        );
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = conversion_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::conversions::convert_backup(
+                &backup,
+                dygma_cli::devices::conversions::Product::Defy,
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), CONVERSION_SHAPE_GOLDEN);
     }
 
     /// A backup's `macros.map` entry with a value that is a valid u16

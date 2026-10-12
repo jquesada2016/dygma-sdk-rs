@@ -4,6 +4,7 @@ extern crate derive_more;
 mod diagnostics;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use dygma_cli::devices::conversions;
 use dygma_cli::devices::defy::{DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap};
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
@@ -987,6 +988,152 @@ enum BackupCommands {
         #[clap(long, global = true)]
         store: Option<PathBuf>,
     },
+    /// Convert a backup JSON file between product wire shapes.
+    ///
+    /// Rewrites the three product-shaped captured commands
+    /// (`keymap.custom`, `colormap.map`, `palette`) from the backup's
+    /// product into the target's — exactly the three commands
+    /// Bazecor's restore-time conversion rewrites — leaves every other
+    /// captured command verbatim, and replaces the backup's device
+    /// descriptor with the target product's. A backup converted to the
+    /// Defy passes `backup restore` unchanged; a backup converted to
+    /// the Sonsei is for Bazecor's restore flow — this SDK restores
+    /// Defy backups only. The Sonsei → Defy direction is an SDK
+    /// extension (Bazecor blind-restores that pair, writing
+    /// 60-position keymap layers to a Defy).
+    ///
+    /// This is fully offline — it never opens a device connection —
+    /// and it prints the mapping report: which positions mapped 1:1,
+    /// which were defaulted (to transparent, or palette color 0), and
+    /// which source positions nothing reads, so nothing is ever
+    /// silently guessed. Converting onto the Defy re-enters the keymap
+    /// through the exactly-10-layer type, so the output is a valid
+    /// `keymap.custom` write by construction.
+    Convert {
+        /// The path of the backup JSON file, captured from any product
+        /// Bazecor backs up.
+        path: PathBuf,
+        /// The product to convert the backup into.
+        #[clap(long)]
+        to: ConvertTarget,
+        /// The path the converted backup JSON file is written to.
+        #[clap(long, required_unless_present = "dry_run")]
+        out: Option<PathBuf>,
+        /// Print the mapping report without writing any file.
+        #[clap(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+/// The products `backup convert` can target, as CLI arguments.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConvertTarget {
+    /// The Dygma Defy (the only product this SDK talks to).
+    Defy,
+    /// The Dygma Sonsei.
+    Sonsei,
+}
+
+impl From<ConvertTarget> for conversions::Product {
+    fn from(target: ConvertTarget) -> Self {
+        match target {
+            ConvertTarget::Defy => Self::Defy,
+            ConvertTarget::Sonsei => Self::Sonsei,
+        }
+    }
+}
+
+/// Prints the conversion's mapping report: which positions mapped 1:1,
+/// which were defaulted, and which source positions nothing reads.
+fn describe_conversion_report(report: &conversions::ConversionReport) {
+    println!("Conversion: {} → {}.", report.from, report.to);
+
+    describe_position_map(
+        "keymap.custom",
+        "positions",
+        &report.keymap,
+        &report.normalized_padding,
+    );
+    describe_position_map("colormap.map", "LEDs", &report.colormap, &[]);
+
+    println!(
+        "palette: {} colors, {}.",
+        conversions::PALETTE_COLORS,
+        report.palette
+    );
+
+    println!(
+        "{} other captured commands pass through verbatim.",
+        report.passthrough_commands
+    );
+
+    println!(
+        "The backup's device descriptor is replaced with the {} descriptor.",
+        report.to
+    );
+}
+
+/// Prints one position-mapping summary of a conversion report.
+/// `normalized_padding` names defaulted positions the output rewrote —
+/// Defy wire-padding slots the keymap type does not model, which
+/// serialize as `0` instead of the table's default value — so the
+/// printed report states exactly what the output file holds.
+fn describe_position_map(
+    name: &str,
+    noun: &str,
+    map: &conversions::PositionMapReport,
+    normalized_padding: &[u16],
+) {
+    println!(
+        "{name}: {} layers × {} {noun} (from {} per layer)",
+        map.layers, map.target_positions, map.source_positions
+    );
+
+    println!("  {} mapped 1:1 per layer", map.mapped_per_layer());
+
+    let defaulted = map.defaulted_positions();
+    let kind = match map.default_value {
+        conversions::DefaultValue::Transparent => "transparent",
+        conversions::DefaultValue::FirstPaletteColor => "palette color 0",
+    };
+
+    println!(
+        "  {} defaulted to {} ({kind}) per layer{}",
+        defaulted.len(),
+        map.default_value.value(),
+        if defaulted.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {}",
+                defaulted
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        }
+    );
+
+    if !normalized_padding.is_empty() {
+        println!(
+            "  note: {} of the defaulted positions per layer are Defy \
+             wire-padding slots the keymap type does not model; the \
+             output writes them as 0, not {}: {}",
+            normalized_padding.len(),
+            map.default_value.value(),
+            normalized_padding
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    println!(
+        "  {} source positions dropped per layer (no target position reads them)",
+        map.dropped_sources.len()
+    );
 }
 
 impl BackupCommands {
@@ -1144,6 +1291,38 @@ impl BackupCommands {
                         backup.neuron_id
                     );
                 }
+
+                Ok(())
+            }
+            Self::Convert {
+                path,
+                to,
+                out,
+                dry_run,
+            } => {
+                // Fully offline: parse the file and convert it — no
+                // device connection is ever opened.
+                let backup = read_json_file::<DefyBackup>(&path).await?;
+
+                let (converted, report) = match conversions::convert_backup(&backup, to.into()) {
+                    Ok(result) => result,
+                    Err(err) => return Err(diagnostics::conversion_report(&path, err)),
+                };
+
+                describe_conversion_report(&report);
+
+                if dry_run {
+                    println!("Dry run: nothing was written, no device connection was opened.");
+
+                    return Ok(());
+                }
+
+                let out = out
+                    .unwrap_or_else(|| unreachable!("clap requires --out unless --dry-run is set"));
+
+                safe_pretty_json_file(&converted, &out).await?;
+
+                println!("Converted backup written to {}.", out.display());
 
                 Ok(())
             }
