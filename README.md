@@ -10,11 +10,8 @@ Currently, only the Defy is supported, but adding support for the Raise 1 and 2
 is easy, though testing would not be, as I only have the Defy.
 
 All connection methods are supported, including wired, wireless over
-RF, and wireless over Bluetooth LE.
-
-**Note**: Currently, sending large data payloads to the Defy is failing over
-BLE, so try to avoid commands while connected over it until this message is
-removed.
+RF, and wireless over Bluetooth LE — with full large-payload transfers
+(keymaps, backups, colormaps) working over all of them.
 
 # Project structure
 
