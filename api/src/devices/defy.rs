@@ -258,63 +258,116 @@ mod error {
         /// from.
         #[display("failed to list the device's commands: {_0}")]
         ListCommands(GetCommandsError),
-        /// The capture was interrupted before it could complete, so the
-        /// file this run would have produced is a *partial* capture:
-        /// [`DefyBackup::partial_capture`] in `partial` holds every
-        /// command captured before the failure and the
-        /// [`parsing::backup::PartialCapture`] marker naming the
-        /// capture-list commands it is missing. The backup still saves
-        /// (and later completes, with
+        /// The capture was interrupted before it could complete: one
+        /// of the capture-list command reads failed mid-capture (the
+        /// identity probes cannot interrupt a capture — they are
+        /// best-effort; see [`CaptureIdentity`]). The file this run
+        /// would have produced is a *partial* capture:
+        /// [`parsing::backup::DefyBackup::partial_capture`] in
+        /// `partial` holds every command captured before the failure
+        /// and the [`parsing::backup::PartialCapture`] marker naming
+        /// the capture-list commands it is missing. The backup still
+        /// saves (and later completes, with
         /// [`DefyKeyboard::complete_backup`]) — it is never mistaken
         /// for a complete one: restore validation refuses it by
         /// default.
-        #[display("the backup capture was interrupted, a partial capture was preserved: {source}")]
+        #[display(
+            "the backup capture was interrupted at `{command}`, a partial capture was preserved: {source}"
+        )]
         IncompleteCapture {
             /// The partial backup: everything captured before the
             /// failure, marked with the commands it is missing. Boxed —
             /// the payload dwarfs the other variants, and errors are
             /// returned everywhere.
             partial: Box<parsing::backup::DefyBackup>,
-            /// What failed, and at which step of the capture.
-            source: CaptureFailure,
+            /// The capture-list command whose read failed and stopped
+            /// the capture.
+            command: String,
+            /// The error the command read failed with.
+            source: RunCommandError,
         },
     }
 
-    /// The step of a backup capture that failed and interrupted it —
-    /// the [`CreateBackupError::IncompleteCapture::source`] of an
-    /// interrupted capture. The capture-list command reads run first;
-    /// the identity probes (`hardware.chip_id`, `version`,
-    /// `hardware.wireless`) run after them, so a probe failure means
-    /// every command was captured and the partial file's missing list
-    /// is empty.
-    #[derive(Debug, Display, Error)]
-    pub enum CaptureFailure {
-        /// Capturing the response of one of the backup's commands
-        /// failed. The capture stopped here; the commands listed after
-        /// this one are the partial file's missing list.
-        #[display("failed to capture the `{command}` response: {source}")]
-        Command {
-            /// The command whose response could not be captured.
-            command: String,
-            /// The error the command failed with.
-            source: RunCommandError,
-        },
-        /// Reading the Neuron's `hardware.chip_id` failed.
-        #[display("failed to read the chip id: {_0}")]
-        ChipId(GetSettingError),
-        /// Reading the `version` response failed.
-        #[display("failed to read the firmware version: {_0}")]
-        Version(RunCommandError),
-        /// Reading `hardware.wireless` failed.
-        #[display("failed to read whether this is the wireless variant: {_0}")]
-        Wireless(GetSettingError),
+    /// Why a backup capture's identity probe produced no value.
+    ///
+    /// The identity probes (`hardware.chip_id`, `version`,
+    /// `hardware.wireless`) are best-effort: a capture is never
+    /// interrupted by one. The reason is recorded instead, and the
+    /// backup is assembled with the identity it did obtain — the
+    /// capture is complete whenever every capture-list command was
+    /// captured, whatever the probes did.
+    #[derive(Clone, Copy, Debug, Display, Error, PartialEq, Eq)]
+    pub enum IdentityProbeUnavailable {
+        /// The device's `help` output — its own capability
+        /// advertisement, and the source of the capture list — does
+        /// not list the probe's command, so the probe was never sent:
+        /// the device has said it does not serve it. The wireless
+        /// Defy's firmware, for example, serves no `hardware.wireless`
+        /// command and answers any attempt with an empty response.
+        #[display("the device does not serve `{_0}`")]
+        NotServed(#[error(not(source))] &'static str),
+        /// The command is served, but the read did not produce a
+        /// usable value: a transport error, an empty response, or a
+        /// response that does not parse.
+        #[display("the `{_0}` read failed or returned nothing usable")]
+        ReadFailed(#[error(not(source))] &'static str),
+    }
+
+    /// The identity metadata a completed backup capture obtained, one
+    /// field per probe: the value the device reported, or
+    /// [`IdentityProbeUnavailable`] naming why it has none.
+    ///
+    /// A capture does not abort on a probe — it is complete when every
+    /// capture-list command was captured, whatever the probes did —
+    /// so the backup file itself carries only the identity that was
+    /// obtained (an empty chip id, absent versions, and the documented
+    /// wired descriptor flag when `hardware.wireless` is unknown; see
+    /// [`DefyKeyboard::create_backup`]). This report is how the caller
+    /// learns what was *not* obtained, so the gaps can be said out
+    /// loud (the CLI prints a note) instead of passing silently.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CaptureIdentity {
+        /// The Neuron's `hardware.chip_id`, or why the capture has
+        /// none. In the file, `Err` reads as: the backup's `neuronID`
+        /// and the descriptor's `chipId` are empty, so the backup
+        /// cannot key a Neuron names-store entry.
+        pub chip_id: Result<String, IdentityProbeUnavailable>,
+        /// The device's verbatim `version` response, or why the
+        /// capture has none. In the file, `Err` reads as: the backup's
+        /// `versions` object is empty (all three fields absent).
+        pub version: Result<String, IdentityProbeUnavailable>,
+        /// The `hardware.wireless` flag, or why the capture has none.
+        /// In the file, `Err` reads as: the descriptor records the
+        /// wired variant (see [`DefyKeyboard::create_backup`] for why
+        /// that choice is safe).
+        pub wireless: Result<bool, IdentityProbeUnavailable>,
+    }
+
+    impl CaptureIdentity {
+        /// The identity fields the device did not provide, with the
+        /// reason each is missing — the single source of the
+        /// unavailable-probe iteration, so a report consumer cannot
+        /// forget a field.
+        pub fn unavailable(&self) -> impl Iterator<Item = IdentityProbeUnavailable> + '_ {
+            [
+                self.chip_id.as_ref().err(),
+                self.version.as_ref().err(),
+                self.wireless.as_ref().err(),
+            ]
+            .into_iter()
+            .flatten()
+            .copied()
+        }
     }
 
     /// The Display message of [`BackupValidationError::PartialCapture`]:
     /// names the missing commands, or — for a marker with an empty
-    /// missing list (a capture interrupted at the identity probes) —
-    /// says why the list is empty, never "0 command(s) missing: "
-    /// with a dangling separator. The single source of the refusal's
+    /// missing list — says why the list is empty, never "0 command(s)
+    /// missing: " with a dangling separator. Such markers no longer
+    /// arise from this crate's captures (the identity probes cannot
+    /// interrupt one), but files saved by earlier versions of this
+    /// crate — captures interrupted at the probes — carry them, and
+    /// the refusal must word them. The single source of the refusal's
     /// wording: the CLI's validation snippet renders this `Display`
     /// directly.
     fn partial_capture_display(missing: &[String]) -> String {
@@ -1628,16 +1681,17 @@ impl DefyKeyboard {
     /// separators), not transformed the way Bazecor post-processes its
     /// captures.
     ///
-    /// The file's neuron object carries the chip id and the Defy
-    /// device descriptor, but no names yet: layer, macro, and superkey
-    /// names are app-side in Bazecor, and this crate has no name store
-    /// (see [`parsing::backup::BackupNeuron`]).
+    /// The file's neuron object carries the chip id (empty when that
+    /// probe was unavailable — see # Interrupted captures) and the
+    /// Defy device descriptor, but no names: layer, macro, and
+    /// superkey names are app-side in Bazecor, and a capture never
+    /// attaches them — the `names` store applies them on restore (see
+    /// [`parsing::backup::BackupNeuron`]).
     ///
     /// # Interrupted captures
     ///
-    /// When any step after the `help` query fails — a command read, or
-    /// one of the identity probes — the error carries the *partial
-    /// capture* in
+    /// When one of the capture-list command reads fails mid-capture,
+    /// the error carries the *partial capture* in
     /// [`CreateBackupError::IncompleteCapture`]: everything captured
     /// before the failure, marked
     /// ([`parsing::backup::PartialCapture`]) with the capture-list
@@ -1646,9 +1700,33 @@ impl DefyKeyboard {
     /// because the marker is on it, and it can be completed later with
     /// [`DefyKeyboard::complete_backup`] (capture commands are
     /// idempotent reads, so re-capturing the missing ones is safe).
+    ///
+    /// The identity probes are **not** part of this: they are
+    /// best-effort, and a capture whose every command was captured is
+    /// complete — marker-free, restorable, Bazecor-shaped — even when
+    /// the device provided no identity at all. A probe the device's
+    /// `help` output does not list is never sent (the wireless Defy's
+    /// firmware does not serve `hardware.wireless` and answers any
+    /// attempt with an empty response — sending it would abort an
+    /// otherwise complete capture on exactly the device that most
+    /// needs backups), and a served probe that fails — a transport
+    /// error, an empty response, a response that does not parse — is
+    /// recorded as unavailable instead of failing the capture. What
+    /// was not obtained is reported in the returned
+    /// [`CaptureIdentity`]; the file itself carries the identity that
+    /// was obtained: an empty `neuronID` when the chip id is unknown,
+    /// an empty `versions` object when the version is unknown, and a
+    /// device descriptor recording the *wired* variant when
+    /// `hardware.wireless` is unknown. That last choice is safe to
+    /// make blind: restore validation
+    /// ([`DefyKeyboard::backup_restore_plan`]) reads only
+    /// `neuron.device.info.product` out of the descriptor — the
+    /// `wireless` flag is inert for it, and Bazecor's restore flow
+    /// likewise reads only the `backup` array, the neuron object, and
+    /// `neuron.device.info.product`.
     pub async fn create_backup(
         &mut self,
-    ) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+    ) -> Result<(parsing::backup::DefyBackup, CaptureIdentity), CreateBackupError> {
         capture_backup(&mut self.focus_api, &[]).await
     }
 
@@ -1674,15 +1752,22 @@ impl DefyKeyboard {
     /// list recomputed against the current capture list.
     ///
     /// The identity fields (chip id, versions, device descriptor) are
-    /// always re-read from the connected device — they replace
+    /// always re-probed from the connected device — they replace
     /// whatever the partial file carried (which, for a file an
     /// interrupted [`DefyKeyboard::create_backup`] saved, is the empty
     /// store shape anyway: the interrupted probes are exactly what
-    /// completion re-runs).
+    /// completion re-runs). The probes are best-effort exactly as in
+    /// [`DefyKeyboard::create_backup`]: a probe the device does not
+    /// serve or that fails is reported as unavailable, and the marker
+    /// clears whenever every capture-list command is present — a
+    /// marker-only partial (a file saved by an earlier version of this
+    /// crate from a capture that died at the probes, as the wireless
+    /// Defy's older captures were) completes even on a device that
+    /// serves none of the probes.
     pub async fn complete_backup(
         &mut self,
         partial: &parsing::backup::DefyBackup,
-    ) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+    ) -> Result<(parsing::backup::DefyBackup, CaptureIdentity), CreateBackupError> {
         capture_backup(&mut self.focus_api, &partial.backup).await
     }
 
@@ -1695,6 +1780,11 @@ impl DefyKeyboard {
     /// a backup file, so a backup without a descriptor is not
     /// restorable there; captures made through
     /// [`DefyKeyboard::create_backup`] always carry this descriptor.
+    /// When the capture could not probe `hardware.wireless`, the
+    /// descriptor records the wired variant (`false`) — a documented
+    /// blind choice, inert for restore validation (both this crate's
+    /// and Bazecor's restore read only `info.product`); see
+    /// [`DefyKeyboard::create_backup`].
     pub fn backup_device_descriptor(wireless: bool, chip_id: &str) -> serde_json::Value {
         let mut descriptor = backup_device_descriptor_template();
 
@@ -1965,17 +2055,20 @@ where
 /// query `help` and compute the capture list; capture only the
 /// capture-list commands the file does not hold yet (multiset
 /// semantics — a twice-listed command needs two captures); then probe
-/// the identity fields. Any failure after the `help` query assembles
-/// the partial capture — everything captured so far, plus the
-/// [`parsing::backup::PartialCapture`] marker naming what is missing —
-/// and returns it in
-/// [`CreateBackupError::IncompleteCapture`]; a failure before any
-/// command is captured cannot produce one worth keeping, so only the
-/// error remains.
+/// the identity fields, best-effort ([`probe_identity`]). A failed
+/// command read assembles the partial capture — everything captured
+/// so far, plus the [`parsing::backup::PartialCapture`] marker naming
+/// what is missing — and returns it in
+/// [`CreateBackupError::IncompleteCapture`]; a `help` failure cannot
+/// produce one worth keeping, so only the error remains. A probe
+/// failure never assembles anything: the identity the device did
+/// provide fills the file, the rest is reported in the returned
+/// [`CaptureIdentity`], and the marker is computed from the captured
+/// commands alone.
 async fn capture_backup(
     connection: &mut impl FocusApiConnection,
     already_captured: &[parsing::backup::BackupCommand],
-) -> Result<parsing::backup::DefyBackup, CreateBackupError> {
+) -> Result<(parsing::backup::DefyBackup, CaptureIdentity), CreateBackupError> {
     let help_commands = connection
         .available_commands()
         .await
@@ -1998,10 +2091,8 @@ async fn capture_backup(
                     &capture_list,
                     already_captured,
                     &captured,
-                    CaptureFailure::Command {
-                        command: command.clone(),
-                        source,
-                    },
+                    command.clone(),
+                    source,
                 ));
             }
         };
@@ -2009,45 +2100,38 @@ async fn capture_backup(
         captured.push(parsing::backup::BackupCommand::new(command.clone(), data));
     }
 
-    let chip_id = read_setting::<parsing::settings::ChipId>(
+    // The identity probes: best-effort, in probe order. A probe the
+    // device does not serve is never sent; a served probe that fails
+    // or answers nothing usable is recorded as unavailable — neither
+    // can lose the commands captured above.
+    let chip_id = probe_identity::<parsing::settings::ChipId>(
         connection,
+        &help_commands,
         DefyKeyboard::HARDWARE_CHIP_ID_COMMAND_NAME,
     )
     .await
-    .map_err(|source| {
-        interrupted(
-            &capture_list,
-            already_captured,
-            &captured,
-            CaptureFailure::ChipId(source),
-        )
-    })?;
+    .map(|chip_id| chip_id.as_str().to_owned());
 
-    let version_response = connection
-        .run_command(DefyKeyboard::VERSION_COMMAND_NAME, None)
-        .await
-        .map_err(|source| {
-            interrupted(
-                &capture_list,
-                already_captured,
-                &captured,
-                CaptureFailure::Version(source),
-            )
-        })?;
-
-    let wireless = read_setting::<parsing::settings::BoolWord>(
+    let version = probe_identity::<String>(
         connection,
+        &help_commands,
+        DefyKeyboard::VERSION_COMMAND_NAME,
+    )
+    .await;
+
+    let wireless = probe_identity::<parsing::settings::BoolWord>(
+        connection,
+        &help_commands,
         DefyKeyboard::HARDWARE_WIRELESS_COMMAND_NAME,
     )
     .await
-    .map_err(|source| {
-        interrupted(
-            &capture_list,
-            already_captured,
-            &captured,
-            CaptureFailure::Wireless(source),
-        )
-    })?;
+    .map(|word| word.0);
+
+    let identity = CaptureIdentity {
+        chip_id,
+        version,
+        wireless,
+    };
 
     let mut entries = already_captured.to_owned();
     entries.extend(captured);
@@ -2061,11 +2145,22 @@ async fn capture_backup(
     // The complete capture's assembly — chip id, descriptor, versions
     // — is `DefyBackup::capture`'s shape; the marker is this path's
     // only addition, present only when something is still missing.
+    // Unknown identity fills from the empty side: no chip id reads as
+    // the empty neuron id, no version as the empty versions object,
+    // and no `hardware.wireless` as the wired descriptor flag — the
+    // documented blind choice, inert for restore validation (see
+    // [`DefyKeyboard::create_backup`]). The chip id is resolved once:
+    // the file's `neuronID` and the descriptor's `chipId` are the same
+    // value by construction, not by two agreeing fallbacks.
+    let chip_id = identity.chip_id.as_deref().unwrap_or("");
+
     let mut backup = parsing::backup::DefyBackup::capture(
-        chip_id.as_str(),
-        parsing::backup::BackupVersions::from_version_response(&version_response),
+        chip_id,
+        parsing::backup::BackupVersions::from_version_response(
+            identity.version.as_deref().unwrap_or(""),
+        ),
         entries,
-        DefyKeyboard::backup_device_descriptor(wireless.0, chip_id.as_str()),
+        DefyKeyboard::backup_device_descriptor(identity.wireless.unwrap_or(false), chip_id),
     );
 
     backup.partial = partial.has_missing().then_some(partial);
@@ -2077,7 +2172,55 @@ async fn capture_backup(
     // complete one downstream.
     debug_assert!(!backup.is_partial());
 
-    Ok(backup)
+    Ok((backup, identity))
+}
+
+/// Runs one identity probe of a backup capture, best-effort: the
+/// single place the "identity never interrupts a capture" rule lives.
+///
+/// A command the device's `help` output does not list is never sent —
+/// the device has advertised that it does not serve it
+/// ([`IdentityProbeUnavailable::NotServed`]). A served probe that
+/// fails — a transport error, an empty response, or a response that
+/// does not parse — is [`IdentityProbeUnavailable::ReadFailed`].
+/// Either way the reason is logged at `debug` level (the empty
+/// responses included, since a served-but-silent command is its own
+/// diagnostic) and returned; nothing here can abort a capture.
+async fn probe_identity<T>(
+    connection: &mut impl FocusApiConnection,
+    served_commands: &[String],
+    command: &'static str,
+) -> Result<T, IdentityProbeUnavailable>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if !served_commands.iter().any(|served| served == command) {
+        debug!(
+            "backup capture: `{command}` is not in the device's `help` \
+             output, the identity probe is skipped"
+        );
+
+        return Err(IdentityProbeUnavailable::NotServed(command));
+    }
+
+    match connection.run_command(command, None).await {
+        Ok(response) if !response.trim().is_empty() => T::from_str(&response).map_err(|err| {
+            debug!("backup capture: `{command}` response did not parse: {err}");
+
+            IdentityProbeUnavailable::ReadFailed(command)
+        }),
+        Ok(_) => {
+            debug!("backup capture: `{command}` returned an empty response");
+
+            Err(IdentityProbeUnavailable::ReadFailed(command))
+        }
+        Err(err) => {
+            debug!("backup capture: `{command}` read failed: {err}");
+
+            Err(IdentityProbeUnavailable::ReadFailed(command))
+        }
+    }
 }
 
 /// Assembles the interrupted-capture error: the partial backup holding
@@ -2088,7 +2231,8 @@ fn interrupted(
     capture_list: &[String],
     already_captured: &[parsing::backup::BackupCommand],
     captured: &[parsing::backup::BackupCommand],
-    source: CaptureFailure,
+    command: String,
+    source: RunCommandError,
 ) -> CreateBackupError {
     let mut entries = already_captured.to_owned();
     entries.extend(captured.iter().cloned());
@@ -2098,6 +2242,7 @@ fn interrupted(
             entries,
             capture_list,
         )),
+        command,
         source,
     }
 }
@@ -2980,10 +3125,8 @@ impl From<MacroAction> for parsing::macros::MacroAction {
 /// [`ColormapDoesNotHave10LayersError`] when the count is wrong.
 ///
 /// Each layer splits at the hardware's LED boundary: the first
-/// [`KEYBOARD_LEDS`](parsing::colormap::KEYBOARD_LEDS) positions paint
-/// the keyboard's keys, the remaining
-/// [`UNDERGLOW_LEDS`](parsing::colormap::UNDERGLOW_LEDS) the
-/// underglow.
+/// [`KEYBOARD_LEDS`] positions paint the keyboard's keys, the
+/// remaining [`UNDERGLOW_LEDS`] the underglow.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deref, DerefMut, From)]
 pub struct DefyColormap {
     /// The colormap's ten layers, in wire order (layer 1 first).
@@ -4375,9 +4518,26 @@ mod tests {
     impl ScriptedConnection {
         /// A `help` response whose capture list is exactly three
         /// commands (`led.brightnessUG` is force-appended by the
-        /// filter, so a full capture runs four reads).
+        /// filter, so a full capture runs four reads) and which lists
+        /// all three identity probes — the probes never join the
+        /// capture list (the deny list filters `hardware`/`version`
+        /// out), but the capture consults this list to decide which
+        /// probes to send.
         fn help() -> String {
-            "keymap.custom\npalette\nmouse.speed\n".to_owned()
+            Self::help_serving(&["version", "hardware.chip_id", "hardware.wireless"])
+        }
+
+        /// The scripted `help` response with only `served_probes`
+        /// listed after the three capture commands: the scenario's
+        /// knob for which identity probes the device serves (and the
+        /// capture may send).
+        fn help_serving(served_probes: &[&str]) -> String {
+            ["keymap.custom", "palette", "mouse.speed"]
+                .into_iter()
+                .chain(served_probes.iter().copied())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
         }
 
         fn ok(
@@ -4471,7 +4631,7 @@ mod tests {
     async fn create_backup_captures_the_whole_list_and_carries_no_marker() {
         let mut connection = ScriptedConnection::full_capture();
 
-        let backup = capture_backup(&mut connection, &[]).await.unwrap();
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
 
         // The entries in `help` order, the force-add last.
         let commands: Vec<&str> = backup.backup.iter().map(|e| e.command.as_str()).collect();
@@ -4498,6 +4658,17 @@ mod tests {
         assert!(!backup.is_partial());
         assert!(backup.partial.is_none());
 
+        // The report agrees with the file: every probe obtained, so
+        // the CLI's note would stay silent.
+        assert_eq!(
+            identity,
+            CaptureIdentity {
+                chip_id: Ok("8ed7f33db024a5b5".to_owned()),
+                version: Ok("v2.2.0 7622bb53 c9d9b7b-dirty".to_owned()),
+                wireless: Ok(true),
+            }
+        );
+
         connection.assert_spent();
     }
 
@@ -4517,13 +4688,19 @@ mod tests {
 
         let err = capture_backup(&mut connection, &[]).await.unwrap_err();
 
-        let CreateBackupError::IncompleteCapture { partial, source } = err else {
+        let CreateBackupError::IncompleteCapture {
+            partial,
+            command,
+            source,
+        } = err
+        else {
             panic!("expected an interrupted capture, got {err:?}");
         };
 
+        assert_eq!(command, "mouse.speed");
         assert!(matches!(
             source,
-            CaptureFailure::Command { ref command, .. } if command == "mouse.speed"
+            RunCommandError::ResponseStreamTerminatedPrematurely
         ));
 
         // The partial holds exactly what was captured, and the marker
@@ -4545,9 +4722,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_backup_preserves_a_partial_when_a_probe_fails() {
-        // Every command captured, but the `version` probe dies: the
-        // file is still marked partial, with an empty missing list.
+    async fn create_backup_skips_an_identity_probe_the_device_does_not_serve() {
+        // The live-hardware scenario (wireless Defy over Bluetooth,
+        // 2026-10-12): the device's `help` output does not list
+        // `hardware.wireless` — its firmware does not serve the
+        // command and answers any attempt with an empty response. The
+        // probe must never be SENT (the script's assert_spent below
+        // proves it), the capture must COMPLETE — marker-free,
+        // Bazecor-shaped — and the descriptor must record the
+        // documented wired choice.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok(
+                    "help",
+                    &ScriptedConnection::help_serving(&["version", "hardware.chip_id"]),
+                ),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+            ]
+            .into(),
+        };
+
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
+
+        connection.assert_spent();
+
+        // Complete: every command captured, no marker.
+        assert_eq!(backup.backup.len(), 4);
+        assert!(!backup.is_partial());
+        assert!(backup.partial.is_none());
+
+        // The obtained identity is in the file; the wireless flag is
+        // the documented unknown-wireless choice (wired), inert for
+        // restore validation, which reads `info.product` only.
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(backup.versions.bazecor.as_deref(), Some("v2.2.0"));
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], false);
+        assert_eq!(
+            backup.neuron.device.as_ref().unwrap()["info"]["product"],
+            "Defy"
+        );
+
+        // The report says exactly what was not obtained, and why.
+        assert_eq!(
+            identity,
+            CaptureIdentity {
+                chip_id: Ok("8ed7f33db024a5b5".to_owned()),
+                version: Ok("v2.2.0 7622bb53 c9d9b7b-dirty".to_owned()),
+                wireless: Err(IdentityProbeUnavailable::NotServed("hardware.wireless")),
+            }
+        );
+        assert_eq!(
+            identity.unavailable().collect::<Vec<_>>(),
+            [IdentityProbeUnavailable::NotServed("hardware.wireless")]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_backup_tolerates_a_served_but_empty_probe() {
+        // Defensively, the response shape the skip above prevents is
+        // also tolerated: `hardware.wireless` IS listed, but the
+        // device answers it with an empty response. Same completion:
+        // the empty answer reads as "no value", not as a capture
+        // failure.
         let mut connection = ScriptedConnection {
             script: [
                 ScriptedConnection::ok("help", &ScriptedConnection::help()),
@@ -4556,23 +4797,142 @@ mod tests {
                 ScriptedConnection::ok("mouse.speed", "20"),
                 ScriptedConnection::ok("led.brightnessUG", "255"),
                 ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
-                ScriptedConnection::failed("version"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", ""),
             ]
             .into(),
         };
 
-        let err = capture_backup(&mut connection, &[]).await.unwrap_err();
-
-        let CreateBackupError::IncompleteCapture { partial, source } = err else {
-            panic!("expected an interrupted capture, got {err:?}");
-        };
-
-        assert!(matches!(source, CaptureFailure::Version(_)));
-        assert_eq!(partial.backup.len(), 4);
-        assert!(partial.is_partial());
-        assert!(!partial.partial.as_ref().unwrap().has_missing());
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
 
         connection.assert_spent();
+
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup.len(), 4);
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], false);
+        assert_eq!(
+            identity,
+            CaptureIdentity {
+                chip_id: Ok("8ed7f33db024a5b5".to_owned()),
+                version: Ok("v2.2.0 7622bb53 c9d9b7b-dirty".to_owned()),
+                wireless: Err(IdentityProbeUnavailable::ReadFailed("hardware.wireless")),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn create_backup_tolerates_a_served_probe_answering_garbage() {
+        // The last ReadFailed shape: the probe is served and answers
+        // something non-empty that does not parse ("true"/"false" is
+        // all `hardware.wireless` may say). Same completion as the
+        // empty answer: recorded, not fatal.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", "yes"),
+            ]
+            .into(),
+        };
+
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
+
+        connection.assert_spent();
+
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup.len(), 4);
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], false);
+        assert_eq!(
+            identity,
+            CaptureIdentity {
+                chip_id: Ok("8ed7f33db024a5b5".to_owned()),
+                version: Ok("v2.2.0 7622bb53 c9d9b7b-dirty".to_owned()),
+                wireless: Err(IdentityProbeUnavailable::ReadFailed("hardware.wireless")),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn create_backup_tolerates_a_probe_transport_failure() {
+        // A served probe whose read dies at the transport is also
+        // recorded, not fatal: the capture completes, the chip id side
+        // of the file stays empty (no Neuron key), the rest of the
+        // identity is filled.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help()),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+                ScriptedConnection::failed("hardware.chip_id"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+                ScriptedConnection::ok("hardware.wireless", "true"),
+            ]
+            .into(),
+        };
+
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
+
+        connection.assert_spent();
+
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup.len(), 4);
+        assert_eq!(backup.neuron_id, "");
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["chipId"], "");
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], true);
+        assert_eq!(backup.versions.bazecor.as_deref(), Some("v2.2.0"));
+        assert_eq!(
+            identity,
+            CaptureIdentity {
+                chip_id: Err(IdentityProbeUnavailable::ReadFailed("hardware.chip_id")),
+                version: Ok("v2.2.0 7622bb53 c9d9b7b-dirty".to_owned()),
+                wireless: Ok(true),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn create_backup_with_no_identity_served_completes_with_empty_identity() {
+        // The extreme of the same design: the device serves none of
+        // the probes (none are listed, so none are sent — the script
+        // holds only the four capture reads). The capture is still
+        // complete, with the empty identity shapes in the file.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("help", &ScriptedConnection::help_serving(&[])),
+                ScriptedConnection::ok("keymap.custom", "41 30 31"),
+                ScriptedConnection::ok("palette", "255 196 0 0"),
+                ScriptedConnection::ok("mouse.speed", "20"),
+                ScriptedConnection::ok("led.brightnessUG", "255"),
+            ]
+            .into(),
+        };
+
+        let (backup, identity) = capture_backup(&mut connection, &[]).await.unwrap();
+
+        connection.assert_spent();
+
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup.len(), 4);
+        assert_eq!(backup.neuron_id, "");
+        assert_eq!(backup.versions, parsing::backup::BackupVersions::default());
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["chipId"], "");
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], false);
+        assert_eq!(
+            identity.unavailable().collect::<Vec<_>>(),
+            [
+                IdentityProbeUnavailable::NotServed("hardware.chip_id"),
+                IdentityProbeUnavailable::NotServed("version"),
+                IdentityProbeUnavailable::NotServed("hardware.wireless"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -4608,7 +4968,7 @@ mod tests {
             .into(),
         };
 
-        let backup = capture_backup(&mut connection, &partial.backup)
+        let (backup, identity) = capture_backup(&mut connection, &partial.backup)
             .await
             .unwrap();
 
@@ -4631,6 +4991,7 @@ mod tests {
             backup.neuron.device.as_ref().unwrap()["chipId"],
             "8ed7f33db024a5b5"
         );
+        assert!(identity.chip_id.is_ok());
 
         // The file's original entries are verbatim; the recaptured
         // ones carry the scripted responses.
@@ -4659,14 +5020,14 @@ mod tests {
             .await
             .unwrap_err();
 
-        let CreateBackupError::IncompleteCapture { partial, source } = err else {
+        let CreateBackupError::IncompleteCapture {
+            partial, command, ..
+        } = err
+        else {
             panic!("expected an interrupted capture, got {err:?}");
         };
 
-        assert!(matches!(
-            source,
-            CaptureFailure::Command { ref command, .. } if command == "led.brightnessUG"
-        ));
+        assert_eq!(command, "led.brightnessUG");
 
         let commands: Vec<&str> = partial.backup.iter().map(|e| e.command.as_str()).collect();
 
@@ -4678,10 +5039,11 @@ mod tests {
 
     #[tokio::test]
     async fn complete_backup_of_a_marker_only_partial_runs_the_probes_only() {
-        // Probe-failure recovery: the original capture died at a probe
-        // with every command already in the file, so the marker's
-        // missing list is empty. Completion must run ZERO command
-        // reads — only the three probes — before the file is complete.
+        // A file saved by an earlier build from a capture that died at
+        // a probe with every command already in the file — the marker's
+        // missing list is empty, a shape current captures can no longer
+        // produce. Completion must run ZERO command reads — only the
+        // probes — before the file is complete.
         let partial = partial_of(&[
             "keymap.custom",
             "palette",
@@ -4702,7 +5064,7 @@ mod tests {
             .into(),
         };
 
-        let backup = capture_backup(&mut connection, &partial.backup)
+        let (backup, identity) = capture_backup(&mut connection, &partial.backup)
             .await
             .unwrap();
 
@@ -4716,6 +5078,55 @@ mod tests {
         assert_eq!(
             backup.neuron.device.as_ref().unwrap()["chipId"],
             "8ed7f33db024a5b5"
+        );
+        assert!(identity.unavailable().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_backup_of_an_old_marker_only_partial_completes_over_a_probeless_device() {
+        // The 2026-10-12 incident's recovery path: a file saved by the
+        // previous build as a marker-only partial (every command
+        // captured, the `hardware.wireless` probe aborted the
+        // assembly) is completed on the very device that caused it —
+        // which still does not serve the probe. The completion runs
+        // the two served probes only (assert_spent proves
+        // `hardware.wireless` is never sent), clears the marker, and
+        // records the wireless flag as the documented wired choice.
+        let partial = partial_of(&[
+            "keymap.custom",
+            "palette",
+            "mouse.speed",
+            "led.brightnessUG",
+        ]);
+
+        assert!(partial.is_partial());
+        assert!(!partial.partial.as_ref().unwrap().has_missing());
+
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok(
+                    "help",
+                    &ScriptedConnection::help_serving(&["version", "hardware.chip_id"]),
+                ),
+                ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
+                ScriptedConnection::ok("version", "v2.2.0 7622bb53 c9d9b7b-dirty"),
+            ]
+            .into(),
+        };
+
+        let (backup, identity) = capture_backup(&mut connection, &partial.backup)
+            .await
+            .unwrap();
+
+        connection.assert_spent();
+
+        assert!(!backup.is_partial());
+        assert_eq!(backup.backup, partial.backup);
+        assert_eq!(backup.neuron_id, "8ed7f33db024a5b5");
+        assert_eq!(backup.neuron.device.as_ref().unwrap()["wireless"], false);
+        assert_eq!(
+            identity.unavailable().collect::<Vec<_>>(),
+            [IdentityProbeUnavailable::NotServed("hardware.wireless")]
         );
     }
 
@@ -4737,7 +5148,14 @@ mod tests {
 
         let mut connection = ScriptedConnection {
             script: [
-                ScriptedConnection::ok("help", "keymap.custom\npalette\nmacros.map\n"),
+                // The current `help` lists `macros.map` and NOT
+                // `mouse.speed` — the changed-capture-list scenario —
+                // with the probes spelled out so they are served.
+                ScriptedConnection::ok(
+                    "help",
+                    "keymap.custom\npalette\nmacros.map\nversion\nhardware.chip_id\n\
+                     hardware.wireless\n",
+                ),
                 ScriptedConnection::ok("macros.map", "4 1 2 3"),
                 ScriptedConnection::ok("led.brightnessUG", "255"),
                 ScriptedConnection::ok("hardware.chip_id", "8ed7f33db024a5b5"),
@@ -4747,7 +5165,7 @@ mod tests {
             .into(),
         };
 
-        let backup = capture_backup(&mut connection, &partial.backup)
+        let (backup, _identity) = capture_backup(&mut connection, &partial.backup)
             .await
             .unwrap();
 

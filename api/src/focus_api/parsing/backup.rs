@@ -173,9 +173,10 @@ pub struct PartialCapture {
     /// capture-list order: what a successful capture would have
     /// captured in addition to the entries the file holds.
     ///
-    /// Empty when the capture stopped after every command was captured
-    /// but before the backup could be assembled completely (the
-    /// `version`/`hardware.chip_id`/`hardware.wireless` probes) — the
+    /// Empty only in files saved by earlier versions of this crate,
+    /// whose captures could still be interrupted after every command
+    /// was captured but before the identity probes ran (they are
+    /// best-effort now, so they cannot interrupt a capture) — the
     /// marker alone still says the file came from a failed capture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
@@ -469,9 +470,12 @@ impl DefyBackup {
     /// probes that fill them never ran) and the [`PartialCapture`]
     /// marker set.
     ///
-    /// The marker is set even when `missing` comes out empty (the
-    /// capture stopped after every command but before the identity
-    /// probes): the marker is the file's "this capture failed" bit.
+    /// The marker is set even when `missing` comes out empty — which,
+    /// since the identity probes became best-effort, only happens when
+    /// a caller assembles it that way (files saved by earlier versions
+    /// of this crate carry such markers, from captures interrupted at
+    /// the probes): the marker is the file's "this capture failed"
+    /// bit regardless of the list's contents.
     pub fn partial_capture(captured: Vec<BackupCommand>, expected: &[String]) -> Self {
         let partial = PartialCapture::from_capture(expected, &captured);
 

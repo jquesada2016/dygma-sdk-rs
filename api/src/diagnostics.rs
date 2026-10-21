@@ -21,9 +21,10 @@ use std::path::Path;
 
 use dygma_cli::devices::conversions::{ConversionError, LayeredWireError, LayeredWireErrorKind};
 use dygma_cli::devices::defy::{
-    BackupEntryError, BackupValidationError, CaptureFailure, DefyColormap, DefyKeymap, MacroMap,
+    BackupEntryError, BackupValidationError, DefyColormap, DefyKeymap, MacroMap,
     ParseColormapError, ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
 };
+use dygma_cli::focus_api::RunCommandError;
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::parsing::palette::Palette;
 use dygma_cli::focus_api::parsing::palette::ParsePaletteError;
@@ -922,23 +923,24 @@ fn backup_validation_report_with_text(
 /// create, "completing the partial capture in <path>" for
 /// `--retry-missing`) — the caller computes it, so the story always
 /// matches the run that failed. A device failure has no source text to
-/// span, so this renders as the plain context chain.
+/// span, so this renders as the plain context chain. The failed
+/// `command` is always among the partial's missing list: a capture
+/// that ran to the end of its command reads completes (the identity
+/// probes cannot interrupt one), so there is no empty-missing story
+/// here.
 pub(super) fn interrupted_capture_report(
     path: &Path,
     partial: &DefyBackup,
-    source: CaptureFailure,
+    command: &str,
+    source: RunCommandError,
     capture_context: String,
 ) -> error_stack::Report<Error> {
-    let missing_line = match partial.missing_commands() {
-        [] => "the capture was interrupted after every command but before the \
-               backup could be assembled completely"
-            .to_owned(),
-        missing => format!("missing: {}", missing.join(", ")),
-    };
+    let missing_line = format!("missing: {}", partial.missing_commands().join(", "));
 
     source
         .into_report()
         .change_context(Error)
+        .attach(format!("the `{command}` read interrupted the capture"))
         .attach(capture_context)
         .attach(format!(
             "a PARTIAL capture was saved to {} ({} command(s) captured, {} missing)",
@@ -1943,7 +1945,6 @@ Error:
     /// recovery paths, under the capture failure itself.
     #[test]
     fn interrupted_capture_report_carries_the_recovery_story() {
-        use dygma_cli::devices::defy::CaptureFailure;
         use dygma_cli::focus_api::RunCommandError;
 
         let expected: Vec<String> = ["keymap.custom", "palette", "mouse.speed"]
@@ -1966,10 +1967,8 @@ Error:
         let report = interrupted_capture_report(
             Path::new("backup.json"),
             &partial,
-            CaptureFailure::Command {
-                command: "mouse.speed".to_owned(),
-                source: RunCommandError::ResponseStreamTerminatedPrematurely,
-            },
+            "mouse.speed",
+            RunCommandError::ResponseStreamTerminatedPrematurely,
             "capturing the backup from the Defy".to_owned(),
         );
 
@@ -1979,9 +1978,9 @@ Error:
         // assertions normalize the wrapping (including miette's `│`
         // continuation markers) away — this report is the plain chain
         // (no snippet), so the words are the whole story. The source
-        // renders like every source-chained error (the innermost
-        // reason as the headline, the full Display at the chain's
-        // end); the attachments carry the recovery story.
+        // renders like every source-chained error (the reason as the
+        // headline); the attachments carry the interruption and the
+        // recovery story.
         let flat = rendered
             .split('│')
             .flat_map(|part| part.split_whitespace())
@@ -1991,10 +1990,7 @@ Error:
         assert!(
             flat.contains("response stream terminated while waiting for the response to complete")
         );
-        assert!(flat.contains(
-            "failed to capture the `mouse.speed` response: response stream terminated \
-             while waiting for the response to complete"
-        ));
+        assert!(flat.contains("the `mouse.speed` read interrupted the capture"));
 
         // The caller-supplied context is the run's only context frame:
         // exactly once — a repeated frame would be a doubled headline,

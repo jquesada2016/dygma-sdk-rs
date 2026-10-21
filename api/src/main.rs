@@ -1932,11 +1932,21 @@ enum BackupCommands {
     /// safe to run at any time (e.g. before an apply). The file this
     /// writes loads into Bazecor's backup flow.
     ///
-    /// If the capture is interrupted (the transport fails mid-way, or
-    /// an identity probe times out), a PARTIAL capture is still saved:
-    /// everything captured so far, marked with the commands it is
-    /// missing. `backup restore` refuses partial files unless
-    /// `--allow-partial` is passed; complete one with `--retry-missing`.
+    /// The identity probes (`hardware.chip_id`, `version`,
+    /// `hardware.wireless`) are best-effort: a probe the device's
+    /// `help` output does not list is never sent (the wireless Defy's
+    /// firmware does not serve `hardware.wireless`), and a served
+    /// probe that fails is recorded rather than fatal. A capture whose
+    /// every command was captured saves as a COMPLETE backup even when
+    /// identity was unobtainable — with the chip id, versions, and
+    /// descriptor fields it did obtain, and a note on stdout naming
+    /// what the device did not provide.
+    ///
+    /// If a capture-list command read fails mid-capture, a PARTIAL
+    /// capture is still saved: everything captured so far, marked with
+    /// the commands it is missing. `backup restore` refuses partial
+    /// files unless `--allow-partial` is passed; complete one with
+    /// `--retry-missing`.
     Create {
         /// The path the backup JSON file will be saved to.
         #[clap(default_value = "backup.json")]
@@ -2200,13 +2210,16 @@ impl BackupCommands {
                     "capturing the backup from the Defy".to_owned()
                 };
 
-                let backup = match capture {
-                    Ok(backup) => backup,
+                let (backup, identity) = match capture {
                     // The capture was interrupted: save the partial
                     // capture it preserved — recoverable, never
                     // mistaken for complete — and fail with the full
                     // recovery story.
-                    Err(CreateBackupError::IncompleteCapture { partial, source }) => {
+                    Err(CreateBackupError::IncompleteCapture {
+                        partial,
+                        command,
+                        source,
+                    }) => {
                         // The partial save itself can fail (a full
                         // disk, a bad path): the write error keeps the
                         // capture story attached instead of discarding
@@ -2214,13 +2227,17 @@ impl BackupCommands {
                         // interrupted capture.
                         if let Err(report) = safe_pretty_json_file(&*partial, &path).await {
                             return Err(report
-                                .attach(format!("while saving the partial capture: {source}"))
+                                .attach(format!(
+                                    "while saving the partial capture: the `{command}` read \
+                                     failed: {source}"
+                                ))
                                 .attach(capture_context));
                         }
 
                         return Err(diagnostics::interrupted_capture_report(
                             &path,
                             &partial,
+                            &command,
                             source,
                             capture_context,
                         ));
@@ -2231,6 +2248,7 @@ impl BackupCommands {
                             .change_context(Error)
                             .attach(capture_context));
                     }
+                    Ok(complete) => complete,
                 };
 
                 safe_pretty_json_file(&backup, &path).await?;
@@ -2241,6 +2259,23 @@ impl BackupCommands {
                     backup.neuron_id,
                     path.display()
                 );
+
+                // Evidence honesty: the file just saved is complete
+                // (the capture only completes when every command was
+                // captured), but identity the device did not provide
+                // is said out loud, not left as silent empty fields.
+                let unavailable: Vec<String> = identity
+                    .unavailable()
+                    .map(|reason| reason.to_string())
+                    .collect();
+
+                if !unavailable.is_empty() {
+                    println!(
+                        "note: the device did not provide all identity metadata (the \
+                         backup is complete): {}",
+                        unavailable.join("; ")
+                    );
+                }
 
                 // A success return never carries the partial marker
                 // (the capture core debug-asserts the invariant), so
