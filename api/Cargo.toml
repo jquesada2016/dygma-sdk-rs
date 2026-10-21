@@ -35,3 +35,9 @@ tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.16", features = ["full"] }
 tracing = "0.1.41"
 winnow = { version = "0.7.13", features = ["unstable-doc"] }
+
+[dev-dependencies]
+# Paused-time (`start_paused`) tests for the HID response deadline.
+# Feature addition to the already-depended-on tokio (its "full" set
+# excludes "test-util"); features unify only under test builds.
+tokio = { version = "1.47.0", features = ["test-util"] }
