@@ -1257,13 +1257,82 @@ fn conversion_snippet(
                 ),
             }
         }
+        ConversionError::NoKeyboardType => ErrorSnippet {
+            code: "dygma-cli::backup-convert::no-keyboard-type",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: (0, 0),
+            label: "this Raise-generation backup's descriptor carries no readable \
+                    `keyboardType`"
+                .to_owned(),
+            context,
+            help: Some(
+                "the Raise 2 → Raise conversion validates the backup's physical layout (the \
+                 ANSI target's Shift swap is the only reader), so the descriptor must spell \
+                 `ANSI` or `ISO` in `neuron.device.info.keyboardType`; Bazecor's `=== \"ISO\"` \
+                 check would silently assume ANSI and skip the swap"
+                    .to_owned(),
+            ),
+        },
+        ConversionError::UnknownKeyboardType { keyboard_type } => ErrorSnippet {
+            code: "dygma-cli::backup-convert::unknown-keyboard-type",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_keyboard_type_value(text, keyboard_type).unwrap_or((0, 0)),
+            label: format!("this backup names the unknown keyboard layout `{keyboard_type}`"),
+            context,
+            help: Some(format!(
+                "only the exact spellings `ANSI` and `ISO` select a layout (Bazecor's \
+                 `=== \"ISO\"` check would silently treat `{keyboard_type}` as ANSI and skip \
+                 the Shift swap); every shipped Raise and Raise 2 descriptor carries one of \
+                 the two"
+            )),
+        },
+        ConversionError::MissingUnderglowGeometry => ErrorSnippet {
+            code: "dygma-cli::backup-convert::no-underglow-geometry",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: (0, 0),
+            label: "this Raise-generation backup's descriptor carries no usable \
+                    `keyboardUnderglow` rows × columns"
+                .to_owned(),
+            context,
+            help: Some(
+                "a Raise ↔ Raise 2 conversion sizes its colormap parse from the descriptor's \
+                 underglow geometry, the way Bazecor's own converters do; a descriptor whose \
+                 geometry is unreadable, zero, or absurd leaves the source layer width unknown"
+                    .to_owned(),
+            ),
+        },
+        ConversionError::UnderglowGeometryTooNarrow { claimed, needed } => ErrorSnippet {
+            code: "dygma-cli::backup-convert::underglow-too-narrow",
+            message: err.to_string(),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: (0, 0),
+            label: format!(
+                "this Raise-generation backup's descriptor claims {claimed} LEDs per layer, \
+                 but the conversion reads {needed}"
+            ),
+            context,
+            help: Some(
+                "the descriptor geometry and the captured colormap cannot both describe the \
+                 same keyboard; Bazecor converts such input anyway (a truncated layer, or \
+                 interpolator defaults past the layer's end), this crate refuses it — check \
+                 the backup's `keyboardUnderglow` descriptor against its `colormap.map` data"
+                    .to_owned(),
+            ),
+        },
     }
 }
 
 /// The supported-conversions sentence shared by the product-shaped
 /// diagnostics.
 fn supported_conversions_help() -> &'static str {
-    "the supported conversions are Defy → Sonsei and Sonsei → Defy"
+    "the supported conversions are Defy → Sonsei, Sonsei → Defy, Raise → Raise 2, and Raise 2 → Raise"
 }
 
 /// The span and label for a converted entry whose data failed the
@@ -1412,6 +1481,16 @@ fn locate_product_value(text: &str, product: &str) -> Option<(usize, usize)> {
     let value = json_string_value(text, key)?;
 
     (text[value.0..value.0 + value.1] == *product).then_some(value)
+}
+
+/// Locates a `keyboardType` value in the raw JSON text, when it holds
+/// exactly the given spelling — the conversion diagnostics' pointer
+/// for an unknown-layout failure.
+fn locate_keyboard_type_value(text: &str, keyboard_type: &str) -> Option<(usize, usize)> {
+    let key = text.find("\"keyboardType\"")?;
+    let value = json_string_value(text, key)?;
+
+    (text[value.0..value.0 + value.1] == *keyboard_type).then_some(value)
 }
 
 /// The span of the `data` value of the entry whose `"command"` is
@@ -1595,7 +1674,15 @@ Error:
 "#;
 
     /// The exact no-color render for the UNSUPPORTED_CONVERSION_GOLDEN (golden).
-    const UNSUPPORTED_CONVERSION_GOLDEN: &str = "dygma-cli::backup-convert::unsupported\n\n  × there is no conversion from Raise to Defy\n    ╭─[backup.json:12:21]\n 11 │         \"vendor\": \"Dygma\",\n 12 │         \"product\": \"Raise\",\n    ·                     ──┬──\n    ·                       ╰── this backup was captured from a `Raise`\n 13 │         \"keyboardType\": \"wireless\",\n    ╰────\n  help: the supported conversions are Defy → Sonsei and Sonsei → Defy, so a Raise → Defy\n        conversion needs its own mapping work\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
+    const UNSUPPORTED_CONVERSION_GOLDEN: &str = "dygma-cli::backup-convert::unsupported\n\n  × there is no conversion from Raise to Defy\n    ╭─[backup.json:12:21]\n 11 │         \"vendor\": \"Dygma\",\n 12 │         \"product\": \"Raise\",\n    ·                     ──┬──\n    ·                       ╰── this backup was captured from a `Raise`\n 13 │         \"keyboardType\": \"wireless\",\n    ╰────\n  help: the supported conversions are Defy → Sonsei, Sonsei → Defy, Raise → Raise 2, and Raise 2 →\n        Raise, so a Raise → Defy conversion needs its own mapping work\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
+
+    /// The exact no-color render for the unknown-keyboard-type failure
+    /// (golden).
+    const UNKNOWN_KEYBOARD_TYPE_GOLDEN: &str = "dygma-cli::backup-convert::unknown-keyboard-type\n\n  × the backup's device descriptor carries the unknown `keyboardType` `wireless`; a Raise 2 →\n  │ Raise conversion accepts only `ANSI` or `ISO`\n    ╭─[backup.json:13:26]\n 12 │         \"product\": \"Raise2\",\n 13 │         \"keyboardType\": \"wireless\",\n    ·                          ────┬───\n    ·                              ╰── this backup names the unknown keyboard layout `wireless`\n 14 │         \"displayName\": \"Dygma Defy wireless\"\n    ╰────\n  help: only the exact spellings `ANSI` and `ISO` select a layout (Bazecor's `=== \"ISO\"` check\n        would silently treat `wireless` as ANSI and skip the Shift swap); every shipped Raise and\n        Raise 2 descriptor carries one of the two\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
+
+    /// The exact no-color render for the narrow-underglow-geometry
+    /// failure (golden).
+    const UNDERGLOW_TOO_NARROW_GOLDEN: &str = "dygma-cli::backup-convert::underglow-too-narrow\n\n  × the backup descriptor's `keyboardUnderglow` geometry resolves to 100 LEDs per layer, but the\n  │ conversion reads 132\n   ╭─[backup.json:1:1]\n 1 │ {\n   · ▲\n   · ╰── this Raise-generation backup's descriptor claims 100 LEDs per layer, but the conversion reads 132\n 2 │   \"neuronID\": \"8ed7f33db024a5b5\",\n   ╰────\n  help: the descriptor geometry and the captured colormap cannot both describe the same keyboard;\n        Bazecor converts such input anyway (a truncated layer, or interpolator defaults past the\n        layer's end), this crate refuses it — check the backup's `keyboardUnderglow` descriptor\n        against its `colormap.map` data\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
 
     /// The exact no-color render for the CONVERSION_SHAPE_GOLDEN (golden).
     const CONVERSION_SHAPE_GOLDEN: &str = "dygma-cli::backup-convert::invalid-entry\n\n  × the `keymap.custom` entry is not convertible: expected 10 layers of 60 values, the data holds\n  │ 800 values, not 600\n   ╭─[backup.json — `keymap.custom` `data` (excerpt):2:44]\n 1 │ \"backup\": [\n 2 │     { \"command\": \"keymap.custom\", \"data\": \"41 30 31 32 33 34 35 0 0 51518 37 38 39 45 46 42 43 20 \n   ·                                            ▲\n   ·                                            ╰── the data holds 800 values, not 600\n   ╰────\n  help: converting rewrites the entry into the target product's layer shape, so the entry must\n        hold the source product's shape exactly\n\nError: \n  × converting the backup in backup.json\n\nError: \n  × something went wrong running the command\n";
@@ -2035,7 +2122,7 @@ Error:
             Some(&text),
             dygma_cli::devices::conversions::convert_backup(
                 &backup,
-                dygma_cli::devices::conversions::Product::Defy,
+                dygma_cli::devices::conversions::ConversionTarget::Defy,
             )
             .unwrap_err(),
         );
@@ -2084,12 +2171,91 @@ Error:
             Some(&text),
             dygma_cli::devices::conversions::convert_backup(
                 &backup,
-                dygma_cli::devices::conversions::Product::Defy,
+                dygma_cli::devices::conversions::ConversionTarget::Defy,
             )
             .unwrap_err(),
         );
 
         assert_eq!(render_plain(&report), CONVERSION_SHAPE_GOLDEN);
+    }
+
+    /// Renders a Raise 2 backup whose descriptor spells an unknown
+    /// `keyboardType` and pins the exact no-color output: the span
+    /// must sit on the unknown layout value, and the help must state
+    /// the true Bazecor behavior (the backup-layout `=== "ISO"` check
+    /// failing open toward ANSI, skipping the Shift swap).
+    #[test]
+    fn unknown_keyboard_type_renders_the_layout_value() {
+        // `backup_json` spells `keyboardType: "wireless"` — exactly the
+        // unknown-layout case for a Raise 2 source; the conversion
+        // fails in `recipe`, before any entry data is read.
+        let text = backup_json("Raise2", "Silver Raise 2", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = conversion_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::conversions::convert_backup(
+                &backup,
+                dygma_cli::devices::conversions::ConversionTarget::Raise(
+                    dygma_cli::devices::conversions::KeyboardType::Ansi,
+                ),
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), UNKNOWN_KEYBOARD_TYPE_GOLDEN);
+    }
+
+    /// Renders a Raise 2 backup whose descriptor geometry claims fewer
+    /// LEDs per layer than the conversion reads and pins the exact
+    /// no-color output: the label must state the claimed/needed counts.
+    #[test]
+    fn narrow_underglow_geometry_renders_the_counts() {
+        // A Raise 2-shaped capture whose descriptor claims 1 × 100 =
+        // 100 LEDs per layer — below the 132 the colormap tables read.
+        // The guard fires before any entry data is read, so the data
+        // strings are irrelevant here.
+        let text = r#"{
+  "neuronID": "8ed7f33db024a5b5",
+  "neuron": {
+    "id": "8ed7f33db024a5b5",
+    "name": "Silver Raise 2",
+    "layers": [],
+    "macros": [],
+    "superkeys": [],
+    "device": {
+      "info": {
+        "vendor": "Dygma",
+        "product": "Raise2",
+        "keyboardType": "ANSI",
+        "displayName": "Dygma Raise 2 ANSI"
+      },
+      "usb": { "vendorId": 13807, "productId": 33 },
+      "keyboardUnderglow": { "rows": 1, "columns": 100 }
+    },
+    "chipId": "8ed7f33db024a5b5"
+  },
+  "versions": { "bazecor": "v1.0.0-beta.2" },
+  "backup": [
+    { "command": "keymap.custom", "data": "0" },
+    { "command": "colormap.map", "data": "0" },
+    { "command": "palette", "data": "0" }
+  ]
+}"#;
+        let backup: DefyBackup = serde_json::from_str(text).unwrap();
+        let report = conversion_report_with_text(
+            Path::new("backup.json"),
+            Some(text),
+            dygma_cli::devices::conversions::convert_backup(
+                &backup,
+                dygma_cli::devices::conversions::ConversionTarget::Raise(
+                    dygma_cli::devices::conversions::KeyboardType::Ansi,
+                ),
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), UNDERGLOW_TOO_NARROW_GOLDEN);
     }
 
     /// A backup's `macros.map` entry with a value that is a valid u16

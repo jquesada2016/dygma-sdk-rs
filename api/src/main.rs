@@ -2026,6 +2026,11 @@ enum BackupCommands {
     /// extension (Bazecor blind-restores that pair, writing
     /// 60-position keymap layers to a Defy).
     ///
+    /// Raise and Raise 2 targets take `--keyboard-type`: the physical
+    /// layout of the TARGET keyboard (the Enter/Shift wire positions
+    /// the conversion swaps differ between ANSI and ISO). The source
+    /// layout is read from the backup's own descriptor.
+    ///
     /// This is fully offline — it never opens a device connection —
     /// and it prints the mapping report: which positions mapped 1:1,
     /// which were defaulted (to transparent, or palette color 0), and
@@ -2040,6 +2045,11 @@ enum BackupCommands {
         /// The product to convert the backup into.
         #[clap(long)]
         to: ConvertTarget,
+        /// The physical key layout of a Raise or Raise 2 target.
+        /// Required for `--to raise` / `--to raise2`; not accepted for
+        /// other targets.
+        #[clap(long)]
+        keyboard_type: Option<KeyboardTypeArg>,
         /// The path the converted backup JSON file is written to.
         #[clap(long, required_unless_present = "dry_run")]
         out: Option<PathBuf>,
@@ -2056,14 +2066,80 @@ enum ConvertTarget {
     Defy,
     /// The Dygma Sonsei.
     Sonsei,
+    /// The Dygma Raise (first generation).
+    Raise,
+    /// The Dygma Raise 2.
+    Raise2,
 }
 
-impl From<ConvertTarget> for conversions::Product {
-    fn from(target: ConvertTarget) -> Self {
-        match target {
-            ConvertTarget::Defy => Self::Defy,
-            ConvertTarget::Sonsei => Self::Sonsei,
+/// The physical key layout of a Raise-generation `backup convert`
+/// target, as `--keyboard-type` spells it — the device descriptors'
+/// own `ANSI`/`ISO` spelling.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KeyboardTypeArg {
+    #[value(name = "ANSI")]
+    Ansi,
+    #[value(name = "ISO")]
+    Iso,
+}
+
+impl From<KeyboardTypeArg> for conversions::KeyboardType {
+    fn from(keyboard_type: KeyboardTypeArg) -> Self {
+        match keyboard_type {
+            KeyboardTypeArg::Ansi => Self::Ansi,
+            KeyboardTypeArg::Iso => Self::Iso,
         }
+    }
+}
+
+/// Error from combining `backup convert`'s target arguments: the
+/// keyboard layout is required exactly for the targets that convert by
+/// layout, and accepted exactly there.
+#[derive(Clone, Debug, Display, Error)]
+enum ConvertTargetError {
+    /// A Raise/Raise 2 target without a `--keyboard-type`.
+    #[display(
+        "converting onto a Raise or Raise 2 needs the target keyboard's physical layout: pass `--keyboard-type ANSI` or `--keyboard-type ISO`"
+    )]
+    KeyboardTypeRequired,
+    /// `--keyboard-type` given for a Defy/Sonsei target.
+    #[display(
+        "`--keyboard-type` only applies to Raise and Raise 2 targets; a {to} keyboard has one layout"
+    )]
+    KeyboardTypeNotApplicable {
+        /// The target whose layout is not a choice.
+        to: conversions::Product,
+    },
+}
+
+/// Resolves `backup convert`'s `--to` and `--keyboard-type` into the
+/// conversion target the SDK layer takes — the one place the CLI's
+/// "layout required exactly for Raise targets" rule lives.
+fn conversion_target(
+    to: ConvertTarget,
+    keyboard_type: Option<KeyboardTypeArg>,
+) -> Result<conversions::ConversionTarget, ConvertTargetError> {
+    match to {
+        ConvertTarget::Defy => match keyboard_type {
+            None => Ok(conversions::ConversionTarget::Defy),
+            Some(_) => Err(ConvertTargetError::KeyboardTypeNotApplicable {
+                to: conversions::Product::Defy,
+            }),
+        },
+        ConvertTarget::Sonsei => match keyboard_type {
+            None => Ok(conversions::ConversionTarget::Sonsei),
+            Some(_) => Err(ConvertTargetError::KeyboardTypeNotApplicable {
+                to: conversions::Product::Sonsei,
+            }),
+        },
+        ConvertTarget::Raise => match keyboard_type {
+            Some(keyboard_type) => Ok(conversions::ConversionTarget::Raise(keyboard_type.into())),
+            None => Err(ConvertTargetError::KeyboardTypeRequired),
+        },
+        ConvertTarget::Raise2 => match keyboard_type {
+            Some(keyboard_type) => Ok(conversions::ConversionTarget::Raise2(keyboard_type.into())),
+            None => Err(ConvertTargetError::KeyboardTypeRequired),
+        },
     }
 }
 
@@ -2449,14 +2525,28 @@ impl BackupCommands {
             Self::Convert {
                 path,
                 to,
+                keyboard_type,
                 out,
                 dry_run,
             } => {
+                // The target arguments are validated before the file
+                // is touched: a `--keyboard-type` misuse has nothing
+                // to do with the file's contents.
+                let target = match conversion_target(to, keyboard_type) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        return Err(err
+                            .into_report()
+                            .change_context(Error)
+                            .attach(format!("converting the backup in {}", path.display())));
+                    }
+                };
+
                 // Fully offline: parse the file and convert it — no
                 // device connection is ever opened.
                 let backup = read_json_file::<DefyBackup>(&path).await?;
 
-                let (converted, report) = match conversions::convert_backup(&backup, to.into()) {
+                let (converted, report) = match conversions::convert_backup(&backup, target) {
                     Ok(result) => result,
                     Err(err) => return Err(diagnostics::conversion_report(&path, err)),
                 };
@@ -3440,6 +3530,78 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--keyboard-type` rule: required exactly for Raise and
+    /// Raise 2 targets, rejected exactly elsewhere, and resolved into
+    /// the SDK's conversion target with the descriptor's layout
+    /// spelling.
+    #[test]
+    fn conversion_target_resolves_the_keyboard_type_rule() {
+        // Defy and Sonsei take no layout argument.
+        assert_eq!(
+            conversion_target(ConvertTarget::Defy, None).unwrap(),
+            conversions::ConversionTarget::Defy
+        );
+        assert_eq!(
+            conversion_target(ConvertTarget::Sonsei, None).unwrap(),
+            conversions::ConversionTarget::Sonsei
+        );
+        assert!(matches!(
+            conversion_target(ConvertTarget::Defy, Some(KeyboardTypeArg::Ansi)),
+            Err(ConvertTargetError::KeyboardTypeNotApplicable {
+                to: conversions::Product::Defy
+            })
+        ));
+        assert!(matches!(
+            conversion_target(ConvertTarget::Sonsei, Some(KeyboardTypeArg::Iso)),
+            Err(ConvertTargetError::KeyboardTypeNotApplicable {
+                to: conversions::Product::Sonsei
+            })
+        ));
+
+        // Raise and Raise 2 require it, in the descriptors' spelling.
+        assert_eq!(
+            conversion_target(ConvertTarget::Raise, Some(KeyboardTypeArg::Ansi)).unwrap(),
+            conversions::ConversionTarget::Raise(conversions::KeyboardType::Ansi)
+        );
+        assert_eq!(
+            conversion_target(ConvertTarget::Raise2, Some(KeyboardTypeArg::Iso)).unwrap(),
+            conversions::ConversionTarget::Raise2(conversions::KeyboardType::Iso)
+        );
+        assert!(matches!(
+            conversion_target(ConvertTarget::Raise, None),
+            Err(ConvertTargetError::KeyboardTypeRequired)
+        ));
+        assert!(matches!(
+            conversion_target(ConvertTarget::Raise2, None),
+            Err(ConvertTargetError::KeyboardTypeRequired)
+        ));
+
+        // The misuse errors render through the same #16 diagnostics
+        // exit the conversion failures do (the exact construction the
+        // `Convert` arm runs): the message and the command context are
+        // the story, and there is no file snippet to invent. The
+        // rendered chain wraps at the pinned width, so the content
+        // assertions normalize the wrapping away.
+        for err in [
+            conversion_target(ConvertTarget::Raise, None).unwrap_err(),
+            conversion_target(ConvertTarget::Defy, Some(KeyboardTypeArg::Iso)).unwrap_err(),
+        ] {
+            let report = err
+                .clone()
+                .into_report()
+                .change_context(Error)
+                .attach("converting the backup in backup.json");
+            let flat = diagnostics::render(&report)
+                .split('│')
+                .flat_map(|part| part.split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            assert!(flat.contains(&err.to_string()));
+            assert!(flat.contains("converting the backup in backup.json"));
+        }
+    }
 
     /// A type whose [`serde::Serialize`] implementation always fails
     /// deterministically.
