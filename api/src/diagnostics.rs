@@ -24,6 +24,8 @@ use dygma_cli::devices::defy::{
     BackupEntryError, BackupValidationError, DefyColormap, DefyKeymap, MacroMap,
     ParseColormapError, ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
 };
+use dygma_cli::devices::raise;
+use dygma_cli::devices::raise2;
 use dygma_cli::devices::restore::RestorePlanError;
 use dygma_cli::devices::sonsei::{
     self, ParseColormapError as SonseiParseColormapError,
@@ -476,6 +478,14 @@ pub(super) enum WireFormat {
     /// `RGBWMode: false` shape). Same reach as
     /// [`WireFormat::Keymap60`].
     PaletteRgb,
+    /// A Raise `colormap.map` data string (132 palette indices per
+    /// layer). Never reaches the apply-command paths (the Raise has
+    /// no transport); it names the format in Raise backup-entry
+    /// diagnostics.
+    Colormap132,
+    /// A Raise 2 `colormap.map` data string (176 palette indices per
+    /// layer). Same reach as [`WireFormat::Colormap132`].
+    Colormap176,
 }
 
 /// How many wire values one layer of each layered format carries, for
@@ -491,6 +501,8 @@ impl WireFormat {
             Self::Colormap => Some(178),
             Self::Keymap60 => Some(60),
             Self::Colormap56 => Some(56),
+            Self::Colormap132 => Some(132),
+            Self::Colormap176 => Some(176),
             Self::Superkeys | Self::Macros => None,
         }
     }
@@ -508,6 +520,8 @@ impl WireFormat {
             Self::Keymap60 => "--keymap",
             Self::Colormap56 => "--colormap",
             Self::PaletteRgb => "--palette",
+            Self::Colormap132 => "--colormap",
+            Self::Colormap176 => "--colormap",
         }
     }
 
@@ -518,7 +532,7 @@ impl WireFormat {
             Self::Superkeys => "superkeys",
             Self::Macros => "macros",
             Self::Palette | Self::PaletteRgb => "palette",
-            Self::Colormap | Self::Colormap56 => "colormap",
+            Self::Colormap | Self::Colormap56 | Self::Colormap132 | Self::Colormap176 => "colormap",
         }
     }
 
@@ -529,7 +543,9 @@ impl WireFormat {
             Self::Superkeys => "dygma-cli::superkeys::wire-parse",
             Self::Macros => "dygma-cli::macros::wire-parse",
             Self::Palette | Self::PaletteRgb => "dygma-cli::palette::wire-parse",
-            Self::Colormap | Self::Colormap56 => "dygma-cli::colormap::wire-parse",
+            Self::Colormap | Self::Colormap56 | Self::Colormap132 | Self::Colormap176 => {
+                "dygma-cli::colormap::wire-parse"
+            }
         }
     }
 
@@ -567,6 +583,14 @@ impl WireFormat {
             Self::PaletteRgb => {
                 "Sonsei palette wire data is space-separated decimals — 3 RGB channels \
                  per color (the RGBWMode: false shape), 16 colors per palette"
+            }
+            Self::Colormap132 => {
+                "Raise colormap wire data is space-separated palette indices (0-15) — \
+                 132 per layer, 10 layers per colormap.map write"
+            }
+            Self::Colormap176 => {
+                "Raise 2 colormap wire data is space-separated palette indices (0-15) — \
+                 176 per layer, 10 layers per colormap.map write"
             }
         }
     }
@@ -1151,6 +1175,8 @@ fn restore_plan_report_with_text(
     match err {
         RestorePlanError::Defy(err) => backup_validation_report_with_text(path, text, err),
         RestorePlanError::Sonsei(err) => sonsei_validation_report_with_text(path, text, err),
+        RestorePlanError::Raise(err) => raise_validation_report_with_text(path, text, err),
+        RestorePlanError::Raise2(err) => raise2_validation_report_with_text(path, text, err),
         dispatch => dispatch_report_with_text(path, text, &dispatch),
     }
 }
@@ -1184,8 +1210,8 @@ fn sonsei_validation_report_with_text(
 
 /// Builds the report for a restore-plan DISPATCH refusal — a backup
 /// whose product the dispatch could not route to a validator (an
-/// unknown product name, or a known one with no modeled restore). Both
-/// are descriptor facts, so the span sits on the product value when
+/// unknown product name; every product the SDK knows has a validator
+/// now). A descriptor fact, so the span sits on the product value when
 /// the file text is available.
 fn dispatch_report_with_text(
     path: &Path,
@@ -1210,24 +1236,16 @@ fn dispatch_report_with_text(
                  `backup show` prints what a file carries"
                     .to_owned(),
             ),
-            RestorePlanError::NoModeledRestore { product } => (
-                "dygma-cli::backup-restore::no-modeled-restore",
-                err.to_string(),
-                format!("this backup was captured from a `{product}`"),
-                format!(
-                    "the {product}'s backups convert but do not restore here — \
-                     convert it first (`dygma-cli backup convert --to defy`, with \
-                     `--keyboard-type` for a Raise target)"
-                ),
-            ),
-            RestorePlanError::Defy(_) | RestorePlanError::Sonsei(_) => {
+            RestorePlanError::Defy(_)
+            | RestorePlanError::Sonsei(_)
+            | RestorePlanError::Raise(_)
+            | RestorePlanError::Raise2(_) => {
                 unreachable!("a per-product validation refusal dispatches to its own report")
             }
         };
 
         let product = match err {
             RestorePlanError::UnknownProduct { product } => product.as_str(),
-            RestorePlanError::NoModeledRestore { product } => product.name(),
             _ => unreachable!("handled above"),
         };
 
@@ -1412,6 +1430,383 @@ fn sonsei_wire_failure(source: &sonsei::BackupEntryError) -> Option<(WireFormat,
         // A color-count rejection names its count; there is no single
         // token to point at.
         _ => None,
+    }
+}
+
+// =====================================================================================
+// Raise-generation restore-plan failures
+// =====================================================================================
+
+/// The Raise-generation entry errors' shared shape for diagnostics:
+/// where a parse failure located itself (the same triple every
+/// product's span machinery consumes) and whether the failure is a
+/// keymap layer-count rejection (the one unlocated failure whose
+/// label spells the numbers out).
+///
+/// Implemented by the Raise's and the Raise 2's
+/// [`BackupEntryError`](crate::devices::raise::BackupEntryError)
+/// types, whose variants are structurally identical — the two
+/// generations differ in widths and wording, not in refusal shapes —
+/// so ONE span/label/snippet implementation serves both.
+trait RaiseLikeEntryError: std::fmt::Display {
+    /// The wire format and failure location of the parse failure,
+    /// when it located one.
+    fn wire_failure(&self) -> Option<(WireFormat, usize, bool)>;
+    /// Whether this failure is the keymap's exactly-ten-layers
+    /// rejection.
+    fn is_keymap_layer_count(&self) -> bool;
+}
+
+impl RaiseLikeEntryError for raise::BackupEntryError {
+    fn wire_failure(&self) -> Option<(WireFormat, usize, bool)> {
+        use raise::BackupEntryError as E;
+
+        match self {
+            E::Keymap(raise::ParseKeymapError::MalformedData(inner)) => {
+                // The Raise keymap is the Defy-width wire matrix.
+                Some((WireFormat::Keymap, inner.offset, false))
+            }
+            E::Superkeys(ParseSuperkeyMapError::MalformedData(inner)) => {
+                Some((WireFormat::Superkeys, inner.offset, false))
+            }
+            E::Macros(ParseMacroMapError::MalformedData(inner)) => {
+                Some((WireFormat::Macros, inner.offset, inner.unsupported_kind))
+            }
+            E::Palette(ParseRgbPaletteError::MalformedData { offset, .. }) => {
+                Some((WireFormat::PaletteRgb, *offset, false))
+            }
+            E::Colormap(raise::ParseColormapError::MalformedData(inner)) => Some((
+                WireFormat::Colormap132,
+                inner.offset,
+                inner.consumed_offender,
+            )),
+            _ => None,
+        }
+    }
+
+    fn is_keymap_layer_count(&self) -> bool {
+        matches!(
+            self,
+            raise::BackupEntryError::Keymap(raise::ParseKeymapError::IncorrectLayerCount(_))
+        )
+    }
+}
+
+impl RaiseLikeEntryError for raise2::BackupEntryError {
+    fn wire_failure(&self) -> Option<(WireFormat, usize, bool)> {
+        use raise2::BackupEntryError as E;
+
+        match self {
+            E::Keymap(raise2::ParseKeymapError::MalformedData(inner)) => {
+                Some((WireFormat::Keymap, inner.offset, false))
+            }
+            E::Superkeys(ParseSuperkeyMapError::MalformedData(inner)) => {
+                Some((WireFormat::Superkeys, inner.offset, false))
+            }
+            E::Macros(ParseMacroMapError::MalformedData(inner)) => {
+                Some((WireFormat::Macros, inner.offset, inner.unsupported_kind))
+            }
+            E::Palette(ParsePaletteError::MalformedData { offset, .. }) => {
+                Some((WireFormat::Palette, *offset, false))
+            }
+            E::Colormap(raise2::ParseColormapError::MalformedData(inner)) => Some((
+                WireFormat::Colormap176,
+                inner.offset,
+                inner.consumed_offender,
+            )),
+            _ => None,
+        }
+    }
+
+    fn is_keymap_layer_count(&self) -> bool {
+        matches!(
+            self,
+            raise2::BackupEntryError::Keymap(raise2::ParseKeymapError::IncorrectLayerCount(_))
+        )
+    }
+}
+
+/// The Raise-generation validation errors' shared shape: which of the
+/// three refusal shapes this error is. See
+/// [`RaiseLikeEntryError`] for why one implementation serves both
+/// generations.
+trait RaiseLikeValidationError {
+    type Entry: RaiseLikeEntryError;
+
+    fn refusal(&self) -> RaiseLikeRefusal<'_, Self::Entry>;
+}
+
+/// One Raise-generation validation refusal, normalized across the two
+/// generations.
+enum RaiseLikeRefusal<'a, E> {
+    /// The backup's descriptor names another product.
+    WrongProduct {
+        /// The product name the descriptor carries.
+        product: &'a str,
+    },
+    /// The backup carries the partial-capture marker.
+    PartialCapture,
+    /// One captured entry failed validation.
+    InvalidEntry {
+        /// The captured command whose data failed.
+        command: &'a str,
+        /// The parse failure.
+        source: &'a E,
+    },
+}
+
+impl RaiseLikeValidationError for raise::BackupValidationError {
+    type Entry = raise::BackupEntryError;
+
+    fn refusal(&self) -> RaiseLikeRefusal<'_, Self::Entry> {
+        use raise::BackupValidationError as E;
+
+        match self {
+            E::NotARaiseBackup { product } => RaiseLikeRefusal::WrongProduct { product },
+            E::PartialCapture { .. } => RaiseLikeRefusal::PartialCapture,
+            E::InvalidEntry { command, source } => {
+                RaiseLikeRefusal::InvalidEntry { command, source }
+            }
+        }
+    }
+}
+
+impl RaiseLikeValidationError for raise2::BackupValidationError {
+    type Entry = raise2::BackupEntryError;
+
+    fn refusal(&self) -> RaiseLikeRefusal<'_, Self::Entry> {
+        use raise2::BackupValidationError as E;
+
+        match self {
+            E::NotARaise2Backup { product } => RaiseLikeRefusal::WrongProduct { product },
+            E::PartialCapture { .. } => RaiseLikeRefusal::PartialCapture,
+            E::InvalidEntry { command, source } => {
+                RaiseLikeRefusal::InvalidEntry { command, source }
+            }
+        }
+    }
+}
+
+/// The per-generation facts the shared Raise-generation snippet needs:
+/// the product's display name and its refusal code/help wordings.
+struct RaiseLikeFacts {
+    /// The product as the messages name it ("Raise" / "Raise 2").
+    product_display: &'static str,
+    /// The wrong-product diagnostic's code.
+    not_product_code: &'static str,
+    /// The wrong-product diagnostic's help.
+    not_product_help: &'static str,
+    /// The invalid-entry diagnostic's help.
+    invalid_entry_help: &'static str,
+}
+
+const RAISE_FACTS: RaiseLikeFacts = RaiseLikeFacts {
+    product_display: "Raise",
+    not_product_code: "dygma-cli::backup::not-a-raise",
+    not_product_help: "a Raise restore takes Raise-shaped data — cross-product \
+                       restores go through conversion (`dygma-cli backup convert`), and \
+                       this SDK has no Raise transport to restore onto in any case",
+    invalid_entry_help: "backups hold whole device maps — this `data` must be Raise wire \
+                         data (every product's shapes differ: a Defy's, Sonsei's, or Raise \
+                         2's entries are not Raise data; this SDK converts Defy and Sonsei \
+                         into each other, and Raise into Raise 2 and back, and nothing \
+                         else)",
+};
+
+const RAISE2_FACTS: RaiseLikeFacts = RaiseLikeFacts {
+    product_display: "Raise 2",
+    not_product_code: "dygma-cli::backup::not-a-raise2",
+    not_product_help: "a Raise 2 restore takes Raise 2-shaped data — cross-product \
+                       restores go through conversion (`dygma-cli backup convert`), and \
+                       this SDK has no Raise 2 transport to restore onto in any case",
+    invalid_entry_help: "backups hold whole device maps — this `data` must be Raise 2 wire \
+                         data (every product's shapes differ: a Defy's, Sonsei's, or Raise's \
+                         entries are not Raise 2 data; this SDK converts Defy and Sonsei \
+                         into each other, and Raise into Raise 2 and back, and nothing \
+                         else)",
+};
+
+/// Builds the Raise validation-failure report from file text the
+/// caller already holds; when the text is unavailable, the diagnostic
+/// renders without a snippet. The Raise sibling of
+/// [`sonsei_validation_report_with_text`], sharing the
+/// Raise-generation snippet machinery below.
+fn raise_validation_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: raise::BackupValidationError,
+) -> error_stack::Report<Error> {
+    let context_line = format!("validating the backup in {}", path.display());
+    let report = err
+        .clone()
+        .into_report()
+        .change_context(Error)
+        .attach(context_line.clone());
+
+    match text {
+        Some(text) => report.attach_opaque(raise_like_backup_validation_snippet(
+            path,
+            text,
+            &err,
+            &RAISE_FACTS,
+            vec![context_line],
+        )),
+        None => report,
+    }
+}
+
+/// Builds the Raise 2 validation-failure report from file text the
+/// caller already holds; when the text is unavailable, the diagnostic
+/// renders without a snippet. The Raise 2 sibling of
+/// [`sonsei_validation_report_with_text`], sharing the
+/// Raise-generation snippet machinery below.
+fn raise2_validation_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: raise2::BackupValidationError,
+) -> error_stack::Report<Error> {
+    let context_line = format!("validating the backup in {}", path.display());
+    let report = err
+        .clone()
+        .into_report()
+        .change_context(Error)
+        .attach(context_line.clone());
+
+    match text {
+        Some(text) => report.attach_opaque(raise_like_backup_validation_snippet(
+            path,
+            text,
+            &err,
+            &RAISE2_FACTS,
+            vec![context_line],
+        )),
+        None => report,
+    }
+}
+
+/// Locates a Raise-generation restore-validation failure in the raw
+/// JSON text. The shared sibling of
+/// [`backup_validation_snippet`] and
+/// [`sonsei_backup_validation_snippet`]: the same three refusal
+/// shapes (the partial-capture refusal renders identically — its
+/// wording's single source is the shared
+/// `PartialCapture::refusal_display`).
+fn raise_like_backup_validation_snippet<E: RaiseLikeValidationError + std::fmt::Display>(
+    path: &Path,
+    text: &str,
+    err: &E,
+    facts: &RaiseLikeFacts,
+    context: Vec<String>,
+) -> ErrorSnippet {
+    match err.refusal() {
+        RaiseLikeRefusal::WrongProduct { product } => ErrorSnippet {
+            code: facts.not_product_code,
+            message: format!(
+                "the backup is for a `{product}`, not a {}",
+                facts.product_display
+            ),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, product).unwrap_or((0, 0)),
+            label: format!("this backup was captured from a `{product}`"),
+            context,
+            help: Some(facts.not_product_help.to_owned()),
+        },
+        RaiseLikeRefusal::PartialCapture => {
+            // The refusal's wording lives on the error type's Display
+            // (one source, including the empty-missing case); the
+            // snippet renders it verbatim — the same single source
+            // every product's refusal renders.
+            let message = err.to_string();
+
+            ErrorSnippet {
+                code: "dygma-cli::backup::partial-capture",
+                message,
+                source_name: path.display().to_string(),
+                source_text: text.to_owned(),
+                span: locate_partial_marker(text).unwrap_or((0, 0)),
+                label: "this marker says the file was saved from a failed capture".to_owned(),
+                context,
+                help: Some(
+                    "restoring it would write a half-captured configuration to the \
+                     device — complete the capture first (`dygma-cli backup create \
+                     --retry-missing <file>`), re-capture, or pass `--allow-partial` \
+                     to restore what the file holds"
+                        .to_owned(),
+                ),
+            }
+        }
+        RaiseLikeRefusal::InvalidEntry { command, source } => {
+            let (span, label) = locate_data_value(text, command)
+                .map(|(start, len)| {
+                    raise_like_entry_span_and_label(&text[start..start + len], start, source)
+                })
+                .unwrap_or(((0, 0), source.to_string()));
+
+            // The `data` value is one huge line; show an excerpt around
+            // the span instead of the whole line.
+            let (source_text, span) = excerpt(text, span.0, span.1);
+
+            ErrorSnippet {
+                code: "dygma-cli::backup::invalid-entry",
+                message: format!("the `{command}` entry failed restore validation: {source}"),
+                source_name: format!("{} — `{command}` `data` (excerpt)", path.display()),
+                source_text,
+                span,
+                label,
+                context,
+                help: Some(facts.invalid_entry_help.to_owned()),
+            }
+        }
+    }
+}
+
+/// The span and label for a Raise-generation backup entry whose `data`
+/// failed validation, with the span offset based at `start` (the
+/// beginning of the entry's data value in the file). The shared
+/// sibling of [`entry_span_and_label`] and
+/// [`sonsei_entry_span_and_label`]: the same three wire-site shapes,
+/// with the Raise generations' 80-wide keymap in the count label.
+fn raise_like_entry_span_and_label<E: RaiseLikeEntryError>(
+    data: &str,
+    start: usize,
+    source: &E,
+) -> ((usize, usize), String) {
+    match wire_site(data, source.wire_failure()) {
+        WireSite::Offender { offset, token } => (
+            (start + offset, token.len()),
+            format!("not valid wire data: `{token}`"),
+        ),
+        WireSite::Stop { offset, token } => (
+            (start + offset, token.len()),
+            "parsing stopped here".to_owned(),
+        ),
+        WireSite::End => (
+            (start, 0),
+            "the data ended where a value was expected".to_owned(),
+        ),
+        // Layer-count rejections carry no offset. A keymap whose layer
+        // count is wrong parses as wire data, so the count is the
+        // whole story: say it with the Raise generations' numbers (the
+        // Defy-width 80-position matrix). The rest let the source's
+        // own message carry it.
+        WireSite::Unlocated { token } => {
+            if source.is_keymap_layer_count() {
+                let numbers = data.split_whitespace().count();
+                let first_token = token.map_or(0, |(_, token)| token.len());
+
+                return (
+                    (start, first_token),
+                    format!(
+                        "{numbers} codes = {} layers; a `keymap.custom` write carries \
+                         exactly 800 = 10",
+                        numbers / 80
+                    ),
+                );
+            }
+
+            ((start, 0), source.to_string())
+        }
     }
 }
 
@@ -1760,6 +2155,8 @@ fn wire_offender(text: &str, offset: usize, format: WireFormat) -> Option<(usize
             | WireFormat::Palette
             | WireFormat::Colormap
             | WireFormat::Colormap56
+            | WireFormat::Colormap132
+            | WireFormat::Colormap176
             | WireFormat::PaletteRgb => token.parse::<u8>().is_err(),
             WireFormat::Keymap | WireFormat::Superkeys | WireFormat::Keymap60 => {
                 token.parse::<u16>().is_err()
@@ -2497,28 +2894,6 @@ Error:
 Error: 
   × something went wrong running the command
 "#;
-    /// The exact no-color render for the no-modeled-restore dispatch
-    /// refusal (golden).
-    const NO_MODELED_RESTORE_GOLDEN: &str = r#"dygma-cli::backup-restore::no-modeled-restore
-
-  × no restore validation is modeled for the Raise; convert the backup to a supported target to
-  │ restore it
-    ╭─[backup.json:12:21]
- 11 │         "vendor": "Dygma",
- 12 │         "product": "Raise",
-    ·                     ──┬──
-    ·                       ╰── this backup was captured from a `Raise`
- 13 │         "keyboardType": "wireless",
-    ╰────
-  help: the Raise's backups convert but do not restore here — convert it first (`dygma-cli backup
-        convert --to defy`, with `--keyboard-type` for a Raise target)
-
-Error: 
-  × validating the backup in backup.json
-
-Error: 
-  × something went wrong running the command
-"#;
 
     /// Renders a Defy backup refused by the SONSEI validator (the
     /// mirrored cross-product guard, reached through the direct
@@ -2573,13 +2948,79 @@ Error:
         assert_eq!(render_plain(&report), UNKNOWN_PRODUCT_GOLDEN);
     }
 
-    /// Renders a Raise backup refused by the restore dispatch (known
-    /// product, no modeled restore) and pins the exact no-color
-    /// output: the help names the conversion that produces a
-    /// restorable file.
+    /// The exact no-color render for the Raise cross-product refusal
+    /// (golden) — the Raise-generation wording of the shared snippet
+    /// machinery.
+    const RAISE_WRONG_PRODUCT_GOLDEN: &str = r#"dygma-cli::backup::not-a-raise
+
+  × the backup is for a `Raise2`, not a Raise
+    ╭─[backup.json:12:21]
+ 11 │         "vendor": "Dygma",
+ 12 │         "product": "Raise2",
+    ·                     ───┬──
+    ·                        ╰── this backup was captured from a `Raise2`
+ 13 │         "keyboardType": "wireless",
+    ╰────
+  help: a Raise restore takes Raise-shaped data — cross-product restores go through conversion
+        (`dygma-cli backup convert`), and this SDK has no Raise transport to restore onto in any
+        case
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+    /// The exact no-color render for a Raise backup whose layer count
+    /// is wrong (golden) — the label states the Raise generations'
+    /// counts (800 = 10), reached through the product dispatch.
+    const RAISE_NINE_GOLDEN: &str = r#"dygma-cli::backup::invalid-entry
+
+  × the `keymap.custom` entry failed restore validation: keymap does not have exactly 10 layers
+   ╭─[backup.json — `keymap.custom` `data` (excerpt):3:16]
+ 2 │       "command": "keymap.custom",
+ 3 │       "data": "41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 
+   ·                ─┬
+   ·                 ╰── 720 codes = 9 layers; a `keymap.custom` write carries exactly 800 = 10
+   ╰────
+  help: backups hold whole device maps — this `data` must be Raise wire data (every product's
+        shapes differ: a Defy's, Sonsei's, or Raise 2's entries are not Raise data; this SDK
+        converts Defy and Sonsei into each other, and Raise into Raise 2 and back, and nothing
+        else)
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+
+    /// Renders a Raise 2 backup refused by the RAISE validator (the
+    /// mirrored cross-product guard, reached through the direct
+    /// library validator — the dispatch itself routes a Raise 2
+    /// backup to the Raise 2 validator) and pins the exact no-color
+    /// output.
     #[test]
-    fn no_modeled_restore_backup_renders_the_product_value() {
-        let text = backup_json("Raise", "Silver Raise", &keymap_wire(10));
+    fn raise_wrong_product_backup_renders_the_product_value() {
+        let text = backup_json("Raise2", "Silver Raise", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let err = RestorePlanError::Raise(
+            dygma_cli::devices::raise::backup_restore_plan(&backup).unwrap_err(),
+        );
+        let report = restore_plan_report_with_text(Path::new("backup.json"), Some(&text), err);
+
+        assert_eq!(render_plain(&report), RAISE_WRONG_PRODUCT_GOLDEN);
+    }
+
+    /// Renders a Raise backup whose `keymap.custom` holds nine
+    /// 80-wide layers, through the product dispatch, and pins the
+    /// exact no-color output: the label must state the Raise
+    /// generations' counts (800 = 10), not the Sonsei's (600 = 10).
+    #[test]
+    fn raise_nine_layer_backup_renders_the_layer_counts() {
+        let layer = vec!["41"; 80].join(" ");
+        let nine = vec![layer; 9].join(" ");
+        let text = backup_json("Raise", "Silver Raise", &nine);
         let backup: DefyBackup = serde_json::from_str(&text).unwrap();
         let report = restore_plan_report_with_text(
             Path::new("backup.json"),
@@ -2587,7 +3028,7 @@ Error:
             dygma_cli::devices::restore::backup_restore_plan(&backup).unwrap_err(),
         );
 
-        assert_eq!(render_plain(&report), NO_MODELED_RESTORE_GOLDEN);
+        assert_eq!(render_plain(&report), RAISE_NINE_GOLDEN);
     }
 
     /// Renders a Raise backup that `backup convert` cannot target and

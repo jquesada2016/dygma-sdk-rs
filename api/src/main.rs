@@ -726,13 +726,14 @@ enum ConfigProduct {
     Raise2,
 }
 
-impl From<ConfigProduct> for conversions::Product {
-    fn from(product: ConfigProduct) -> Self {
-        match product {
-            ConfigProduct::Defy => Self::Defy,
-            ConfigProduct::Sonsei => Self::Sonsei,
-            ConfigProduct::Raise => Self::Raise,
-            ConfigProduct::Raise2 => Self::Raise2,
+impl ConfigProduct {
+    /// The product as the SDK names it, for messages.
+    fn product(self) -> conversions::Product {
+        match self {
+            ConfigProduct::Defy => conversions::Product::Defy,
+            ConfigProduct::Sonsei => conversions::Product::Sonsei,
+            ConfigProduct::Raise => conversions::Product::Raise,
+            ConfigProduct::Raise2 => conversions::Product::Raise2,
         }
     }
 }
@@ -746,20 +747,30 @@ enum ConfigCommands {
     /// `macros apply`, `leds palette apply`, `leds colormap apply`).
     ///
     /// The defaults are evidence-backed, not invented: they match
-    /// Bazecor's shipped defaults, whose two independent sources —
-    /// the app's virtual keyboards and its shipped default backups —
-    /// agree, and are differentially validated against a recording of
-    /// them (tools/bazecor-differential). The Defy and the Sonsei are
-    /// modeled — the Sonsei's files carry the Sonsei's shapes (60
-    /// positions, 56 LEDs, RGB palette; the product has no device
-    /// transport in this CLI yet, so its files are for editing and
-    /// for backup conversion) — and the Raise generations, with no
-    /// modeled defaults, are refused. Refuses to overwrite existing
-    /// files unless `--force` is passed.
+    /// Bazecor's shipped defaults, differentially validated against a
+    /// recording of them (tools/bazecor-differential). The Defy and
+    /// the Sonsei are dual-source checked (the app's virtual keyboards
+    /// and its shipped default backups agree — for the Defy, modulo
+    /// the wired backup's recorded layer-0 thumb-cluster outlier);
+    /// the Raise generations are graded per their evidence — the
+    /// Raise's shipped backups are real captures and agree with the
+    /// virtuals, the Raise 2's defaults ride the app's virtual
+    /// keyboards alone. Every product is modeled; the output prints a
+    /// "Defaults evidence:" line stating the product's grading. The Raise generations take
+    /// `--keyboard-type` (their defaults are per physical layout);
+    /// the products have no device transport in this CLI beyond the
+    /// Defy, so the Sonsei/Raise files are for editing and for backup
+    /// conversion. Refuses to overwrite existing files unless `--force`
+    /// is passed.
     Init {
         /// The product to write the default config of.
         #[clap(long, default_value = "defy")]
         product: ConfigProduct,
+        /// The physical key layout, for the products whose defaults
+        /// are per layout (Raise, Raise 2). Required for those;
+        /// not accepted for the others.
+        #[clap(long)]
+        keyboard_type: Option<KeyboardTypeArg>,
         /// The directory the config files are written to.
         ///
         /// Created when missing.
@@ -846,10 +857,117 @@ fn sonsei_config_files(out_dir: &Path) -> [ConfigFile; 5] {
     ]
 }
 
+/// Error from combining `config init`'s product arguments: the
+/// keyboard layout is required exactly for the products whose defaults
+/// are per layout, and accepted exactly there — the same rule
+/// `backup convert`'s targets follow.
+#[derive(Clone, Copy, Debug, Display, Error)]
+enum ConfigTargetError {
+    /// A Raise/Raise 2 `config init` without a `--keyboard-type`.
+    #[display(
+        "initializing a Raise or Raise 2 config needs the keyboard's physical layout: pass `--keyboard-type ANSI` or `--keyboard-type ISO`"
+    )]
+    KeyboardTypeRequired,
+    /// `--keyboard-type` given for a Defy/Sonsei `config init`.
+    #[display(
+        "`--keyboard-type` only applies to Raise and Raise 2 configs; a {product} keyboard has one layout"
+    )]
+    KeyboardTypeNotApplicable {
+        /// The product whose layout is not a choice.
+        product: conversions::Product,
+    },
+}
+
+/// Resolves `config init`'s `--product` and `--keyboard-type` into the
+/// conversion target the defaults layer takes — the one place the
+/// CLI's "layout required exactly for Raise targets" rule lives.
+fn config_target(
+    product: ConfigProduct,
+    keyboard_type: Option<KeyboardTypeArg>,
+) -> Result<conversions::ConversionTarget, ConfigTargetError> {
+    match product {
+        ConfigProduct::Defy => match keyboard_type {
+            None => Ok(conversions::ConversionTarget::Defy),
+            Some(_) => Err(ConfigTargetError::KeyboardTypeNotApplicable {
+                product: product.product(),
+            }),
+        },
+        ConfigProduct::Sonsei => match keyboard_type {
+            None => Ok(conversions::ConversionTarget::Sonsei),
+            Some(_) => Err(ConfigTargetError::KeyboardTypeNotApplicable {
+                product: product.product(),
+            }),
+        },
+        ConfigProduct::Raise => match keyboard_type {
+            Some(keyboard_type) => Ok(conversions::ConversionTarget::Raise(keyboard_type.into())),
+            None => Err(ConfigTargetError::KeyboardTypeRequired),
+        },
+        ConfigProduct::Raise2 => match keyboard_type {
+            Some(keyboard_type) => Ok(conversions::ConversionTarget::Raise2(keyboard_type.into())),
+            None => Err(ConfigTargetError::KeyboardTypeRequired),
+        },
+    }
+}
+
+/// The five files a Raise `config init` writes, with the Raise's own
+/// shape descriptions.
+fn raise_config_files(out_dir: &Path) -> [ConfigFile; 5] {
+    [
+        ConfigFile {
+            path: out_dir.join("keymap.json"),
+            description: "the factory keymap: 10 layers, 73 keys each (of the 80 wire positions)",
+        },
+        ConfigFile {
+            path: out_dir.join("superkeys.json"),
+            description: "the factory superkey: superkey 1, the clipboard keys (tap Ctrl+C, hold Ctrl+V)",
+        },
+        ConfigFile {
+            path: out_dir.join("macros.json"),
+            description: "the factory macro: macro 1 typing \"Hey, Dygmates\"",
+        },
+        ConfigFile {
+            path: out_dir.join("palette.json"),
+            description: "the factory palette: 16 RGB colors (amber accents, silver keys), the RGBWMode: false shape",
+        },
+        ConfigFile {
+            path: out_dir.join("colormap.json"),
+            description: "the factory colormap: 10 layers of palette indices, 132 LEDs each (69 keyboard + 30 left + 33 right underglow)",
+        },
+    ]
+}
+
+/// The five files a Raise 2 `config init` writes, with the Raise 2's
+/// own shape descriptions.
+fn raise2_config_files(out_dir: &Path) -> [ConfigFile; 5] {
+    [
+        ConfigFile {
+            path: out_dir.join("keymap.json"),
+            description: "the factory keymap: 10 layers, 73 keys each (of the 80 wire positions)",
+        },
+        ConfigFile {
+            path: out_dir.join("superkeys.json"),
+            description: "the factory superkey: superkey 1, the clipboard keys (tap Ctrl+C, hold Ctrl+V)",
+        },
+        ConfigFile {
+            path: out_dir.join("macros.json"),
+            description: "the factory macro: macro 1, a space tap then \"Hey, Dygmates\"",
+        },
+        ConfigFile {
+            path: out_dir.join("palette.json"),
+            description: "the factory palette: 16 RGBW colors, the RGBWMode: true shape",
+        },
+        ConfigFile {
+            path: out_dir.join("colormap.json"),
+            description: "the factory colormap: 10 layers of palette indices, 176 LEDs each (69 keyboard + 53 left + 54 right underglow)",
+        },
+    ]
+}
+
 impl ConfigCommands {
     async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         let Self::Init {
             product,
+            keyboard_type,
             out_dir,
             force,
             dry_run,
@@ -858,13 +976,13 @@ impl ConfigCommands {
         // Offline by construction: the defaults are pure data, and
         // every check below runs before any file is written. No
         // device connection is ever opened.
-        let config = defaults::default_config(product.into()).map_err(|err| {
-            err.into_report().change_context(Error).attach(format!(
-                "initializing a default config for the {product:?}; \
-                     the defaults that exist for it are recorded in \
-                     tools/bazecor-differential/expectations/default-configs.json"
-            ))
+        let target = config_target(product, keyboard_type).map_err(|err| {
+            err.into_report()
+                .change_context(Error)
+                .attach(format!("initializing a default config for the {product:?}"))
         })?;
+
+        let config = defaults::default_config(target);
 
         let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("."));
 
@@ -876,6 +994,8 @@ impl ConfigCommands {
         let files: [ConfigFile; 5] = match &config {
             defaults::DefaultConfig::Defy(_) => defy_config_files(&out_dir),
             defaults::DefaultConfig::Sonsei(_) => sonsei_config_files(&out_dir),
+            defaults::DefaultConfig::Raise(_) => raise_config_files(&out_dir),
+            defaults::DefaultConfig::Raise2(_) => raise2_config_files(&out_dir),
         };
 
         // A real run refuses to clobber; the dry run reports the same
@@ -922,6 +1042,7 @@ impl ConfigCommands {
                 println!("  {} — {}", file.path.display(), file.description);
             }
 
+            println!("Defaults evidence: {}.", config_evidence_line(&config));
             println!("Dry run: nothing was written.");
             print_evidence_note();
 
@@ -968,6 +1089,32 @@ impl ConfigCommands {
                 )
                 .await?;
             }
+            defaults::DefaultConfig::Raise(config) => {
+                write_five_config_files(
+                    &files,
+                    (
+                        &config.keymap,
+                        &config.superkeys,
+                        &config.macros,
+                        &config.palette,
+                        &config.colormap,
+                    ),
+                )
+                .await?;
+            }
+            defaults::DefaultConfig::Raise2(config) => {
+                write_five_config_files(
+                    &files,
+                    (
+                        &config.keymap,
+                        &config.superkeys,
+                        &config.macros,
+                        &config.palette,
+                        &config.colormap,
+                    ),
+                )
+                .await?;
+            }
         }
 
         println!(
@@ -979,6 +1126,8 @@ impl ConfigCommands {
         for file in &files {
             println!("  {} — {}", file.path.display(), file.description);
         }
+
+        println!("Defaults evidence: {}.", config_evidence_line(&config));
 
         print_evidence_note();
 
@@ -1037,6 +1186,33 @@ where
 /// informative about what a default config does NOT carry: the
 /// palette/colormap and settings defaults exist in the recorded
 /// evidence but have no file format here.
+/// The per-product evidence grading `config init` states in its
+/// output — what each product's defaults stand on, one truthful
+/// sentence apiece (the same grading the defaults module's evidence
+/// map carries, and the same words the module docs use).
+fn config_evidence_line(config: &defaults::DefaultConfig) -> &'static str {
+    match config {
+        defaults::DefaultConfig::Defy(_) => {
+            "dual-source: Bazecor's virtual keyboards and its shipped wireless \
+             backup (real captures) agree on every command (the wired backup's \
+             lone layer-0 thumb-cluster outlier is recorded, not shipped)"
+        }
+        defaults::DefaultConfig::Sonsei(_) => {
+            "dual-source: Bazecor's virtual keyboard and its shipped backup \
+             (real captures) agree on every command"
+        }
+        defaults::DefaultConfig::Raise(_) => {
+            "dual-source: Bazecor's virtual keyboards and its shipped Raise backups \
+             (real captures) agree on every command"
+        }
+        defaults::DefaultConfig::Raise2(_) => {
+            "app-side only (no Raise 2 device capture exists): Bazecor's two copies \
+             of the virtual keyboard agree — the ANSI pair token for token, the ISO \
+             pair except recorded colormap/keymap drifts the defaults do not carry"
+        }
+    }
+}
+
 fn print_evidence_note() {
     println!(
         "Note: the default LED settings (brightness, fade, idle and \
@@ -2562,13 +2738,12 @@ impl BackupCommands {
                 let product =
                     conversions::Product::from_descriptor(backup.neuron.device.as_ref()).ok();
 
-                // The send path is Defy-bound: a Sonsei backup's plan is
-                // validation only (this SDK has no Sonsei transport —
-                // issue #24's unit 4), so a real restore refuses BEFORE
-                // any connection is opened, pointing at the conversion
-                // that produces a restorable file. (A Raise-generation
-                // backup never reaches here: the plan dispatch already
-                // refused it offline.)
+                // The send path is Defy-bound: a non-Defy backup's plan
+                // is validation only (this SDK has no Sonsei/Raise/
+                // Raise 2 transport — issue #24's unit 4), so a real
+                // restore refuses BEFORE any connection is opened,
+                // pointing at the conversion that produces a restorable
+                // file.
                 if product == Some(conversions::Product::Sonsei) {
                     return Err(Error
                         .into_report()
@@ -2578,6 +2753,25 @@ impl BackupCommands {
                              transport: a real restore to a Sonsei is not possible \
                              here. `backup restore --dry-run` validates the file, and \
                              `backup convert --to defy` converts it for a Defy restore",
+                        ));
+                }
+
+                if matches!(
+                    product,
+                    Some(conversions::Product::Raise) | Some(conversions::Product::Raise2)
+                ) {
+                    return Err(Error
+                        .into_report()
+                        .attach(format!("restoring the backup in {}", path.display()))
+                        .attach(
+                            "the backup is for a Raise-generation keyboard, and this \
+                             SDK has no Raise transport: a real restore to a Raise or \
+                             Raise 2 is not possible here. `backup restore --dry-run` \
+                             validates the file, and `backup convert` converts between \
+                             the Raise generations (`--to raise` / `--to raise2`, with \
+                             `--keyboard-type`). There is no Raise-to-Defy conversion: \
+                             this SDK converts Defy and Sonsei into each other, and \
+                             Raise into Raise 2 and back, and nothing else",
                         ));
                 }
 
@@ -2609,9 +2803,9 @@ impl BackupCommands {
                         names store under the connected device's chip id."
                     );
 
-                    // Validation-only honesty for the product the send
-                    // path cannot serve: said on the Sonsei's dry run,
-                    // not left to be discovered by a refused real run.
+                    // Validation-only honesty for the products the send
+                    // path cannot serve: said on their dry runs, not
+                    // left to be discovered by a refused real run.
                     if product == Some(conversions::Product::Sonsei) {
                         println!(
                             "This backup is for a Sonsei: the plan above is \
@@ -2619,6 +2813,21 @@ impl BackupCommands {
                             yet, so a real restore of it is refused \
                             (`backup convert --to defy` produces a restorable \
                             file)."
+                        );
+                    }
+
+                    if matches!(
+                        product,
+                        Some(conversions::Product::Raise) | Some(conversions::Product::Raise2)
+                    ) {
+                        println!(
+                            "This backup is for a Raise-generation keyboard: the plan \
+                            above is validation only — this SDK has no Raise \
+                            transport yet, so a real restore of it is refused. \
+                            `backup convert` converts between the Raise generations \
+                            (`--to raise` / `--to raise2`, with `--keyboard-type`); \
+                            there is no Raise-to-Defy conversion (this SDK converts \
+                            Defy ↔ Sonsei and Raise ↔ Raise 2 only)."
                         );
                     }
 
@@ -3784,6 +3993,106 @@ mod tests {
             assert!(flat.contains(&err.to_string()));
             assert!(flat.contains("converting the backup in backup.json"));
         }
+    }
+
+    /// The per-product evidence lines `config init` prints are pinned
+    /// exactly, so the grading cannot silently drift from the
+    /// defaults module's evidence map (the docs and the output must
+    /// say the same thing — round-2 review: the Defy arm once
+    /// overclaimed past the wired backup's thumb-cluster outlier).
+    #[test]
+    fn config_evidence_lines_are_pinned_per_product() {
+        // Read through the PUBLIC enum so the pin breaks if a variant
+        // moves: one line per product, asserted whole.
+        let line = |config: &defaults::DefaultConfig| config_evidence_line(config);
+
+        let defy = defaults::default_config(conversions::ConversionTarget::Defy);
+        assert_eq!(
+            line(&defy),
+            "dual-source: Bazecor's virtual keyboards and its shipped wireless \
+             backup (real captures) agree on every command (the wired backup's \
+             lone layer-0 thumb-cluster outlier is recorded, not shipped)"
+        );
+
+        let sonsei = defaults::default_config(conversions::ConversionTarget::Sonsei);
+        assert_eq!(
+            line(&sonsei),
+            "dual-source: Bazecor's virtual keyboard and its shipped backup \
+             (real captures) agree on every command"
+        );
+
+        let raise = defaults::default_config(conversions::ConversionTarget::Raise(
+            conversions::KeyboardType::Ansi,
+        ));
+        assert_eq!(
+            line(&raise),
+            "dual-source: Bazecor's virtual keyboards and its shipped Raise backups \
+             (real captures) agree on every command"
+        );
+
+        let raise2 = defaults::default_config(conversions::ConversionTarget::Raise2(
+            conversions::KeyboardType::Iso,
+        ));
+        assert_eq!(
+            line(&raise2),
+            "app-side only (no Raise 2 device capture exists): Bazecor's two copies \
+             of the virtual keyboard agree — the ANSI pair token for token, the ISO \
+             pair except recorded colormap/keymap drifts the defaults do not carry"
+        );
+
+        // The other Raise-generation layout answers the same grading
+        // (the layouts select data, not evidence class).
+        let raise_iso = defaults::default_config(conversions::ConversionTarget::Raise(
+            conversions::KeyboardType::Iso,
+        ));
+        assert_eq!(line(&raise_iso), line(&raise));
+    }
+
+    /// `config init`'s target rule mirrors `backup convert`'s: the
+    /// keyboard layout is required exactly for the Raise generations
+    /// and rejected elsewhere, and the layouts pass through in the
+    /// descriptors' spelling.
+    #[test]
+    fn config_target_resolves_the_keyboard_type_rule() {
+        // Defy and Sonsei have one layout each.
+        assert_eq!(
+            config_target(ConfigProduct::Defy, None).unwrap(),
+            conversions::ConversionTarget::Defy
+        );
+        assert_eq!(
+            config_target(ConfigProduct::Sonsei, None).unwrap(),
+            conversions::ConversionTarget::Sonsei
+        );
+        assert!(matches!(
+            config_target(ConfigProduct::Defy, Some(KeyboardTypeArg::Ansi)),
+            Err(ConfigTargetError::KeyboardTypeNotApplicable {
+                product: conversions::Product::Defy
+            })
+        ));
+        assert!(matches!(
+            config_target(ConfigProduct::Sonsei, Some(KeyboardTypeArg::Iso)),
+            Err(ConfigTargetError::KeyboardTypeNotApplicable {
+                product: conversions::Product::Sonsei
+            })
+        ));
+
+        // Raise and Raise 2 require it, in the descriptors' spelling.
+        assert_eq!(
+            config_target(ConfigProduct::Raise, Some(KeyboardTypeArg::Ansi)).unwrap(),
+            conversions::ConversionTarget::Raise(conversions::KeyboardType::Ansi)
+        );
+        assert_eq!(
+            config_target(ConfigProduct::Raise2, Some(KeyboardTypeArg::Iso)).unwrap(),
+            conversions::ConversionTarget::Raise2(conversions::KeyboardType::Iso)
+        );
+        assert!(matches!(
+            config_target(ConfigProduct::Raise, None),
+            Err(ConfigTargetError::KeyboardTypeRequired)
+        ));
+        assert!(matches!(
+            config_target(ConfigProduct::Raise2, None),
+            Err(ConfigTargetError::KeyboardTypeRequired)
+        ));
     }
 
     /// A type whose [`serde::Serialize`] implementation always fails

@@ -600,15 +600,6 @@ impl DefyKeyboard {
     const WIRELESS_RF_SYNC_PAIRING_COMMAND_NAME: &str = "wireless.rf.syncPairing";
     const WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME: &str = "wireless.bluetooth.deviceName";
     const WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME: &str = "wireless.bluetooth.infoChannel";
-    /// The command Bazecor's restore sends after every backup entry
-    /// (`noCacheCommand("led.mode 0")` in `Backup.ts`
-    /// `restoreBackup`), switching the LEDs out of whatever state the
-    /// restored `led.*` writes left them in. `led.mode` is deny-listed
-    /// from captures, so restores append it unconditionally — exactly
-    /// like Bazecor.
-    const RESTORE_FINALIZE_COMMAND_NAME: &str = "led.mode";
-    const RESTORE_FINALIZE_DATA: &str = "0";
-
     /// The memory size of the superkey map.
     pub const SUPERKEY_MEMORY_SIZE: usize = 512;
 
@@ -1843,73 +1834,20 @@ impl DefyKeyboard {
     /// The plan computation behind the refusal pair: `allow_partial`
     /// says whether a backup carrying the partial-capture marker is
     /// planned anyway.
+    ///
+    /// The skeleton ([`plan::restore_plan`][core]) holds the
+    /// product-independent shape — the partial refusal, the product
+    /// guard, the shared superkeys/macros entries, the plan order, the
+    /// `led.mode 0` tail — and [`DefyShapes`] names the Defy's own
+    /// pieces: the product name, the refusals' wording, and the
+    /// Defy-shaped entries.
+    ///
+    /// [core]: plan::restore_plan
     fn backup_restore_plan_with(
         backup: &parsing::backup::DefyBackup,
         allow_partial: bool,
     ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
-        if let Some(partial) = &backup.partial
-            && !allow_partial
-        {
-            return Err(BackupValidationError::PartialCapture {
-                missing: partial.missing.clone(),
-            });
-        }
-
-        if let Some(product) = backup.neuron.device.as_ref().and_then(|device| {
-            device
-                .get("info")
-                .and_then(|info| info.get("product"))
-                .and_then(serde_json::Value::as_str)
-        }) && product != "Defy"
-        {
-            return Err(BackupValidationError::NotADefyBackup {
-                product: product.to_owned(),
-            });
-        }
-
-        for entry in &backup.backup {
-            let validated: Result<(), BackupEntryError> = match entry.command.as_str() {
-                // A `keymap.custom` write carries exactly the ten
-                // layers; [`DefyKeymap`] cannot be constructed from
-                // anything else, so the parse here is the whole
-                // validation.
-                Self::KEYMAP_CUSTOM_COMMAND_NAME => DefyKeymap::from_str(&entry.data)
-                    .map_err(BackupEntryError::Keymap)
-                    .map(|_| ()),
-                Self::SUPERKEY_MAP_COMMAND_NAME => SuperkeyMap::from_str(&entry.data)
-                    .map_err(BackupEntryError::Superkeys)
-                    .map(|_| ()),
-                Self::MACRO_MAP_COMMAND_NAME => MacroMap::from_str(&entry.data)
-                    .map_err(BackupEntryError::Macros)
-                    .map(|_| ()),
-                // A Defy `palette` write is exactly 16 RGBW colors;
-                // the type cannot be constructed from anything else.
-                Self::PALETTE_COMMAND_NAME => parsing::palette::Palette::from_str(&entry.data)
-                    .map_err(BackupEntryError::Palette)
-                    .map(|_| ()),
-                // A `colormap.map` write carries exactly the ten
-                // layers; [`DefyColormap`] cannot be constructed from
-                // anything else.
-                Self::COLORMAP_MAP_COMMAND_NAME => DefyColormap::from_str(&entry.data)
-                    .map_err(BackupEntryError::Colormap)
-                    .map(|_| ()),
-                _ => Ok(()),
-            };
-
-            validated.map_err(|source| BackupValidationError::InvalidEntry {
-                command: entry.command.clone(),
-                source,
-            })?;
-        }
-
-        let mut plan = parsing::backup::restore_command_sequence(&backup.backup);
-
-        plan.push(parsing::backup::BackupCommand::new(
-            Self::RESTORE_FINALIZE_COMMAND_NAME.to_owned(),
-            Self::RESTORE_FINALIZE_DATA.to_owned(),
-        ));
-
-        Ok(plan)
+        super::plan::restore_plan::<DefyShapes>(backup, allow_partial)
     }
 
     /// Restores a captured backup to the device: validates it
@@ -2236,6 +2174,67 @@ fn interrupted(
         )),
         command,
         source,
+    }
+}
+
+/// The Defy's restore-validation shapes: the pieces
+/// [`plan::restore_plan`](super::plan::restore_plan) wires together —
+/// the product name the guard matches, the refusals' wording, and the
+/// Defy-shaped entries (the keymap, palette, and colormap; the
+/// superkeys and macros maps are the skeleton's).
+struct DefyShapes;
+
+impl super::plan::ProductRestoreShapes for DefyShapes {
+    type ValidationError = BackupValidationError;
+    type EntryError = BackupEntryError;
+    const EXPECTED_PRODUCT: &'static str = "Defy";
+
+    fn wrong_product(product: String) -> BackupValidationError {
+        BackupValidationError::NotADefyBackup { product }
+    }
+
+    fn refused_partial(missing: Vec<String>) -> BackupValidationError {
+        BackupValidationError::PartialCapture { missing }
+    }
+
+    fn invalid_entry(command: String, source: BackupEntryError) -> BackupValidationError {
+        BackupValidationError::InvalidEntry { command, source }
+    }
+
+    fn shared_map_error(source: super::plan::SharedMapError) -> BackupEntryError {
+        match source {
+            super::plan::SharedMapError::Superkeys(source) => BackupEntryError::Superkeys(source),
+            super::plan::SharedMapError::Macros(source) => BackupEntryError::Macros(source),
+        }
+    }
+
+    fn validate_product_entry(command: &str, data: &str) -> Option<Result<(), BackupEntryError>> {
+        match command {
+            // A `keymap.custom` write carries exactly the ten layers;
+            // [`DefyKeymap`] cannot be constructed from anything else,
+            // so the parse here is the whole validation.
+            DefyKeyboard::KEYMAP_CUSTOM_COMMAND_NAME => Some(
+                DefyKeymap::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Keymap),
+            ),
+            // A Defy `palette` write is exactly 16 RGBW colors; the
+            // type cannot be constructed from anything else.
+            DefyKeyboard::PALETTE_COMMAND_NAME => Some(
+                parsing::palette::Palette::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Palette),
+            ),
+            // A `colormap.map` write carries exactly the ten layers;
+            // [`DefyColormap`] cannot be constructed from anything
+            // else.
+            DefyKeyboard::COLORMAP_MAP_COMMAND_NAME => Some(
+                DefyColormap::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Colormap),
+            ),
+            _ => None,
+        }
     }
 }
 

@@ -414,7 +414,7 @@ fn the_shipped_sonsei_backup_validates_whole() {
     // The superkeys land before the keymap (Bazecor's reorder).
     let superkeys = commands
         .iter()
-        .position(|command| *command == SUPERKEY_MAP_COMMAND_NAME)
+        .position(|command| *command == "superkeys.map")
         .unwrap();
     let keymap = commands
         .iter()

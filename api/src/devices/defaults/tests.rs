@@ -9,7 +9,10 @@
 
 use super::*;
 use crate::{
+    devices::conversions::{ConversionTarget, KeyboardType},
     devices::defy::{DefyColormap, DefyKeyboard, DefyKeymapLayer, MacroAction},
+    devices::raise::{RaiseColormap, RaiseKeymap},
+    devices::raise2::{Raise2Colormap, Raise2Keymap},
     devices::sonsei::{KEYS_PER_LAYER, SonseiColormap, SonseiKeymap, SonseiKeymapLayer},
     focus_api::parsing,
     focus_api::parsing::palette::{Palette, RgbPalette},
@@ -25,6 +28,16 @@ struct RecordedDefaults {
     bazecor_commit: String,
     defy: RecordedPair,
     sonsei: RecordedPair,
+    raise: RecordedGeneration,
+    raise2: RecordedGeneration,
+}
+
+/// One Raise generation's recorded pair (each carries an ANSI and an
+/// ISO variant — the defaults are per physical layout).
+#[derive(serde::Deserialize)]
+struct RecordedGeneration {
+    ansi: RecordedVirtual,
+    iso: RecordedVirtual,
 }
 
 /// One product's recorded pair (only the Defy carries a wired
@@ -75,9 +88,7 @@ fn default_config_answers_the_defy() {
     // Through the PUBLIC entry, not the per-product builder: this test
     // is the enum-dispatch answer's proof (the private builders are
     // exercised everywhere else).
-    let DefaultConfig::Defy(config) =
-        default_config(Product::Defy).expect("the Defy has a default config")
-    else {
+    let DefaultConfig::Defy(config) = default_config(ConversionTarget::Defy) else {
         panic!("the Defy answers a Defy default config");
     };
 
@@ -91,9 +102,7 @@ fn default_config_answers_the_defy() {
 #[test]
 fn default_config_answers_the_sonsei() {
     // Through the PUBLIC entry (see the Defy test above).
-    let DefaultConfig::Sonsei(config) =
-        default_config(Product::Sonsei).expect("the Sonsei has a default config")
-    else {
+    let DefaultConfig::Sonsei(config) = default_config(ConversionTarget::Sonsei) else {
         panic!("the Sonsei answers a Sonsei default config");
     };
 
@@ -105,13 +114,75 @@ fn default_config_answers_the_sonsei() {
 }
 
 #[test]
-fn products_without_modeled_defaults_are_refused_by_name() {
-    for product in [Product::Raise, Product::Raise2] {
-        assert_eq!(
-            default_config(product).unwrap_err(),
-            NoDefaultConfigError { product }
-        );
+fn default_config_answers_the_raise_per_layout() {
+    // The Raise generations' defaults are PER LAYOUT — the type will
+    // not let a caller ask for "the Raise default" without choosing
+    // ANSI or ISO (the layouts sit different keys at the same wire
+    // positions), and each layout answers its own data.
+    for keyboard_type in [KeyboardType::Ansi, KeyboardType::Iso] {
+        let DefaultConfig::Raise(config) = default_config(ConversionTarget::Raise(keyboard_type))
+        else {
+            panic!("the Raise answers a Raise default config");
+        };
+
+        assert_eq!(config.keymap.layers.len(), 10);
+        assert_eq!(config.superkeys.len(), 1);
+        assert_eq!(config.macros.len(), 1);
+        assert_eq!(config.palette.0.len(), 16);
+        assert_eq!(config.colormap.layers.len(), 10);
     }
+}
+
+#[test]
+fn default_config_answers_the_raise2_per_layout() {
+    for keyboard_type in [KeyboardType::Ansi, KeyboardType::Iso] {
+        let DefaultConfig::Raise2(config) = default_config(ConversionTarget::Raise2(keyboard_type))
+        else {
+            panic!("the Raise 2 answers a Raise 2 default config");
+        };
+
+        assert_eq!(config.keymap.layers.len(), 10);
+        assert_eq!(config.superkeys.len(), 1);
+        assert_eq!(config.macros.len(), 1);
+        assert_eq!(config.palette.0.len(), 16);
+        assert_eq!(config.colormap.layers.len(), 10);
+    }
+}
+
+#[test]
+fn the_raise_layouts_answer_different_data() {
+    // The layouts are real variants: the ANSI and ISO defaults differ
+    // where the physical layouts do (pinned exactly by the recorded
+    // comparisons below — this is the smoke side of that pin).
+    let DefaultConfig::Raise(ansi) = default_config(ConversionTarget::Raise(KeyboardType::Ansi))
+    else {
+        panic!("the Raise answers a Raise default config");
+    };
+    let DefaultConfig::Raise(iso) = default_config(ConversionTarget::Raise(KeyboardType::Iso))
+    else {
+        panic!("the Raise answers a Raise default config");
+    };
+
+    assert_ne!(ansi.keymap, iso.keymap);
+    assert_ne!(ansi.colormap, iso.colormap);
+    assert_eq!(ansi.superkeys, iso.superkeys);
+    assert_eq!(ansi.macros, iso.macros);
+    assert_eq!(ansi.palette, iso.palette);
+
+    let DefaultConfig::Raise2(ansi) = default_config(ConversionTarget::Raise2(KeyboardType::Ansi))
+    else {
+        panic!("the Raise 2 answers a Raise 2 default config");
+    };
+    let DefaultConfig::Raise2(iso) = default_config(ConversionTarget::Raise2(KeyboardType::Iso))
+    else {
+        panic!("the Raise 2 answers a Raise 2 default config");
+    };
+
+    assert_ne!(ansi.keymap, iso.keymap);
+    assert_ne!(ansi.colormap, iso.colormap);
+    assert_eq!(ansi.superkeys, iso.superkeys);
+    assert_eq!(ansi.macros, iso.macros);
+    assert_eq!(ansi.palette, iso.palette);
 }
 
 #[test]
@@ -775,26 +846,26 @@ fn the_sonsei_default_macros_decode_to_hello_and_hola() {
 
     assert_eq!(config.macros.len(), 2);
 
-    let right_shift = KeyKind::from(225);
+    let left_shift = KeyKind::from(225);
 
-    // "Hello": RightShift held while tapping H, released; E L L O
+    // "Hello": LeftShift held while tapping H, released; E L L O
     // tapped.
     let expected_hello = [
-        MacroAction::KeyCodeDown(right_shift),
+        MacroAction::KeyCodeDown(left_shift),
         MacroAction::TapCode(KeyKind::from(11)),
-        MacroAction::KeyCodeUp(right_shift),
+        MacroAction::KeyCodeUp(left_shift),
         MacroAction::TapCode(KeyKind::from(8)),
         MacroAction::TapCode(KeyKind::from(15)),
         MacroAction::TapCode(KeyKind::from(15)),
         MacroAction::TapCode(KeyKind::from(18)),
     ];
 
-    // "Hola": RightShift held while tapping H, released; O L A
+    // "Hola": LeftShift held while tapping H, released; O L A
     // tapped.
     let expected_hola = [
-        MacroAction::KeyCodeDown(right_shift),
+        MacroAction::KeyCodeDown(left_shift),
         MacroAction::TapCode(KeyKind::from(11)),
-        MacroAction::KeyCodeUp(right_shift),
+        MacroAction::KeyCodeUp(left_shift),
         MacroAction::TapCode(KeyKind::from(18)),
         MacroAction::TapCode(KeyKind::from(15)),
         MacroAction::TapCode(KeyKind::from(4)),
@@ -873,4 +944,676 @@ fn generated_sonsei_config_files_round_trip_to_the_write_shapes() {
         tokens(&colormap.to_colormap_map_data()),
         tokens(&recorded.sonsei.wireless.colormap_map)
     );
+}
+
+/// The shipped Raise ANSI backup fixture (a byte-identical copy of
+/// `bazecor/src/defaultBackups/RaiseANSI.json`) — the Raise's second
+/// defaults source: a REAL device capture.
+fn raise_backup_fixture(layout: &str) -> serde_json::Value {
+    serde_json::from_str(match layout {
+        "ANSI" => include_str!("../../../../tools/bazecor-differential/fixtures/RaiseANSI.json"),
+        "ISO" => include_str!("../../../../tools/bazecor-differential/fixtures/RaiseISO.json"),
+        other => panic!("unknown Raise layout {other}"),
+    })
+    .expect("the shipped Raise backup fixture parses")
+}
+
+/// The shipped Raise 2 record fixture (a byte-identical copy of
+/// `bazecor/src/defaultBackups/Raise2{ANSI,ISO}.json`) — NOT a
+/// backup: the `{device, virtual}` recording of the app's simulated
+/// factory device. The only Raise 2 artifacts Bazecor ships; the
+/// recording this module's expectations hold comes from the
+/// hardware-virtual DEFINITIONS (`src/api/hardware-virtual/
+/// Raise2{ANSI,ISO}.ts`), the other copy of the same pair.
+fn raise2_record_fixture(layout: &str) -> serde_json::Value {
+    serde_json::from_str(match layout {
+        "ANSI" => include_str!("../../../../tools/bazecor-differential/fixtures/Raise2ANSI.json"),
+        "ISO" => include_str!("../../../../tools/bazecor-differential/fixtures/Raise2ISO.json"),
+        other => panic!("unknown Raise 2 layout {other}"),
+    })
+    .expect("the shipped Raise 2 record fixture parses")
+}
+
+/// A backup entry's `data` by command name.
+fn backup_data<'a>(backup: &'a serde_json::Value, command: &str) -> &'a str {
+    backup["backup"]
+        .as_array()
+        .expect("the backup holds a command array")
+        .iter()
+        .find(|entry| entry["command"] == command)
+        .map(|entry| entry["data"].as_str().expect("data is a string"))
+        .unwrap_or_else(|| panic!("the shipped backup carries no {command}"))
+}
+
+/// A `{device, virtual}` record's command data by command name.
+fn virtual_data<'a>(record: &'a serde_json::Value, command: &str) -> &'a str {
+    record["virtual"][command]["data"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the shipped record carries no {command}"))
+}
+
+#[test]
+fn embedded_raise_data_matches_the_recorded_expectations() {
+    // The constants are verbatim the recorded Bazecor data — with
+    // exactly two stated normalizations, both the parsers' own
+    // tolerance (stated in the constants' docs):
+    //
+    // - the superkeys and macros constants are the LIVE forms (the
+    //   recorded streams' tails past the maps' `0 0` terminators are
+    //   what the wire parsers ignore; the serializers emit the live
+    //   forms);
+    // - the palette constant drops the recorded string's trailing
+    //   separator space (a device-read artifact; the recorded ANSI
+    //   and ISO palettes are the same tokens, one with the trailing
+    //   space and one without).
+    //
+    // The tails themselves differ by ARTIFACT FAMILY, not by layout
+    // (the recordings read the hardware-virtual definitions): the
+    // definitions carry stale EEPROM bytes after both maps'
+    // terminators, the shipped ANSI backup's superkeys then runs
+    // pure `65535` padding where the definition carries its stale run
+    // (its macros entry is token-identical to the definition's —
+    // 2048 tokens, stale bytes included; the definition's string
+    // carries a trailing separator the backup's lacks), and the
+    // shipped ISO backup's entries are the live forms plain. None of it is part of the default — the
+    // parsed-content test below is the check that matters; these
+    // assertions only pin that the embedded live forms are the exact
+    // prefixes.
+    let recorded = recorded();
+
+    for layout in ["ansi", "iso"] {
+        let recorded = match layout {
+            "ansi" => &recorded.raise.ansi,
+            _ => &recorded.raise.iso,
+        };
+
+        let (keymap, colormap) = match layout {
+            "ansi" => (
+                RAISE_ANSI_DEFAULT_KEYMAP_DATA,
+                RAISE_ANSI_DEFAULT_COLORMAP_DATA,
+            ),
+            _ => (
+                RAISE_ISO_DEFAULT_KEYMAP_DATA,
+                RAISE_ISO_DEFAULT_COLORMAP_DATA,
+            ),
+        };
+
+        assert_eq!(keymap, recorded.keymap_custom, "raise {layout} keymap");
+        assert_eq!(colormap, recorded.colormap_map, "raise {layout} colormap");
+        assert_eq!(
+            tokens(RAISE_DEFAULT_PALETTE_DATA),
+            tokens(&recorded.palette),
+            "raise {layout} palette"
+        );
+
+        let live = tokens(RAISE_DEFAULT_SUPERKEYS_DATA);
+        let all = tokens(&recorded.superkeys_map);
+
+        assert_eq!(all[..live.len()], live[..], "raise {layout} superkeys");
+
+        let live = tokens(RAISE_DEFAULT_MACROS_DATA);
+        let all = tokens(&recorded.macros_map);
+
+        assert_eq!(all[..live.len()], live[..], "raise {layout} macros");
+    }
+}
+
+#[test]
+fn embedded_raise2_data_matches_the_recorded_expectations() {
+    // As with the Raise (see that test): keymaps and colormaps
+    // verbatim, palette modulo the trailing separator, superkeys and
+    // macros as the live forms. BOTH layouts' superkeys/macros/
+    // palette are the same data (only the keymap and colormap carry
+    // the layout's shape). The superkeys recordings' tails are pure
+    // `65535` padding (asserted); the macros recordings' tails are
+    // stale EEPROM bytes then the `255` eraser (not part of the
+    // default — prefix-only, like the Raise's).
+    let recorded = recorded();
+
+    for layout in ["ansi", "iso"] {
+        let recorded = match layout {
+            "ansi" => &recorded.raise2.ansi,
+            _ => &recorded.raise2.iso,
+        };
+
+        let (keymap, colormap) = match layout {
+            "ansi" => (
+                RAISE2_ANSI_DEFAULT_KEYMAP_DATA,
+                RAISE2_ANSI_DEFAULT_COLORMAP_DATA,
+            ),
+            _ => (
+                RAISE2_ISO_DEFAULT_KEYMAP_DATA,
+                RAISE2_ISO_DEFAULT_COLORMAP_DATA,
+            ),
+        };
+
+        assert_eq!(keymap, recorded.keymap_custom, "raise2 {layout} keymap");
+        assert_eq!(colormap, recorded.colormap_map, "raise2 {layout} colormap");
+        assert_eq!(
+            tokens(RAISE2_DEFAULT_PALETTE_DATA),
+            tokens(&recorded.palette),
+            "raise2 {layout} palette"
+        );
+
+        let live = tokens(RAISE2_DEFAULT_SUPERKEYS_DATA);
+        let all = tokens(&recorded.superkeys_map);
+
+        assert_eq!(all[..live.len()], live[..], "raise2 {layout} superkeys");
+        assert!(
+            all[live.len()..].iter().all(|token| *token == "65535"),
+            "raise2 {layout} superkeys tail is pure padding"
+        );
+
+        let live = tokens(RAISE2_DEFAULT_MACROS_DATA);
+        let all = tokens(&recorded.macros_map);
+
+        assert_eq!(all[..live.len()], live[..], "raise2 {layout} macros");
+    }
+}
+
+#[test]
+fn recorded_raise_defaults_match_the_shipped_backup_fixtures() {
+    // THE RAISE EVIDENCE CLAIM, resolved by this unit: the recorded
+    // hardware-virtual defaults and the SHIPPED BACKUPS (real device
+    // captures) agree on every config command, per layout — token for
+    // token where the sources hold the same string, modulo the
+    // recorded trailing separator (keymap, palette, colormap — the
+    // ISO recording's strings carry one trailing separator each that
+    // the shipped backup's lack; the ANSI ones are byte-equal), and
+    // as PARSED CONTENT where they hold different
+    // forms of the same data (superkeys and macros: the recordings
+    // and the shipped ANSI backup carry stale EEPROM bytes and
+    // padding after the maps' `0 0` terminators, the shipped ISO
+    // backup the live forms; both parsers — Bazecor's
+    // `split(" 0 0")[0]` and ours — read the same one clipboard
+    // superkey and the same one greeting macro out of every form, so
+    // the comparison is through the map types, which is exactly the
+    // normalization the wire format defines).
+    let recorded = recorded();
+
+    for layout in ["ANSI", "ISO"] {
+        let recorded = match layout {
+            "ANSI" => &recorded.raise.ansi,
+            _ => &recorded.raise.iso,
+        };
+        let shipped = raise_backup_fixture(layout);
+
+        assert_eq!(
+            tokens(&recorded.keymap_custom),
+            tokens(backup_data(&shipped, "keymap.custom")),
+            "raise {layout} keymap"
+        );
+        assert_eq!(
+            tokens(&recorded.palette),
+            tokens(backup_data(&shipped, "palette")),
+            "raise {layout} palette"
+        );
+        assert_eq!(
+            tokens(&recorded.colormap_map),
+            tokens(backup_data(&shipped, "colormap.map")),
+            "raise {layout} colormap"
+        );
+
+        let recorded_superkeys = recorded
+            .superkeys_map
+            .parse::<SuperkeyMap>()
+            .expect("the recorded Raise superkeys data parses");
+        let shipped_superkeys = backup_data(&shipped, "superkeys.map")
+            .parse::<SuperkeyMap>()
+            .expect("the shipped Raise superkeys data parses");
+
+        assert_eq!(
+            recorded_superkeys, shipped_superkeys,
+            "raise {layout} superkeys (parsed content)"
+        );
+
+        let recorded_macros = recorded
+            .macros_map
+            .parse::<MacroMap>()
+            .expect("the recorded Raise macros data parses");
+        let shipped_macros = backup_data(&shipped, "macros.map")
+            .parse::<MacroMap>()
+            .expect("the shipped Raise macros data parses");
+
+        assert_eq!(
+            recorded_macros, shipped_macros,
+            "raise {layout} macros (parsed content)"
+        );
+    }
+}
+
+#[test]
+fn recorded_raise2_ansi_defaults_match_the_shipped_record() {
+    // THE RAISE 2 ANSI EVIDENCE CLAIM: Bazecor's two app-side copies
+    // of the virtual keyboard — the hardware-virtual definition (what
+    // the recording holds) and the shipped `{device, virtual}` record
+    // — agree token for token on every config command. No real-device
+    // capture exists for a Raise 2: this is app-side evidence on both
+    // sides, the same class as the settings defaults, and the module
+    // docs say so.
+    let recorded = recorded();
+    let shipped = raise2_record_fixture("ANSI");
+
+    for command in [
+        "keymap.custom",
+        "superkeys.map",
+        "macros.map",
+        "palette",
+        "colormap.map",
+    ] {
+        let recorded_data = match command {
+            "keymap.custom" => &recorded.raise2.ansi.keymap_custom,
+            "superkeys.map" => &recorded.raise2.ansi.superkeys_map,
+            "macros.map" => &recorded.raise2.ansi.macros_map,
+            "palette" => &recorded.raise2.ansi.palette,
+            _ => &recorded.raise2.ansi.colormap_map,
+        };
+
+        assert_eq!(
+            tokens(recorded_data),
+            tokens(virtual_data(&shipped, command)),
+            "raise2 ANSI {command}"
+        );
+    }
+}
+
+#[test]
+fn recorded_raise2_iso_defaults_agree_except_the_recorded_drifts() {
+    // THE RAISE 2 ISO EVIDENCE CLAIM, stated exactly: the two
+    // app-side copies agree on the superkeys, macros, and palette
+    // token for token, and drift in TWO recorded places — the keymap
+    // at 28 positions of layer 3 (every difference a placeholder
+    // swap, `0` in one copy vs `65535` transparent in the other: no
+    // real key differs) and the colormap (the shipped record's
+    // drifted 1440-token copy against the definition's
+    // internally-consistent 1760-token one). The defaults ship the
+    // DEFINITION's data for both: it is the copy the app serves, it
+    // is internally consistent with its own geometry, and the
+    // colormap matches the ANSI layout's structure (the two
+    // colormaps differ at eleven LED positions where the physical
+    // layouts do). The colormap drift is typed-rejected by
+    // [`Raise2Colormap`] — the same typed rejection the conversions
+    // unit pins — never replicated.
+    let recorded = recorded();
+    let shipped = raise2_record_fixture("ISO");
+
+    // The keymap drift, pinned exactly: all 28 differences sit on
+    // layer 3 and are placeholder-for-placeholder swaps.
+    let recorded_keymap = tokens(&recorded.raise2.iso.keymap_custom);
+    let shipped_keymap = tokens(virtual_data(&shipped, "keymap.custom"));
+
+    assert_eq!(recorded_keymap.len(), 800);
+    assert_eq!(shipped_keymap.len(), 800);
+
+    let mut differing_positions = Vec::new();
+
+    for (position, (recorded_token, shipped_token)) in
+        recorded_keymap.iter().zip(&shipped_keymap).enumerate()
+    {
+        if recorded_token == shipped_token {
+            continue;
+        }
+
+        // Every difference sits on layer 3 and is a placeholder swap.
+        assert_eq!(position / 80, 2, "raise2 ISO keymap drift layer");
+        assert!(
+            (*recorded_token == "0" || *recorded_token == "65535")
+                && (*shipped_token == "0" || *shipped_token == "65535"),
+            "raise2 ISO keymap drift at wire position {} carries real keys: \
+             {recorded_token} vs {shipped_token}",
+            position % 80
+        );
+
+        differing_positions.push(position % 80);
+    }
+
+    assert_eq!(
+        differing_positions.len(),
+        28,
+        "raise2 ISO keymap drift position count"
+    );
+
+    // The agreed commands, token for token.
+    let recorded_superkeys = recorded
+        .raise2
+        .iso
+        .superkeys_map
+        .parse::<SuperkeyMap>()
+        .expect("the Raise 2 ISO recorded superkeys data parses");
+    let shipped_superkeys = virtual_data(&shipped, "superkeys.map")
+        .parse::<SuperkeyMap>()
+        .expect("the Raise 2 ISO shipped superkeys data parses");
+
+    assert_eq!(recorded_superkeys, shipped_superkeys);
+
+    let recorded_macros = recorded
+        .raise2
+        .iso
+        .macros_map
+        .parse::<MacroMap>()
+        .expect("the Raise 2 ISO recorded macros data parses");
+    let shipped_macros = virtual_data(&shipped, "macros.map")
+        .parse::<MacroMap>()
+        .expect("the Raise 2 ISO shipped macros data parses");
+
+    assert_eq!(recorded_macros, shipped_macros);
+
+    assert_eq!(
+        tokens(&recorded.raise2.iso.palette),
+        tokens(virtual_data(&shipped, "palette"))
+    );
+
+    // The colormap drift: the shipped record's copy is 1440 tokens
+    // against the 176-LED layer the typed colormap holds — a typed
+    // rejection, never a misread.
+    let drifted = virtual_data(&shipped, "colormap.map");
+
+    assert_eq!(tokens(drifted).len(), 1440);
+    assert!(drifted.parse::<Raise2Colormap>().is_err());
+
+    // The shipped form — the definition's — parses and is exactly
+    // what the embedded constant carries.
+    let shipped_colormap = recorded
+        .raise2
+        .iso
+        .colormap_map
+        .parse::<Raise2Colormap>()
+        .expect("the Raise 2 ISO default colormap parses");
+
+    assert_eq!(
+        shipped_colormap.to_colormap_map_data(),
+        recorded.raise2.iso.colormap_map
+    );
+}
+
+#[test]
+fn raise_default_keymap_serializes_to_the_recorded_bazecor_data() {
+    // At the data level, exactly like the Defy's and Sonsei's (same
+    // padding caveat: the recorded default carries `65535` in the
+    // seven unmodeled slots of layers 3–10 and `0` on layers 1–2;
+    // the typed keymap normalizes them all to `0`).
+    let recorded = recorded();
+    let config = raise_default_config(KeyboardType::Ansi);
+
+    let recorded_keymap: RaiseKeymap = recorded
+        .raise
+        .ansi
+        .keymap_custom
+        .parse()
+        .expect("the recorded Raise default keymap data parses");
+
+    assert_eq!(
+        tokens(&config.keymap.to_keymap_custom_data()),
+        tokens(&recorded_keymap.to_keymap_custom_data())
+    );
+    assert_eq!(tokens(&config.keymap.to_keymap_custom_data()).len(), 800);
+}
+
+#[test]
+fn raise_default_colormap_palette_superkeys_and_macros_serialize_to_the_recorded_data() {
+    let recorded = recorded();
+    let config = raise_default_config(KeyboardType::Ansi);
+
+    // The colormap write is exactly the recorded default, token for
+    // token (132 LEDs per layer, no padding class).
+    assert_eq!(
+        tokens(&config.colormap.to_colormap_map_data()),
+        tokens(&recorded.raise.ansi.colormap_map)
+    );
+    assert_eq!(tokens(&config.colormap.to_colormap_map_data()).len(), 1320);
+
+    // The palette write: 48 decimals, the recorded tokens.
+    assert_eq!(
+        tokens(&config.palette.to_string()),
+        tokens(&recorded.raise.ansi.palette)
+    );
+
+    // The superkeys write carries the live form, then `65535`
+    // padding to the 512-slot memory — the recorded stream's tail.
+    let data = parsing::superkeys::SuperkeyMap::from(&config.superkeys)
+        .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()
+        .expect("the default superkeys map fits the device memory");
+    let all = tokens(&data);
+    let live = tokens(RAISE_DEFAULT_SUPERKEYS_DATA);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "65535"));
+
+    // The macros write: live form, then `255` eraser padding to the
+    // 2048-byte memory.
+    let data = parsing::macros::MacroMap::from(&config.macros)
+        .to_command_data(DefyKeyboard::MACRO_MEMORY_SIZE)
+        .expect("the default macro map fits the device memory");
+    let all = tokens(&data);
+    let live = tokens(RAISE_DEFAULT_MACROS_DATA);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "255"));
+}
+
+#[test]
+fn raise2_default_keymap_serializes_to_the_recorded_bazecor_data() {
+    let recorded = recorded();
+    let config = raise2_default_config(KeyboardType::Ansi);
+
+    let recorded_keymap: Raise2Keymap = recorded
+        .raise2
+        .ansi
+        .keymap_custom
+        .parse()
+        .expect("the recorded Raise 2 default keymap data parses");
+
+    assert_eq!(
+        tokens(&config.keymap.to_keymap_custom_data()),
+        tokens(&recorded_keymap.to_keymap_custom_data())
+    );
+
+    // And the ISO layout's own data, through its own types.
+    let config = raise2_default_config(KeyboardType::Iso);
+
+    let recorded_keymap: Raise2Keymap = recorded
+        .raise2
+        .iso
+        .keymap_custom
+        .parse()
+        .expect("the recorded Raise 2 ISO default keymap data parses");
+
+    assert_eq!(
+        tokens(&config.keymap.to_keymap_custom_data()),
+        tokens(&recorded_keymap.to_keymap_custom_data())
+    );
+}
+
+#[test]
+fn raise2_default_colormap_palette_superkeys_and_macros_serialize_to_the_recorded_data() {
+    let recorded = recorded();
+    let config = raise2_default_config(KeyboardType::Ansi);
+
+    assert_eq!(
+        tokens(&config.colormap.to_colormap_map_data()),
+        tokens(&recorded.raise2.ansi.colormap_map)
+    );
+    assert_eq!(tokens(&config.colormap.to_colormap_map_data()).len(), 1760);
+
+    assert_eq!(
+        tokens(&config.palette.to_string()),
+        tokens(&recorded.raise2.ansi.palette)
+    );
+    assert_eq!(tokens(&config.palette.to_string()).len(), 64);
+
+    let data = parsing::superkeys::SuperkeyMap::from(&config.superkeys)
+        .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()
+        .expect("the default superkeys map fits the device memory");
+    let all = tokens(&data);
+    let live = tokens(RAISE2_DEFAULT_SUPERKEYS_DATA);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "65535"));
+
+    let data = parsing::macros::MacroMap::from(&config.macros)
+        .to_command_data(DefyKeyboard::MACRO_MEMORY_SIZE)
+        .expect("the default macro map fits the device memory");
+    let all = tokens(&data);
+    let live = tokens(RAISE2_DEFAULT_MACROS_DATA);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "255"));
+}
+
+#[test]
+fn the_raise_default_superkey_decodes_to_its_documented_actions() {
+    for keyboard_type in [KeyboardType::Ansi, KeyboardType::Iso] {
+        let DefaultConfig::Raise(config) = default_config(ConversionTarget::Raise(keyboard_type))
+        else {
+            panic!("the Raise answers a Raise default config");
+        };
+
+        let superkeys: Vec<_> = config.superkeys.iter().collect();
+
+        let [&superkey] = superkeys[..] else {
+            panic!("the default map holds exactly one superkey");
+        };
+
+        // The factory clipboard superkey, one pair of actions: tap
+        // Ctrl+C, hold Ctrl+V, no other action (the wire's `1`,
+        // "no action").
+        assert_eq!(superkey.tap, Some(KeyKind::from(262)));
+        assert_eq!(superkey.hold, Some(KeyKind::from(281)));
+        assert_eq!(superkey.tap_hold, None);
+        assert_eq!(superkey.double_tap, None);
+        assert_eq!(superkey.double_tap_hold, None);
+    }
+}
+
+#[test]
+fn the_raise2_default_superkey_decodes_to_its_documented_actions() {
+    for keyboard_type in [KeyboardType::Ansi, KeyboardType::Iso] {
+        let DefaultConfig::Raise2(config) = default_config(ConversionTarget::Raise2(keyboard_type))
+        else {
+            panic!("the Raise 2 answers a Raise 2 default config");
+        };
+
+        let superkeys: Vec<_> = config.superkeys.iter().collect();
+
+        let [&superkey] = superkeys[..] else {
+            panic!("the default map holds exactly one superkey");
+        };
+
+        assert_eq!(superkey.tap, Some(KeyKind::from(262)));
+        assert_eq!(superkey.hold, Some(KeyKind::from(281)));
+        assert_eq!(superkey.tap_hold, None);
+        assert_eq!(superkey.double_tap, None);
+        assert_eq!(superkey.double_tap_hold, None);
+    }
+}
+
+#[test]
+fn the_raise_default_macro_decodes_to_its_documented_sequence() {
+    let config = raise_default_config(KeyboardType::Ansi);
+
+    // ONE macro, typing "Hey, Dygmates": LeftShift held while
+    // tapping H, released; E, Y, comma, space; LeftShift held while
+    // tapping D, released; Y, G, M, A, T, E, S.
+    assert_eq!(config.macros.len(), 1);
+
+    let left_shift = KeyKind::from(225);
+
+    assert_eq!(
+        config.macros[0].actions,
+        [
+            MacroAction::KeyCodeDown(left_shift),
+            MacroAction::TapCode(KeyKind::from(11)),
+            MacroAction::KeyCodeUp(left_shift),
+            MacroAction::TapCode(KeyKind::from(8)),
+            MacroAction::TapCode(KeyKind::from(28)),
+            MacroAction::TapCode(KeyKind::from(54)),
+            MacroAction::TapCode(KeyKind::from(44)),
+            MacroAction::KeyCodeDown(left_shift),
+            MacroAction::TapCode(KeyKind::from(7)),
+            MacroAction::KeyCodeUp(left_shift),
+            MacroAction::TapCode(KeyKind::from(28)),
+            MacroAction::TapCode(KeyKind::from(10)),
+            MacroAction::TapCode(KeyKind::from(16)),
+            MacroAction::TapCode(KeyKind::from(4)),
+            MacroAction::TapCode(KeyKind::from(23)),
+            MacroAction::TapCode(KeyKind::from(8)),
+            MacroAction::TapCode(KeyKind::from(22)),
+        ]
+    );
+}
+
+#[test]
+fn the_raise2_default_macro_decodes_to_its_documented_sequence() {
+    let config = raise2_default_config(KeyboardType::Ansi);
+
+    // ONE macro: a tap of space, then the Raise's own greeting
+    // sequence, "Hey, Dygmates" (pinned action for action by the
+    // Raise's decode test above).
+    assert_eq!(config.macros.len(), 1);
+
+    let raise = raise_default_config(KeyboardType::Ansi);
+
+    let mut expected = vec![MacroAction::TapCode(KeyKind::from(44))];
+    expected.extend(raise.macros[0].actions.iter().copied());
+
+    assert_eq!(config.macros[0].actions, expected);
+}
+
+#[test]
+fn generated_raise_and_raise2_config_files_round_trip_to_the_write_shapes() {
+    // What `config init` writes reads back as the same typed value;
+    // what the apply paths accept is the same value read back from
+    // that JSON. This is the offline proof that the written files
+    // produce exactly the recorded default write shapes.
+    for keyboard_type in [KeyboardType::Ansi, KeyboardType::Iso] {
+        let DefaultConfig::Raise(config) = default_config(ConversionTarget::Raise(keyboard_type))
+        else {
+            panic!("the Raise answers a Raise default config");
+        };
+
+        let keymap_json =
+            serde_json::to_vec_pretty(&config.keymap).expect("a default keymap serializes");
+        let keymap: RaiseKeymap =
+            serde_json::from_slice(&keymap_json).expect("the written keymap JSON reads back");
+
+        assert_eq!(
+            keymap.to_keymap_custom_data(),
+            config.keymap.to_keymap_custom_data()
+        );
+
+        let colormap_json =
+            serde_json::to_vec_pretty(&config.colormap).expect("a default colormap serializes");
+        let colormap: RaiseColormap =
+            serde_json::from_slice(&colormap_json).expect("the written colormap JSON reads back");
+
+        assert_eq!(
+            colormap.to_colormap_map_data(),
+            config.colormap.to_colormap_map_data()
+        );
+
+        let DefaultConfig::Raise2(config) = default_config(ConversionTarget::Raise2(keyboard_type))
+        else {
+            panic!("the Raise 2 answers a Raise 2 default config");
+        };
+
+        let keymap_json =
+            serde_json::to_vec_pretty(&config.keymap).expect("a default keymap serializes");
+        let keymap: Raise2Keymap =
+            serde_json::from_slice(&keymap_json).expect("the written keymap JSON reads back");
+
+        assert_eq!(
+            keymap.to_keymap_custom_data(),
+            config.keymap.to_keymap_custom_data()
+        );
+
+        let colormap_json =
+            serde_json::to_vec_pretty(&config.colormap).expect("a default colormap serializes");
+        let colormap: Raise2Colormap =
+            serde_json::from_slice(&colormap_json).expect("the written colormap JSON reads back");
+
+        assert_eq!(
+            colormap.to_colormap_map_data(),
+            config.colormap.to_colormap_map_data()
+        );
+    }
 }

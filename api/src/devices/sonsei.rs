@@ -69,14 +69,17 @@
 //!   from the shipped backup by the conversions unit, where it lives
 //!   because that is who rewrites descriptors.
 //! - **Superkeys and macros** are product-independent wire formats:
-//!   the Defy module's [`SuperkeyMap`] (512-slot memory, 128-superkey
-//!   firmware addressing limit) and [`MacroMap`] (128-macro limit)
+//!   the Defy module's
+//!   [`SuperkeyMap`][crate::devices::defy::SuperkeyMap] (512-slot
+//!   memory, 128-superkey firmware addressing limit) and
+//!   [`MacroMap`][crate::devices::defy::MacroMap] (128-macro limit)
 //!   apply to the Sonsei unchanged — the shipped Sonsei backup's
-//!   entries parse through them, and the restore validation below uses
-//!   them for exactly that reason.
+//!   entries parse through them, and the restore validation (through
+//!   the shared `devices::plan` skeleton) uses them for exactly
+//!   that reason.
 
 use crate::{
-    devices::defy::{MacroMap, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap},
+    devices::defy::{ParseMacroMapError, ParseSuperkeyMapError},
     focus_api::parsing,
     keycode_tables::KeyKind,
 };
@@ -151,7 +154,7 @@ mod error {
         /// The backup's device descriptor names a product other than
         /// the Sonsei. Restoring another product's backup to a Sonsei
         /// would write foreign data to it (and no Sonsei transport
-        /// exists in this crate yet — see the [module docs](self)).
+        /// exists in this crate yet — see the [module docs](super)).
         #[display("the backup is for a `{product}`, not a Sonsei")]
         NotASonseiBackup {
             /// The product the backup's device descriptor names.
@@ -783,19 +786,14 @@ impl From<&SonseiColormapLayer> for parsing::colormap::ColormapLayer<{ LEDS_PER_
 }
 
 /// The captured Focus commands the Sonsei restore validation knows —
-/// the product-shaped ones plus the product-independent maps. Private:
-/// the command names are the firmware's and identical across products,
-/// and nothing outside this module names them.
+/// the product-shaped ones. (The product-independent `superkeys.map`
+/// and `macros.map` arms live in the shared
+/// [`plan`](super::plan) skeleton.) Private: the command names are
+/// the firmware's and identical across products, and nothing outside
+/// this module names them.
 const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
-const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
-const MACRO_MAP_COMMAND_NAME: &str = "macros.map";
 const PALETTE_COMMAND_NAME: &str = "palette";
 const COLORMAP_MAP_COMMAND_NAME: &str = "colormap.map";
-/// The command Bazecor's restore sends after every backup entry (see
-/// the Defy's `RESTORE_FINALIZE_COMMAND_NAME`): `led.mode` is
-/// deny-listed from captures, so restores append it unconditionally.
-const RESTORE_FINALIZE_COMMAND_NAME: &str = "led.mode";
-const RESTORE_FINALIZE_DATA: &str = "0";
 
 /// Computes the exact command sequence a Sonsei restore would send for
 /// a backup, validating the backup first — **without any connection**
@@ -813,7 +811,9 @@ const RESTORE_FINALIZE_DATA: &str = "0";
 /// through
 /// [`RgbPalette`][crate::focus_api::parsing::palette::RgbPalette] —
 /// and the product-independent maps through the shared
-/// [`SuperkeyMap`]/[`MacroMap`] types. The backup's device descriptor,
+/// [`SuperkeyMap`][crate::devices::defy::SuperkeyMap]/
+/// [`MacroMap`][crate::devices::defy::MacroMap] types. The backup's
+/// device descriptor,
 /// when it carries one, must name the Sonsei: the cross-product guard
 /// stands in this direction too, so conversion remains the explicit
 /// pre-step between products.
@@ -844,74 +844,82 @@ pub fn backup_restore_plan_allowing_partial(
 /// The plan computation behind the refusal pair: `allow_partial` says
 /// whether a backup carrying the partial-capture marker is planned
 /// anyway.
+///
+/// The skeleton ([`plan::restore_plan`][core]) holds the
+/// product-independent shape — the partial refusal, the product
+/// guard, the shared superkeys/macros entries, the plan order, the
+/// `led.mode 0` tail — and [`SonseiShapes`] names the Sonsei's own
+/// pieces: the product name, the refusals' wording, and the
+/// Sonsei-shaped entries.
+///
+/// [core]: plan::restore_plan
 fn backup_restore_plan_with(
     backup: &parsing::backup::DefyBackup,
     allow_partial: bool,
 ) -> Result<Vec<parsing::backup::BackupCommand>, BackupValidationError> {
-    if let Some(partial) = &backup.partial
-        && !allow_partial
-    {
-        return Err(BackupValidationError::PartialCapture {
-            missing: partial.missing.clone(),
-        });
+    super::plan::restore_plan::<SonseiShapes>(backup, allow_partial)
+}
+
+/// The Sonsei's restore-validation shapes: the pieces
+/// [`plan::restore_plan`](super::plan::restore_plan) wires together —
+/// the product name the guard matches, the refusals' wording, and the
+/// Sonsei-shaped entries (the keymap, palette, and colormap; the
+/// superkeys and macros maps are the skeleton's).
+struct SonseiShapes;
+
+impl super::plan::ProductRestoreShapes for SonseiShapes {
+    type ValidationError = BackupValidationError;
+    type EntryError = BackupEntryError;
+    const EXPECTED_PRODUCT: &'static str = "Sonsei";
+
+    fn wrong_product(product: String) -> BackupValidationError {
+        BackupValidationError::NotASonseiBackup { product }
     }
 
-    if let Some(product) = backup.neuron.device.as_ref().and_then(|device| {
-        device
-            .get("info")
-            .and_then(|info| info.get("product"))
-            .and_then(serde_json::Value::as_str)
-    }) && product != "Sonsei"
-    {
-        return Err(BackupValidationError::NotASonseiBackup {
-            product: product.to_owned(),
-        });
+    fn refused_partial(missing: Vec<String>) -> BackupValidationError {
+        BackupValidationError::PartialCapture { missing }
     }
 
-    for entry in &backup.backup {
-        let validated: Result<(), BackupEntryError> = match entry.command.as_str() {
-            // A `keymap.custom` write carries exactly the ten
-            // layers; [`SonseiKeymap`] cannot be constructed from
-            // anything else, so the parse here is the whole
-            // validation.
-            KEYMAP_CUSTOM_COMMAND_NAME => SonseiKeymap::from_str(&entry.data)
-                .map_err(BackupEntryError::Keymap)
-                .map(|_| ()),
-            SUPERKEY_MAP_COMMAND_NAME => SuperkeyMap::from_str(&entry.data)
-                .map_err(BackupEntryError::Superkeys)
-                .map(|_| ()),
-            MACRO_MAP_COMMAND_NAME => MacroMap::from_str(&entry.data)
-                .map_err(BackupEntryError::Macros)
-                .map(|_| ()),
+    fn invalid_entry(command: String, source: BackupEntryError) -> BackupValidationError {
+        BackupValidationError::InvalidEntry { command, source }
+    }
+
+    fn shared_map_error(source: super::plan::SharedMapError) -> BackupEntryError {
+        match source {
+            super::plan::SharedMapError::Superkeys(source) => BackupEntryError::Superkeys(source),
+            super::plan::SharedMapError::Macros(source) => BackupEntryError::Macros(source),
+        }
+    }
+
+    fn validate_product_entry(command: &str, data: &str) -> Option<Result<(), BackupEntryError>> {
+        match command {
+            // A `keymap.custom` write carries exactly the ten layers;
+            // [`SonseiKeymap`] cannot be constructed from anything
+            // else, so the parse here is the whole validation.
+            KEYMAP_CUSTOM_COMMAND_NAME => Some(
+                SonseiKeymap::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Keymap),
+            ),
             // A `RGBWMode: false` palette write is exactly 16 RGB
             // colors; the type cannot be constructed from anything
             // else.
-            PALETTE_COMMAND_NAME => parsing::palette::RgbPalette::from_str(&entry.data)
-                .map_err(BackupEntryError::Palette)
-                .map(|_| ()),
+            PALETTE_COMMAND_NAME => Some(
+                parsing::palette::RgbPalette::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Palette),
+            ),
             // A `colormap.map` write carries exactly the ten 56-LED
             // layers; [`SonseiColormap`] cannot be constructed from
             // anything else.
-            COLORMAP_MAP_COMMAND_NAME => SonseiColormap::from_str(&entry.data)
-                .map_err(BackupEntryError::Colormap)
-                .map(|_| ()),
-            _ => Ok(()),
-        };
-
-        validated.map_err(|source| BackupValidationError::InvalidEntry {
-            command: entry.command.clone(),
-            source,
-        })?;
+            COLORMAP_MAP_COMMAND_NAME => Some(
+                SonseiColormap::from_str(data)
+                    .map(|_| ())
+                    .map_err(BackupEntryError::Colormap),
+            ),
+            _ => None,
+        }
     }
-
-    let mut plan = parsing::backup::restore_command_sequence(&backup.backup);
-
-    plan.push(parsing::backup::BackupCommand::new(
-        RESTORE_FINALIZE_COMMAND_NAME.to_owned(),
-        RESTORE_FINALIZE_DATA.to_owned(),
-    ));
-
-    Ok(plan)
 }
 
 #[cfg(test)]
