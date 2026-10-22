@@ -1,6 +1,7 @@
 //! Functions for interacting with the Focus API provided with Dygma
 //! firmware.
 
+pub mod identities;
 pub mod parsing;
 mod serial_port;
 
@@ -168,16 +169,22 @@ impl FocusApiConnection for SerialPortFocusApi {
 }
 
 impl SerialPortFocusApi {
-    const MANUFACTURER_NAME: &str = "DYGMA";
-
-    /// Creates a Focus API instance.
+    /// Creates a Focus API instance over the first serial port whose
+    /// USB (vendor id, product id) pair matches one of `identities`,
+    /// returning which identity matched alongside the connection.
+    ///
+    /// See [`identities::SERIAL_IDENTITIES`] for the table covering
+    /// every supported product; ports match on the exact (vendor id,
+    /// product id) pair alone — never on the port's
+    /// manufacturer/product strings, the way Bazecor's serial scan
+    /// matches them.
     pub async fn new(
-        product_name: &str,
+        identities: &[identities::DeviceIdentity],
         baud_rate: u32,
-    ) -> Result<Self, CreateSerialPortFocusApiError> {
-        let sp = SerialPort::connect(Self::MANUFACTURER_NAME, product_name, baud_rate).await?;
+    ) -> Result<(Self, identities::DeviceIdentity), CreateSerialPortFocusApiError> {
+        let (sp, identity) = SerialPort::connect(identities, baud_rate).await?;
 
-        Ok(Self(sp))
+        Ok((Self(sp), identity))
     }
 
     /// Executes commands and returns their response.
@@ -467,26 +474,108 @@ impl HidFocusApi {
             .await
             .map_err(CreateHidFocusApiError::ConnectingToDevice)?;
 
-        eprintln!(
-            "Warning:\n\
-            You are connected to the keyboard via Bluetooth.\n\
-            \n\
-            Large data payloads over Bluetooth used to fail: the final \
-            chunk of every transfer went out short and unpadded, which \
-            the wireless firmware misreads. This build zero-pads every \
-            chunk to full size and paces the transfer, but that fix is \
-            NOT yet validated against real hardware over the air.\n\
-            \n\
-            If the keyboard becomes unresponsive after a large \
-            transfer, restart it and reconnect over wired or wireless \
-            RF. This warning is removed once the fix is live-validated."
-        );
+        Self::warn_wireless_connection();
 
         Ok(Self {
             _device: device,
             transport: HidTransport { reader, writer },
         })
     }
+
+    /// Opens a connection to the first HID device whose (vendor id,
+    /// product id) pair matches one of `identities` — at the usage
+    /// page/id the Dygma raw-HID interface carries — returning which
+    /// identity matched alongside the connection.
+    ///
+    /// See [`identities::HID_IDENTITIES`] for the table covering every
+    /// product this crate matches on this transport: it mirrors
+    /// Bazecor's Focus HID scan (`src/api/hid/hid.ts`), which opens
+    /// product ids `[18, 33]` only. Absent from that scan is not
+    /// absent full stop — Bazecor's Lens opens a raw-HID interface at
+    /// the Sonsei's id on this very usage page, so Focus-over-HID on a
+    /// Sonsei is unattested in Bazecor, not known to be impossible —
+    /// and the first-generation Raise is the one product serial-only
+    /// across both Bazecor HID surfaces.
+    pub async fn new_matching(
+        identities: &[identities::DeviceIdentity],
+    ) -> Result<(Self, identities::DeviceIdentity), CreateHidFocusApiError> {
+        let backend = async_hid::HidBackend::default();
+
+        let device_stream = backend
+            .enumerate()
+            .await
+            .map_err(CreateHidFocusApiError::EnumeratingFailure)?
+            .filter_map(|device| {
+                matched_identity(&device, Self::USAGE_PAGE, Self::USAGE_ID, identities)
+                    .map(|identity| (device, identity))
+            });
+
+        futures::pin_mut!(device_stream);
+
+        let (device, identity) = device_stream
+            .next()
+            .await
+            .ok_or(CreateHidFocusApiError::DeviceNotFound)?;
+
+        let (reader, writer) = device
+            .open()
+            .await
+            .map_err(CreateHidFocusApiError::ConnectingToDevice)?;
+
+        Self::warn_wireless_connection();
+
+        Ok((
+            Self {
+                _device: device,
+                transport: HidTransport { reader, writer },
+            },
+            identity,
+        ))
+    }
+
+    /// The wireless-connection warning: deliberate, printed on every
+    /// HID-class connection (this transport class is the wireless
+    /// products' Bluetooth interface). Do not remove it — it is the
+    /// one place the transfer-recovery advice lives.
+    fn warn_wireless_connection() {
+        eprintln!(
+            "Warning:\n\
+            You are connected to the keyboard via its Bluetooth HID \
+            interface.\n\
+            \n\
+            Large data payloads over Bluetooth used to fail: the final \
+            chunk of every transfer went out short and unpadded, which \
+            the wireless firmware misreads. This build zero-pads every \
+            chunk to full size and paces the transfer, and that fix is \
+            live-validated on the Defy — the other products on this \
+            transport share it but not that validation.\n\
+            \n\
+            If the keyboard becomes unresponsive after a large \
+            transfer, restart it and reconnect over wired or wireless \
+            RF."
+        );
+    }
+}
+
+/// The identity of the first requested one this HID device carries at
+/// the Dygma raw-HID usage page/id, or `None` when it carries none —
+/// the filter Bazecor's HID scan applies
+/// (`src/api/hid/hid.ts`), returning what matched instead of a
+/// boolean.
+fn matched_identity(
+    info: &async_hid::DeviceInfo,
+    usage_page: u16,
+    usage_id: u16,
+    identities: &[identities::DeviceIdentity],
+) -> Option<identities::DeviceIdentity> {
+    if info.usage_page != usage_page || info.usage_id != usage_id {
+        return None;
+    }
+
+    identities
+        .iter()
+        .find(|identity| identity.matches(info.vendor_id, info.product_id))
+        .copied()
 }
 
 #[cfg(test)]
@@ -752,5 +841,123 @@ mod hid_tests {
             HidRunCommandError::ResponseTimedOut.to_string(),
             "timed out waiting for the device to complete its response"
         );
+    }
+
+    /// A `DeviceInfo` as a Dygma keyboard (or anything else) would
+    /// enumerate: platform-independent ids are fabricated.
+    fn device_info(
+        vendor_id: u16,
+        product_id: u16,
+        usage_page: u16,
+        usage_id: u16,
+    ) -> async_hid::DeviceInfo {
+        async_hid::DeviceInfo {
+            id: {
+                #[cfg(target_os = "macos")]
+                {
+                    async_hid::DeviceId::RegistryEntryId(0)
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    async_hid::DeviceId::UncPath(Default::default())
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    async_hid::DeviceId::DevPath(std::path::PathBuf::new())
+                }
+            },
+            name: String::new(),
+            product_id,
+            vendor_id,
+            usage_id,
+            usage_page,
+            serial_number: None,
+        }
+    }
+
+    #[test]
+    fn hid_filter_matches_the_dygma_rawhid_usage_and_one_identity() {
+        let dygma = device_info(
+            HidFocusApi::VENDOR_ID,
+            identities::DEFY_WIRELESS.product_id,
+            HidFocusApi::USAGE_PAGE,
+            HidFocusApi::USAGE_ID,
+        );
+
+        assert_eq!(
+            matched_identity(
+                &dygma,
+                HidFocusApi::USAGE_PAGE,
+                HidFocusApi::USAGE_ID,
+                &identities::HID_IDENTITIES
+            ),
+            Some(identities::DEFY_WIRELESS)
+        );
+    }
+
+    #[test]
+    fn hid_filter_rejects_wrong_usage_vendor_and_product() {
+        let wrong_usage = device_info(HidFocusApi::VENDOR_ID, 18, 1, 1);
+        let wrong_vendor = device_info(1, 18, HidFocusApi::USAGE_PAGE, HidFocusApi::USAGE_ID);
+        let wrong_product = device_info(
+            HidFocusApi::VENDOR_ID,
+            49, // the Sonsei's serial id: never a HID match
+            HidFocusApi::USAGE_PAGE,
+            HidFocusApi::USAGE_ID,
+        );
+
+        for info in [&wrong_usage, &wrong_vendor, &wrong_product] {
+            assert_eq!(
+                matched_identity(
+                    info,
+                    HidFocusApi::USAGE_PAGE,
+                    HidFocusApi::USAGE_ID,
+                    &identities::HID_IDENTITIES
+                ),
+                None,
+                "{info:?} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hid_identity_passes_the_filter_and_the_table_never_grows_a_product_absent_from_bazecors_focus_scan()
+     {
+        for identity in &identities::HID_IDENTITIES {
+            let info = device_info(
+                identity.vendor_id,
+                identity.product_id,
+                HidFocusApi::USAGE_PAGE,
+                HidFocusApi::USAGE_ID,
+            );
+
+            assert_eq!(
+                matched_identity(
+                    &info,
+                    HidFocusApi::USAGE_PAGE,
+                    HidFocusApi::USAGE_ID,
+                    &identities::HID_IDENTITIES
+                ),
+                Some(*identity)
+            );
+        }
+
+        // The table mirrors Bazecor's Focus HID scan (`src/api/hid/
+        // hid.ts`, product ids [18, 33]): if it ever grows an id that
+        // scan does not open, this test demands the Bazecor citation
+        // first. (The Sonsei is the known near-miss: its raw-HID
+        // interface exists — Bazecor's Lens opens it — but
+        // Focus-over-HID on a Sonsei is unattested, so its id stays
+        // serial-only here until someone attests it.)
+        for absent_from_scan in [
+            identities::RAISE,
+            identities::SONSEI,
+            identities::DEFY_WIRED,
+        ] {
+            assert!(
+                !identities::HID_IDENTITIES.contains(&absent_from_scan),
+                "{absent_from_scan:?} is not in Bazecor's Focus HID scan"
+            );
+        }
     }
 }

@@ -4,6 +4,7 @@ extern crate derive_more;
 mod diagnostics;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use dygma_cli::devices::connection::{ConnectedProduct, DygmaConnection};
 use dygma_cli::devices::conversions;
 use dygma_cli::devices::defaults;
 use dygma_cli::devices::defy::{
@@ -132,12 +133,14 @@ impl CommandCommands {
     async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         match self {
             Self::Run { cmd, data } => {
-                let mut defy = DefyKeyboard::new()
+                let mut connection = DygmaConnection::new()
                     .await
                     .change_context(Error)
-                    .attach("connecting to the Defy keyboard")?;
+                    .attach("connecting to the keyboard")?;
 
-                let available_cmds = defy
+                print_connected_product(&connection.product);
+
+                let available_cmds = connection
                     .available_commands()
                     .await
                     .change_context(Error)
@@ -154,7 +157,7 @@ impl CommandCommands {
                         .change_context(Error));
                 }
 
-                let res = defy
+                let res = connection
                     .run_command(&cmd, data.as_deref())
                     .await
                     .change_context(Error)
@@ -165,12 +168,15 @@ impl CommandCommands {
                 Ok(())
             }
             Self::List { term } => {
-                let mut defy = DefyKeyboard::new()
+                let mut connection = DygmaConnection::new()
                     .await
                     .change_context(Error)
-                    .attach("connecting to the Defy keyboard")?;
+                    .attach("connecting to the keyboard")?;
 
-                defy.available_commands()
+                print_connected_product(&connection.product);
+
+                connection
+                    .available_commands()
                     .await
                     .change_context(Error)
                     .attach("getting list of available commands")?
@@ -187,6 +193,25 @@ impl CommandCommands {
                 Ok(())
             }
         }
+    }
+}
+
+/// Announces what was connected to, on stderr so stdout stays the
+/// command's output alone.
+///
+/// The non-Defy disclosure is stated plainly: those products are
+/// differential-validated against Bazecor's sources only, and raw
+/// Focus commands are the whole supported surface for them — the
+/// device-level typed methods exist for the Defy alone.
+fn print_connected_product(product: &ConnectedProduct) {
+    eprintln!("connected to {product}");
+
+    if product.product != conversions::Product::Defy {
+        eprintln!(
+            "note: this product's support is differential-validated against Bazecor's \
+             sources only — raw Focus commands are the supported surface for it, and \
+             live validation on real hardware is still wanted (see the README)"
+        );
     }
 }
 

@@ -1,17 +1,43 @@
 # Dygma SDK
 
 This repo is the home of a community-maintained set of tools designed for
-working with Dygma keyboards in a programatic fassion.
+working with Dygma keyboards in a programmatic fashion.
 
 The goal of this project is to allow for feature parity of Bazecor
 via a CLI, as well as a Rust SDK.
 
-Currently, only the Defy is supported, but adding support for the Raise 1 and 2
-is easy, though testing would not be, as I only have the Defy.
+## Supported products
 
-All connection methods are supported, including wired, wireless over
-RF, and wireless over Bluetooth LE — with full large-payload transfers
-(keymaps, backups, colormaps) working over all of them.
+The SDK matches and connects to every product Bazecor does — the Defy,
+Raise, Raise 2, and Sonsei — over the transports each of them presents
+(USB serial for all of them; Bluetooth for the Defy wireless and the
+Raise 2, which the SDK also matches over HID — the Sonsei connects
+over USB serial only as far as this SDK's matching goes). The
+transports carry full large-payload transfers (keymaps, backups,
+colormaps) — a fix live-validated on the Defy that the other products'
+transports share in code but not in validation.
+
+Support is not the same depth for every product, and this README says
+so plainly:
+
+- **Defy** — the reference product. It carries the device-level typed
+  APIs (keymap, superkeys, macros, LEDs, settings, wireless,
+  backup/restore) and it is the only product validated against real
+  hardware.
+- **Raise, Raise 2, Sonsei** — transport-level and format-level
+  support only, validated *differentially* against Bazecor's own
+  sources (its hardware definitions, its parsers, and its shipped
+  backups): connection and product identification, backup file
+  parsing and conversion between products, restore validation, and
+  default configurations. No device-level typed APIs exist for them;
+  raw Focus commands (`command list` / `command run`) are the
+  supported way to talk to one. When the CLI connects to a non-Defy
+  product it says which one it reached and prints this caveat.
+- **No non-Defy hardware exists in this project's validation.** If
+  you own a Raise, Raise 2, or Sonsei, real-hardware evidence would
+  be valuable to the project — `command list` output and a
+  `backup restore --dry-run` of one of your Bazecor backups
+  especially. Please open an issue with whatever you find.
 
 # Project structure
 

@@ -2,10 +2,11 @@
 //! the keyboard.
 
 use super::colormap_serde::colormap_layer_serde;
+use super::probes::probe_identity;
 use crate::{
     focus_api::{
         CreateHidFocusApiError, FocusApiConnection, GetCommandsError, HidFocusApi, RunCommandError,
-        SerialPortFocusApi, parsing,
+        SerialPortFocusApi, identities, parsing,
     },
     keycode_tables::KeyKind,
 };
@@ -291,28 +292,14 @@ mod error {
 
     /// Why a backup capture's identity probe produced no value.
     ///
-    /// The identity probes (`hardware.chip_id`, `version`,
-    /// `hardware.wireless`) are best-effort: a capture is never
-    /// interrupted by one. The reason is recorded instead, and the
-    /// backup is assembled with the identity it did obtain — the
-    /// capture is complete whenever every capture-list command was
-    /// captured, whatever the probes did.
-    #[derive(Clone, Copy, Debug, Display, Error, PartialEq, Eq)]
-    pub enum IdentityProbeUnavailable {
-        /// The device's `help` output — its own capability
-        /// advertisement, and the source of the capture list — does
-        /// not list the probe's command, so the probe was never sent:
-        /// the device has said it does not serve it. The wireless
-        /// Defy's firmware, for example, serves no `hardware.wireless`
-        /// command and answers any attempt with an empty response.
-        #[display("the device does not serve `{_0}`")]
-        NotServed(#[error(not(source))] &'static str),
-        /// The command is served, but the read did not produce a
-        /// usable value: a transport error, an empty response, or a
-        /// response that does not parse.
-        #[display("the `{_0}` read failed or returned nothing usable")]
-        ReadFailed(#[error(not(source))] &'static str),
-    }
+    /// An alias of the shared best-effort probe machinery
+    /// ([`IdentityProbeUnavailable`](crate::devices::probes::IdentityProbeUnavailable))
+    /// — the capture probes are exactly the connect-time
+    /// identification's probes, one rule for both. See
+    /// [`DefyKeyboard::create_backup`] for how a capture treats each
+    /// variant.
+    #[doc(inline)]
+    pub use crate::devices::probes::IdentityProbeUnavailable;
 
     /// The identity metadata a completed backup capture obtained, one
     /// field per probe: the value the device reported, or
@@ -549,8 +536,13 @@ pub struct DefyKeyboard {
 
 impl DefyKeyboard {
     const HID_PRODUCT_ID: u16 = 18;
-    const PRODUCT_NAME: &str = "DEFY";
-    const BAUD_RATE: u32 = 115_200;
+
+    /// The Defy's serial identities, both variants: the only devices
+    /// this typed handle may reach. The matching is by USB (vendor id,
+    /// product id) pair, the way Bazecor matches serial ports — the
+    /// port's manufacturer/product strings are never consulted.
+    const SERIAL_IDENTITIES: &[identities::DeviceIdentity] =
+        &[identities::DEFY_WIRED, identities::DEFY_WIRELESS];
 
     const KEYMAP_CUSTOM_COMMAND_NAME: &str = "keymap.custom";
     const SUPERKEY_MAP_COMMAND_NAME: &str = "superkeys.map";
@@ -558,7 +550,11 @@ impl DefyKeyboard {
     const VERSION_COMMAND_NAME: &str = "version";
     const HARDWARE_CHIP_ID_COMMAND_NAME: &str = "hardware.chip_id";
     const HARDWARE_WIRELESS_COMMAND_NAME: &str = "hardware.wireless";
-    const HARDWARE_LAYOUT_COMMAND_NAME: &str = "hardware.layout";
+    /// The `hardware.layout` wire command's name, shared with the
+    /// connect-time identification's layout probe
+    /// ([`DygmaConnection`](super::connection::DygmaConnection)) — the
+    /// one source of the string.
+    pub(crate) const HARDWARE_LAYOUT_COMMAND_NAME: &str = "hardware.layout";
     const KEYMAP_ONLY_CUSTOM_COMMAND_NAME: &str = "keymap.onlyCustom";
     const SETTINGS_DEFAULT_LAYER_COMMAND_NAME: &str = "settings.defaultLayer";
     const QUKEYS_HOLD_TIMEOUT_COMMAND_NAME: &str = "qukeys.holdTimeout";
@@ -612,9 +608,10 @@ impl DefyKeyboard {
 
     /// Creates a handle to the keyboard.
     pub async fn new() -> Result<Self, CreateDefyKeyboardError> {
-        let sp_focus_api_res = SerialPortFocusApi::new(Self::PRODUCT_NAME, Self::BAUD_RATE)
-            .await
-            .map(Into::into);
+        let sp_focus_api_res =
+            SerialPortFocusApi::new(Self::SERIAL_IDENTITIES, identities::BAUD_RATE)
+                .await
+                .map(|(api, _identity)| api.into());
         let bt_focus_api_res = HidFocusApi::new(Self::HID_PRODUCT_ID).await.map(Into::into);
 
         let focus_api = sp_focus_api_res.or(bt_focus_api_res)?;
@@ -2106,54 +2103,6 @@ async fn capture_backup(
     Ok((backup, identity))
 }
 
-/// Runs one identity probe of a backup capture, best-effort: the
-/// single place the "identity never interrupts a capture" rule lives.
-///
-/// A command the device's `help` output does not list is never sent —
-/// the device has advertised that it does not serve it
-/// ([`IdentityProbeUnavailable::NotServed`]). A served probe that
-/// fails — a transport error, an empty response, or a response that
-/// does not parse — is [`IdentityProbeUnavailable::ReadFailed`].
-/// Either way the reason is logged at `debug` level (the empty
-/// responses included, since a served-but-silent command is its own
-/// diagnostic) and returned; nothing here can abort a capture.
-async fn probe_identity<T>(
-    connection: &mut impl FocusApiConnection,
-    served_commands: &[String],
-    command: &'static str,
-) -> Result<T, IdentityProbeUnavailable>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    if !served_commands.iter().any(|served| served == command) {
-        debug!(
-            "backup capture: `{command}` is not in the device's `help` \
-             output, the identity probe is skipped"
-        );
-
-        return Err(IdentityProbeUnavailable::NotServed(command));
-    }
-
-    match connection.run_command(command, None).await {
-        Ok(response) if !response.trim().is_empty() => T::from_str(&response).map_err(|err| {
-            debug!("backup capture: `{command}` response did not parse: {err}");
-
-            IdentityProbeUnavailable::ReadFailed(command)
-        }),
-        Ok(_) => {
-            debug!("backup capture: `{command}` returned an empty response");
-
-            Err(IdentityProbeUnavailable::ReadFailed(command))
-        }
-        Err(err) => {
-            debug!("backup capture: `{command}` read failed: {err}");
-
-            Err(IdentityProbeUnavailable::ReadFailed(command))
-        }
-    }
-}
-
 /// Assembles the interrupted-capture error: the partial backup holding
 /// `already_captured` (the completed file's entries) plus `captured`
 /// (this run's entries, in capture order), marked against the capture
@@ -2319,6 +2268,14 @@ fn backup_device_descriptor_template() -> serde_json::Value {
 }
 
 /// Static dispatch for focus API connections.
+///
+/// Product-agnostic by design — it dispatches transports, not products
+/// ([`DygmaConnection`](super::connection::DygmaConnection) builds on
+/// it for every supported keyboard). It and the
+/// `hardware.layout` command name live here only for history: moving
+/// both to a neutral devices-level module is the recorded
+/// post-commit systemic-pass queue item (see FEATURE-PARITY.md, the
+/// #24 unit-4 gauntlet disposition).
 #[derive(Debug, From)]
 pub enum DynFocusApi {
     /// Connections to the device over serial port,
