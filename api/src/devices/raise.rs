@@ -109,7 +109,7 @@
 //!   exactly that reason.
 
 use crate::{
-    devices::colormap_serde::colormap_layer_serde,
+    devices::colormap_serde::{colormap_layer_serde, colormap_map_impls},
     devices::defy::{ParseMacroMapError, ParseSuperkeyMapError},
     focus_api::parsing,
     keycode_tables::KeyKind,
@@ -667,81 +667,12 @@ pub struct RaiseColormap {
     pub layers: [RaiseColormapLayer; KEYMAP_CUSTOM_COMMAND_LAYERS],
 }
 
-impl TryFrom<Vec<RaiseColormapLayer>> for RaiseColormap {
-    type Error = ColormapDoesNotHave10LayersError;
-
-    fn try_from(layers: Vec<RaiseColormapLayer>) -> Result<Self, Self::Error> {
-        let layers = layers
-            .try_into()
-            .map_err(|_| ColormapDoesNotHave10LayersError)?;
-
-        Ok(Self { layers })
-    }
-}
-
-impl FromStr for RaiseColormap {
-    type Err = ParseColormapError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let layers: Vec<RaiseColormapLayer> = s
-            .parse::<parsing::colormap::Colormap<{ LEDS_PER_LAYER }>>()?
-            .iter()
-            .map(RaiseColormapLayer::from)
-            .collect();
-
-        Ok(Self::try_from(layers)?)
-    }
-}
-
-impl serde::Serialize for RaiseColormap {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.layers
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, layer)| RaiseColormapLayer {
-                layer_number: i as u8 + 1,
-                ..layer
-            })
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for RaiseColormap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let layers = <Vec<RaiseColormapLayer> as serde::Deserialize>::deserialize(deserializer)?;
-
-        // Checked at the JSON boundary like `FromStr` checks it at the
-        // wire boundary: a config file holding a different number of
-        // layers cannot come into existence as a [`RaiseColormap`]
-        // either, so every consumer of the type can rely on the write
-        // shape.
-        Self::try_from(layers).map_err(serde::de::Error::custom)
-    }
-}
-
-impl RaiseColormap {
-    /// Converts this colormap into a form suitable for sending over to
-    /// the keyboard as the data of a `colormap.map` command.
-    ///
-    /// Infallible by construction: a [`RaiseColormap`] holds exactly
-    /// the ten layers the command requires.
-    pub fn to_colormap_map_data(&self) -> String {
-        parsing::colormap::Colormap(
-            self.layers
-                .iter()
-                .map(parsing::colormap::ColormapLayer::from)
-                .collect(),
-        )
-        .to_string()
-    }
+colormap_map_impls! {
+    RaiseColormap,
+    RaiseColormapLayer,
+    parsing::colormap::Colormap<{ LEDS_PER_LAYER }>,
+    layer_count_error: ColormapDoesNotHave10LayersError,
+    parse_error: ParseColormapError,
 }
 
 /// A single human-readable Raise colormap layer.

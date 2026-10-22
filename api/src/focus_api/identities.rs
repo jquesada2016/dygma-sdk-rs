@@ -30,6 +30,22 @@
 /// (`src/api/comms/serial/SerialAPI.ts`, `open`).
 pub const BAUD_RATE: u32 = 115_200;
 
+/// The `hardware.layout` wire command's name: the Focus command whose
+/// response names a connected device's physical layout (ANSI or ISO).
+///
+/// This is the one source of the string. The connect-time
+/// identification
+/// ([`DygmaConnection`](crate::devices::connection::DygmaConnection))
+/// probes it on the Raise generations — the only products whose
+/// ANSI/ISO layouts their transport identities cannot decide, the
+/// probe this module's [`DeviceKind`] docs describe — and the Defy's
+/// typed handle serves it through
+/// [`DefyKeyboard::get_layout`](crate::devices::defy::DefyKeyboard::get_layout).
+/// Bazecor probes the same command on every serial-matched device
+/// (`src/api/comms/serial/SerialAPI.ts`, `checkProperties`), consuming
+/// the layout for exactly those products.
+pub(crate) const HARDWARE_LAYOUT_COMMAND_NAME: &str = "hardware.layout";
+
 /// The USB vendor id of Dygma `0x35ef` (decimal 13807): the Defy,
 /// Raise 2, and Sonsei all present it.
 pub const VENDOR_DYGMA: u16 = 0x35ef;

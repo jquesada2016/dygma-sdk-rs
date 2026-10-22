@@ -557,6 +557,40 @@ impl HidFocusApi {
     }
 }
 
+/// Static dispatch for focus API connections.
+///
+/// Product-agnostic by design — it dispatches transports, not
+/// products: it is one enum over the two transports this module
+/// defines, so a handle or connection can hold either without being
+/// generic over the connection trait
+/// ([`DygmaConnection`](crate::devices::connection::DygmaConnection)
+/// builds on it for every supported keyboard).
+#[derive(Debug, From)]
+pub enum DynFocusApi {
+    /// Connections to the device over serial port,
+    /// which includes both wired over USB, as well as
+    /// wireless over RF.
+    Serial(SerialPortFocusApi),
+    /// Connections to the device over BTLE.
+    Bluetooth(HidFocusApi),
+}
+
+impl FocusApiConnection for DynFocusApi {
+    async fn run_command(
+        &mut self,
+        command: &str,
+        data: Option<&str>,
+    ) -> Result<String, RunCommandError> {
+        match self {
+            // Qualified: `SerialPortFocusApi`'s private inherent
+            // `run_command` (visible inside this module, where it is
+            // defined) would otherwise shadow the trait method here.
+            Self::Serial(sp) => FocusApiConnection::run_command(sp, command, data).await,
+            Self::Bluetooth(hid) => hid.run_command(command, data).await,
+        }
+    }
+}
+
 /// The identity of the first requested one this HID device carries at
 /// the Dygma raw-HID usage page/id, or `None` when it carries none —
 /// the filter Bazecor's HID scan applies

@@ -26,9 +26,10 @@
 
 pub use error::*;
 
-use super::{conversions::Product, defy::DynFocusApi, probes};
+use super::{conversions::Product, probes};
 use crate::focus_api::{
-    self, CreateHidFocusApiError, FocusApiConnection, SerialPortFocusApi, identities, parsing,
+    self, CreateHidFocusApiError, DynFocusApi, FocusApiConnection, SerialPortFocusApi, identities,
+    parsing,
 };
 
 mod error {
@@ -241,7 +242,7 @@ async fn probe_layout_over(
     match probes::probe_identity::<parsing::settings::KeyboardLayout>(
         connection,
         &served,
-        super::defy::DefyKeyboard::HARDWARE_LAYOUT_COMMAND_NAME,
+        identities::HARDWARE_LAYOUT_COMMAND_NAME,
     )
     .await
     {

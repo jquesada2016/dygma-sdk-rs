@@ -1,5 +1,8 @@
-//! The serde implementation behind the products' colormap layers,
-//! stamped out per product by [`colormap_layer_serde!`].
+//! The shared colormap machinery stamped out per product:
+//! [`colormap_layer_serde!`] generates every product's colormap layer
+//! serde impls, and [`colormap_map_impls!`] generates every product's
+//! colormap map wrapper (count-checked construction, wire parse, JSON
+//! boundary, `colormap.map` write-shape conversion).
 //!
 //! Every product's colormap layer serializes as a JSON object carrying
 //! the write-only `layer_number` UX aid plus one palette-index array
@@ -187,6 +190,106 @@ macro_rules! colormap_layer_serde {
 }
 
 pub(super) use colormap_layer_serde;
+
+/// Stamps out a colormap map type's whole human-readable wrapper: the
+/// count-checked construction
+/// ([`TryFrom`](::core::convert::TryFrom) over the layers), the wire
+/// parse ([`FromStr`](::core::str::FromStr)), the JSON boundary
+/// ([`serde::Serialize`] / [`serde::Deserialize`]), and the
+/// `colormap.map` write-shape conversion
+/// (`to_colormap_map_data`).
+///
+/// The five impls are one rule set stamped per product, exactly like
+/// the layer serde above: a map holds exactly the ten layers every
+/// `colormap.map` write carries — checked at the wire boundary
+/// (`FromStr`) and at the JSON boundary (`Deserialize`) alike — and
+/// serialization stamps the write-only `layer_number` aid (1-based)
+/// that deserialization ignores. The invocation names the map and
+/// layer types, the wire colormap type to parse
+/// (`Colormap` for the Defy's default width,
+/// `Colormap<{ LEDS_PER_LAYER }>` for the others), and the product's
+/// two error types, which stay per-product: only their names flow
+/// through here, never new error text.
+macro_rules! colormap_map_impls {
+    (
+        $map:ident, $layer:ident, $wire:ty,
+        layer_count_error: $layer_count_error:ident,
+        parse_error: $parse_error:ty $(,)?
+    ) => {
+        impl ::core::convert::TryFrom<Vec<$layer>> for $map {
+            type Error = $layer_count_error;
+
+            fn try_from(layers: Vec<$layer>) -> Result<Self, Self::Error> {
+                let layers = layers.try_into().map_err(|_| $layer_count_error)?;
+
+                Ok(Self { layers })
+            }
+        }
+
+        impl ::core::str::FromStr for $map {
+            type Err = $parse_error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let layers: Vec<$layer> = s.parse::<$wire>()?.iter().map($layer::from).collect();
+
+                Ok(Self::try_from(layers)?)
+            }
+        }
+
+        impl serde::Serialize for $map {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                self.layers
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, layer)| $layer {
+                        layer_number: i as u8 + 1,
+                        ..layer
+                    })
+                    .collect::<Vec<_>>()
+                    .serialize(serializer)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $map {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let layers = <Vec<$layer> as serde::Deserialize>::deserialize(deserializer)?;
+
+                // Checked at the JSON boundary like `FromStr` checks it
+                // at the wire boundary: a config file holding a
+                // different number of layers cannot come into existence
+                // as the colormap type either, so every consumer of the
+                // type can rely on the write shape.
+                Self::try_from(layers).map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl $map {
+            /// Converts this colormap into a form suitable for sending
+            /// over to the keyboard as the data of a `colormap.map`
+            /// command.
+            ///
+            #[doc = concat!("Infallible by construction: a [`", stringify!($map), "`] holds exactly the ten layers the command requires.")]
+            pub fn to_colormap_map_data(&self) -> String {
+                $crate::focus_api::parsing::colormap::Colormap(
+                    self.layers
+                        .iter()
+                        .map($crate::focus_api::parsing::colormap::ColormapLayer::from)
+                        .collect(),
+                )
+                .to_string()
+            }
+        }
+    };
+}
+
+pub(super) use colormap_map_impls;
 
 /// Builds the field identifier's "expecting" sentence from the LED
 /// field names: `` `keyboard`, `underglow_left`, or `underglow_right`

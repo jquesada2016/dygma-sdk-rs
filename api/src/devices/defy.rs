@@ -1,7 +1,7 @@
 //! Provides the [`DefyKeyboard`] struct for programatically interacting with
 //! the keyboard.
 
-use super::colormap_serde::colormap_layer_serde;
+use super::colormap_serde::{colormap_layer_serde, colormap_map_impls};
 use super::probes::probe_identity;
 use crate::{
     focus_api::{
@@ -550,11 +550,6 @@ impl DefyKeyboard {
     const VERSION_COMMAND_NAME: &str = "version";
     const HARDWARE_CHIP_ID_COMMAND_NAME: &str = "hardware.chip_id";
     const HARDWARE_WIRELESS_COMMAND_NAME: &str = "hardware.wireless";
-    /// The `hardware.layout` wire command's name, shared with the
-    /// connect-time identification's layout probe
-    /// ([`DygmaConnection`](super::connection::DygmaConnection)) — the
-    /// one source of the string.
-    pub(crate) const HARDWARE_LAYOUT_COMMAND_NAME: &str = "hardware.layout";
     const KEYMAP_ONLY_CUSTOM_COMMAND_NAME: &str = "keymap.onlyCustom";
     const SETTINGS_DEFAULT_LAYER_COMMAND_NAME: &str = "settings.defaultLayer";
     const QUKEYS_HOLD_TIMEOUT_COMMAND_NAME: &str = "qukeys.holdTimeout";
@@ -810,7 +805,8 @@ impl DefyKeyboard {
     pub async fn get_layout(
         &mut self,
     ) -> Result<parsing::settings::KeyboardLayout, GetSettingError> {
-        self.get_setting(Self::HARDWARE_LAYOUT_COMMAND_NAME).await
+        self.get_setting(identities::HARDWARE_LAYOUT_COMMAND_NAME)
+            .await
     }
 
     /// Get whether the keyboard only uses the layers stored in
@@ -2267,37 +2263,13 @@ fn backup_device_descriptor_template() -> serde_json::Value {
     })
 }
 
-/// Static dispatch for focus API connections.
-///
-/// Product-agnostic by design — it dispatches transports, not products
-/// ([`DygmaConnection`](super::connection::DygmaConnection) builds on
-/// it for every supported keyboard). It and the
-/// `hardware.layout` command name live here only for history: moving
-/// both to a neutral devices-level module is the recorded
-/// post-commit systemic-pass queue item (see FEATURE-PARITY.md, the
-/// #24 unit-4 gauntlet disposition).
-#[derive(Debug, From)]
-pub enum DynFocusApi {
-    /// Connections to the device over serial port,
-    /// which includes both wired over USB, as well as
-    /// wireless over RF.
-    Serial(SerialPortFocusApi),
-    /// Connections to the device over BTLE.
-    Bluetooth(HidFocusApi),
-}
-
-impl FocusApiConnection for DynFocusApi {
-    async fn run_command(
-        &mut self,
-        command: &str,
-        data: Option<&str>,
-    ) -> Result<String, crate::focus_api::RunCommandError> {
-        match self {
-            Self::Serial(sp) => sp.run_command(command, data).await,
-            Self::Bluetooth(hid) => hid.run_command(command, data).await,
-        }
-    }
-}
+/// Static dispatch for focus API connections: it dispatches the two
+/// transports, not products, so its home is the transport layer
+/// ([`focus_api`](crate::focus_api)), where both transports are
+/// defined. This re-export preserves the type's public path, which has
+/// always run through this module.
+#[doc(inline)]
+pub use crate::focus_api::DynFocusApi;
 
 /// Structure representing the physical layout of the Defy keyboard.
 #[derive(Clone, Copy, Debug)]
@@ -3082,81 +3054,12 @@ pub struct DefyColormap {
     pub layers: [DefyColormapLayer; KEYMAP_CUSTOM_COMMAND_LAYERS],
 }
 
-impl TryFrom<Vec<DefyColormapLayer>> for DefyColormap {
-    type Error = ColormapDoesNotHave10LayersError;
-
-    fn try_from(layers: Vec<DefyColormapLayer>) -> Result<Self, Self::Error> {
-        let layers = layers
-            .try_into()
-            .map_err(|_| ColormapDoesNotHave10LayersError)?;
-
-        Ok(Self { layers })
-    }
-}
-
-impl FromStr for DefyColormap {
-    type Err = ParseColormapError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let layers: Vec<DefyColormapLayer> = s
-            .parse::<parsing::colormap::Colormap>()?
-            .iter()
-            .map(DefyColormapLayer::from)
-            .collect();
-
-        Ok(Self::try_from(layers)?)
-    }
-}
-
-impl serde::Serialize for DefyColormap {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.layers
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, layer)| DefyColormapLayer {
-                layer_number: i as u8 + 1,
-                ..layer
-            })
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for DefyColormap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let layers = <Vec<DefyColormapLayer> as serde::Deserialize>::deserialize(deserializer)?;
-
-        // Checked at the JSON boundary like `FromStr` checks it at the
-        // wire boundary: a config file holding a different number of
-        // layers cannot come into existence as a [`DefyColormap`]
-        // either, so every consumer of the type can rely on the write
-        // shape.
-        Self::try_from(layers).map_err(serde::de::Error::custom)
-    }
-}
-
-impl DefyColormap {
-    /// Converts this colormap into a form suitable for sending over to
-    /// the keyboard as the data of a `colormap.map` command.
-    ///
-    /// Infallible by construction: a [`DefyColormap`] holds exactly
-    /// the ten layers the command requires.
-    pub fn to_colormap_map_data(&self) -> String {
-        parsing::colormap::Colormap(
-            self.layers
-                .iter()
-                .map(parsing::colormap::ColormapLayer::from)
-                .collect(),
-        )
-        .to_string()
-    }
+colormap_map_impls! {
+    DefyColormap,
+    DefyColormapLayer,
+    parsing::colormap::Colormap,
+    layer_count_error: ColormapDoesNotHave10LayersError,
+    parse_error: ParseColormapError,
 }
 
 /// A single human-readable Defy colormap layer.
