@@ -109,6 +109,7 @@
 //!   exactly that reason.
 
 use crate::{
+    devices::colormap_serde::colormap_layer_serde,
     devices::defy::{ParseMacroMapError, ParseSuperkeyMapError},
     focus_api::parsing,
     keycode_tables::KeyKind,
@@ -749,8 +750,9 @@ impl RaiseColormap {
 /// write-only UX aid like the keymap layers' (a file carrying one has
 /// it ignored on the way in), and the three LED arrays are
 /// length-checked on the way in — exactly 69 keyboard, 30
-/// left-underglow, and 33 right-underglow indices. Hand-written serde
-/// like the Defy layer's (69 lands past the derive's array support).
+/// left-underglow, and 33 right-underglow indices. The serde impls
+/// come from the shared `colormap_layer_serde!` macro (69 lands past
+/// the derive's array support).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RaiseColormapLayer {
     /// A human-readable label for knowing what layer you're editing in
@@ -770,186 +772,11 @@ pub struct RaiseColormapLayer {
     pub underglow_right: [parsing::colormap::PaletteIndex; UNDERGLOW_RIGHT],
 }
 
-impl serde::Serialize for RaiseColormapLayer {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-
-        let mut state = serializer.serialize_struct("RaiseColormapLayer", 4)?;
-
-        state.serialize_field("layer_number", &self.layer_number)?;
-        state.serialize_field("keyboard", &&self.keyboard[..])?;
-        state.serialize_field("underglow_left", &&self.underglow_left[..])?;
-        state.serialize_field("underglow_right", &&self.underglow_right[..])?;
-
-        state.end()
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for RaiseColormapLayer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        enum Field {
-            Keyboard,
-            UnderglowLeft,
-            UnderglowRight,
-            /// A present `layer_number` — accepted and discarded, the
-            /// way the derived skip-deserializing keymap layers treat
-            /// theirs (it is a write-only UX aid).
-            LayerNumber,
-            /// Any other field — ignored, the way derived structs
-            /// tolerate unknown fields (`deny_unknown_fields` is not
-            /// the derived default).
-            Other,
-        }
-
-        impl<'de> serde::Deserialize<'de> for Field {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct FieldVisitor;
-
-                impl serde::de::Visitor<'_> for FieldVisitor {
-                    type Value = Field;
-
-                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        f.write_str("`keyboard`, `underglow_left`, or `underglow_right`")
-                    }
-
-                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Field, E> {
-                        match value {
-                            "keyboard" => Ok(Field::Keyboard),
-                            "underglow_left" => Ok(Field::UnderglowLeft),
-                            "underglow_right" => Ok(Field::UnderglowRight),
-                            "layer_number" => Ok(Field::LayerNumber),
-                            _ => Ok(Field::Other),
-                        }
-                    }
-                }
-
-                deserializer.deserialize_identifier(FieldVisitor)
-            }
-        }
-
-        struct LayerVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for LayerVisitor {
-            type Value = RaiseColormapLayer;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(
-                    f,
-                    "a colormap layer of {KEYBOARD_LEDS} keyboard, \
-                     {UNDERGLOW_LEFT} left-underglow, and {UNDERGLOW_RIGHT} \
-                     right-underglow palette indices"
-                )
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut keyboard: Option<Vec<parsing::colormap::PaletteIndex>> = None;
-                let mut underglow_left: Option<Vec<parsing::colormap::PaletteIndex>> = None;
-                let mut underglow_right: Option<Vec<parsing::colormap::PaletteIndex>> = None;
-
-                while let Some(field) = map.next_key::<Field>()? {
-                    match field {
-                        Field::Keyboard => {
-                            if keyboard.is_some() {
-                                return Err(serde::de::Error::duplicate_field("keyboard"));
-                            }
-
-                            keyboard =
-                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
-                        }
-                        Field::UnderglowLeft => {
-                            if underglow_left.is_some() {
-                                return Err(serde::de::Error::duplicate_field("underglow_left"));
-                            }
-
-                            underglow_left =
-                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
-                        }
-                        Field::UnderglowRight => {
-                            if underglow_right.is_some() {
-                                return Err(serde::de::Error::duplicate_field("underglow_right"));
-                            }
-
-                            underglow_right =
-                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
-                        }
-                        Field::LayerNumber | Field::Other => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                let keyboard = keyboard
-                    .ok_or_else(|| serde::de::Error::missing_field("keyboard"))?
-                    .try_into()
-                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
-                        // serde's `invalid_length` names the FOUND
-                        // count, not the required one (`TryFrom<Vec<T>>
-                        // for [T; N]` hands the vec back as its error).
-                        serde::de::Error::invalid_length(
-                            found.len(),
-                            &format!("a `keyboard` array of exactly {KEYBOARD_LEDS} indices")
-                                .as_str(),
-                        )
-                    })?;
-
-                let underglow_left = underglow_left
-                    .ok_or_else(|| serde::de::Error::missing_field("underglow_left"))?
-                    .try_into()
-                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
-                        serde::de::Error::invalid_length(
-                            found.len(),
-                            &format!(
-                                "an `underglow_left` array of exactly {UNDERGLOW_LEFT} indices"
-                            )
-                            .as_str(),
-                        )
-                    })?;
-
-                let underglow_right = underglow_right
-                    .ok_or_else(|| serde::de::Error::missing_field("underglow_right"))?
-                    .try_into()
-                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
-                        serde::de::Error::invalid_length(
-                            found.len(),
-                            &format!(
-                                "an `underglow_right` array of exactly {UNDERGLOW_RIGHT} indices"
-                            )
-                            .as_str(),
-                        )
-                    })?;
-
-                Ok(Self::Value {
-                    layer_number: 0,
-                    keyboard,
-                    underglow_left,
-                    underglow_right,
-                })
-            }
-        }
-
-        deserializer.deserialize_struct(
-            "RaiseColormapLayer",
-            &[
-                "layer_number",
-                "keyboard",
-                "underglow_left",
-                "underglow_right",
-            ],
-            LayerVisitor,
-        )
-    }
+colormap_layer_serde! {
+    RaiseColormapLayer,
+    keyboard => Keyboard [KEYBOARD_LEDS] "keyboard",
+    underglow_left => UnderglowLeft [UNDERGLOW_LEFT] "left-underglow",
+    underglow_right => UnderglowRight [UNDERGLOW_RIGHT] "right-underglow",
 }
 
 impl From<&parsing::colormap::ColormapLayer<{ LEDS_PER_LAYER }>> for RaiseColormapLayer {

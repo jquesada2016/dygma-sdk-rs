@@ -1,5 +1,6 @@
 //! module providing API abstractions for working with specific hardware keyboards.
 
+mod colormap_serde;
 pub mod conversions;
 pub mod defaults;
 pub mod defy;

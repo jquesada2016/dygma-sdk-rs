@@ -79,6 +79,7 @@
 //!   that reason.
 
 use crate::{
+    devices::colormap_serde::colormap_layer_serde,
     devices::defy::{ParseMacroMapError, ParseSuperkeyMapError},
     focus_api::parsing,
     keycode_tables::KeyKind,
@@ -631,9 +632,9 @@ impl SonseiColormap {
 /// Serialized as a JSON object of two fields; `layer_number` is a
 /// write-only UX aid like the keymap layers' (a file carrying one has
 /// it ignored on the way in), and the `keyboard` array is
-/// length-checked on the way in — exactly 56 indices. Hand-written
-/// serde like the Defy layer's (56 lands past the derive's array
-/// support), minus the keyboard/underglow split.
+/// length-checked on the way in — exactly 56 indices. The serde impls
+/// come from the shared `colormap_layer_serde!` macro (56 lands past
+/// the derive's array support).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SonseiColormapLayer {
     /// A human-readable label for knowing what layer you're editing in
@@ -647,127 +648,9 @@ pub struct SonseiColormapLayer {
     pub keyboard: [parsing::colormap::PaletteIndex; LEDS_PER_LAYER],
 }
 
-impl serde::Serialize for SonseiColormapLayer {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-
-        let mut state = serializer.serialize_struct("SonseiColormapLayer", 2)?;
-
-        state.serialize_field("layer_number", &self.layer_number)?;
-        state.serialize_field("keyboard", &&self.keyboard[..])?;
-
-        state.end()
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for SonseiColormapLayer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        enum Field {
-            Keyboard,
-            /// A present `layer_number` — accepted and discarded, the
-            /// way the derived skip-deserializing keymap layers treat
-            /// theirs (it is a write-only UX aid).
-            LayerNumber,
-            /// Any other field — ignored, the way derived structs
-            /// tolerate unknown fields (`deny_unknown_fields` is not
-            /// the derived default).
-            Other,
-        }
-
-        impl<'de> serde::Deserialize<'de> for Field {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct FieldVisitor;
-
-                impl serde::de::Visitor<'_> for FieldVisitor {
-                    type Value = Field;
-
-                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        f.write_str("`keyboard`")
-                    }
-
-                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Field, E> {
-                        match value {
-                            "keyboard" => Ok(Field::Keyboard),
-                            "layer_number" => Ok(Field::LayerNumber),
-                            _ => Ok(Field::Other),
-                        }
-                    }
-                }
-
-                deserializer.deserialize_identifier(FieldVisitor)
-            }
-        }
-
-        struct LayerVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for LayerVisitor {
-            type Value = SonseiColormapLayer;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(
-                    f,
-                    "a colormap layer of {LEDS_PER_LAYER} keyboard palette indices"
-                )
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut keyboard: Option<Vec<parsing::colormap::PaletteIndex>> = None;
-
-                while let Some(field) = map.next_key::<Field>()? {
-                    match field {
-                        Field::Keyboard => {
-                            if keyboard.is_some() {
-                                return Err(serde::de::Error::duplicate_field("keyboard"));
-                            }
-
-                            keyboard =
-                                Some(map.next_value::<Vec<parsing::colormap::PaletteIndex>>()?);
-                        }
-                        Field::LayerNumber | Field::Other => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-
-                let keyboard = keyboard
-                    .ok_or_else(|| serde::de::Error::missing_field("keyboard"))?
-                    .try_into()
-                    .map_err(|found: Vec<parsing::colormap::PaletteIndex>| {
-                        // serde's `invalid_length` names the FOUND
-                        // count, not the required one (`TryFrom<Vec<T>>
-                        // for [T; N]` hands the vec back as its error).
-                        serde::de::Error::invalid_length(
-                            found.len(),
-                            &format!("a `keyboard` array of exactly {LEDS_PER_LAYER} indices")
-                                .as_str(),
-                        )
-                    })?;
-
-                Ok(Self::Value {
-                    layer_number: 0,
-                    keyboard,
-                })
-            }
-        }
-
-        deserializer.deserialize_struct(
-            "SonseiColormapLayer",
-            &["layer_number", "keyboard"],
-            LayerVisitor,
-        )
-    }
+colormap_layer_serde! {
+    SonseiColormapLayer,
+    keyboard => Keyboard [LEDS_PER_LAYER] "keyboard",
 }
 
 impl From<&parsing::colormap::ColormapLayer<{ LEDS_PER_LAYER }>> for SonseiColormapLayer {
