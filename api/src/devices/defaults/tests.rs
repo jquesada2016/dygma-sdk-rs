@@ -10,8 +10,9 @@
 use super::*;
 use crate::{
     devices::defy::{DefyColormap, DefyKeyboard, DefyKeymapLayer, MacroAction},
+    devices::sonsei::{KEYS_PER_LAYER, SonseiColormap, SonseiKeymap, SonseiKeymapLayer},
     focus_api::parsing,
-    focus_api::parsing::palette::Palette,
+    focus_api::parsing::palette::{Palette, RgbPalette},
     keycode_tables::KeyKind,
 };
 
@@ -71,7 +72,14 @@ fn recording_is_pinned_to_the_audited_bazecor_commit() {
 
 #[test]
 fn default_config_answers_the_defy() {
-    let config = default_config(Product::Defy).expect("the Defy has a default config");
+    // Through the PUBLIC entry, not the per-product builder: this test
+    // is the enum-dispatch answer's proof (the private builders are
+    // exercised everywhere else).
+    let DefaultConfig::Defy(config) =
+        default_config(Product::Defy).expect("the Defy has a default config")
+    else {
+        panic!("the Defy answers a Defy default config");
+    };
 
     assert_eq!(config.keymap.layers.len(), 10);
     assert_eq!(config.superkeys.len(), 1);
@@ -81,8 +89,24 @@ fn default_config_answers_the_defy() {
 }
 
 #[test]
+fn default_config_answers_the_sonsei() {
+    // Through the PUBLIC entry (see the Defy test above).
+    let DefaultConfig::Sonsei(config) =
+        default_config(Product::Sonsei).expect("the Sonsei has a default config")
+    else {
+        panic!("the Sonsei answers a Sonsei default config");
+    };
+
+    assert_eq!(config.keymap.layers.len(), 10);
+    assert_eq!(config.superkeys.len(), 4);
+    assert_eq!(config.macros.len(), 2);
+    assert_eq!(config.palette.0.len(), 16);
+    assert_eq!(config.colormap.layers.len(), 10);
+}
+
+#[test]
 fn products_without_modeled_defaults_are_refused_by_name() {
-    for product in [Product::Sonsei, Product::Raise, Product::Raise2] {
+    for product in [Product::Raise, Product::Raise2] {
         assert_eq!(
             default_config(product).unwrap_err(),
             NoDefaultConfigError { product }
@@ -146,6 +170,31 @@ fn embedded_evidence_data_matches_the_recorded_expectations() {
         tokens(&wired.colormap_map),
         tokens(&recorded.defy.wireless.colormap_map)
     );
+
+    // The Sonsei constants are byte-verbatim the recorded Bazecor data
+    // too — all five, with no trailing-separator caveat: the recorded
+    // Sonsei palette string carries none (147 chars = 48 tokens + 47
+    // single separators).
+    assert_eq!(
+        SONSEI_DEFAULT_KEYMAP_DATA,
+        recorded.sonsei.wireless.keymap_custom
+    );
+    assert_eq!(
+        SONSEI_DEFAULT_SUPERKEYS_DATA,
+        recorded.sonsei.wireless.superkeys_map
+    );
+    assert_eq!(
+        SONSEI_DEFAULT_MACROS_DATA,
+        recorded.sonsei.wireless.macros_map
+    );
+    assert_eq!(
+        SONSEI_DEFAULT_PALETTE_DATA,
+        recorded.sonsei.wireless.palette
+    );
+    assert_eq!(
+        SONSEI_DEFAULT_COLORMAP_DATA,
+        recorded.sonsei.wireless.colormap_map
+    );
 }
 
 #[test]
@@ -196,9 +245,8 @@ fn recorded_defy_defaults_match_the_shipped_backup_fixture() {
 fn recorded_sonsei_defaults_match_the_shipped_backup_fixture() {
     // The Sonsei evidence claim, pinned the same way: the recorded
     // Sonsei virtual keyboard's config data equals the shipped Sonsei
-    // backup's captures. The SDK models no human-readable Sonsei
-    // config files, so this pin is what keeps the recorded Sonsei
-    // defaults honest while they wait for a consumer.
+    // backup's captures — Bazecor's two independent sources of the
+    // defaults agree, token for token, on every recorded command.
     let recorded = recorded();
     let shipped: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../tools/bazecor-differential/fixtures/Sonsei.json"
@@ -226,6 +274,14 @@ fn recorded_sonsei_defaults_match_the_shipped_backup_fixture() {
     assert_eq!(
         tokens(&recorded.sonsei.wireless.macros_map),
         tokens(shipped_data("macros.map"))
+    );
+    assert_eq!(
+        tokens(&recorded.sonsei.wireless.palette),
+        tokens(shipped_data("palette"))
+    );
+    assert_eq!(
+        tokens(&recorded.sonsei.wireless.colormap_map),
+        tokens(shipped_data("colormap.map"))
     );
 }
 
@@ -382,7 +438,7 @@ fn generated_config_files_round_trip_to_the_write_shapes() {
     // written files produce exactly the recorded default write
     // shapes.
     let recorded = recorded();
-    let config = default_config(Product::Defy).expect("the Defy has a default config");
+    let config = defy_default_config();
 
     let keymap_json =
         serde_json::to_vec_pretty(&config.keymap).expect("a default keymap serializes");
@@ -516,4 +572,305 @@ fn the_default_macro_decodes_to_the_types_hey_dygmate_sequence() {
     ];
 
     assert_eq!(config.macros[0].actions, expected);
+}
+
+#[test]
+fn sonsei_default_keymap_serializes_to_the_recorded_bazecor_data() {
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    // At the data level, exactly like the Defy's: the recorded
+    // default, read through the same typed round trip any real keymap
+    // takes (wire parse → `SonseiKeymap` → serialize), produces
+    // exactly the wire form our default config serializes to.
+    let recorded_keymap: SonseiKeymap = recorded
+        .sonsei
+        .wireless
+        .keymap_custom
+        .parse()
+        .expect("the recorded default keymap data parses");
+
+    assert_eq!(
+        tokens(&config.keymap.to_keymap_custom_data()),
+        tokens(&recorded_keymap.to_keymap_custom_data())
+    );
+}
+
+#[test]
+fn the_sonsei_typed_default_differs_from_the_recorded_string_only_at_padding() {
+    // The exact statement of the Sonsei's padding normalization (see
+    // the `SONSEI_DEFAULT_KEYMAP_DATA` docs): our serialized default
+    // differs from the recorded data string ONLY at the four
+    // wire-padding positions the Sonsei `LAYOUT` does not model
+    // (52–55), and only in `65535` → `0` (layer 1 records `0` there
+    // already). Every modeled key of every layer is byte-identical.
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    // The modeled positions, read off the type itself: a cleared
+    // layer's `to_keymap_data` answers `None` exactly there.
+    let modeled: std::collections::HashSet<usize> =
+        SonseiKeymapLayer::new_cleared_to(KeyKind::from(0))
+            .to_keymap_data()
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| key.is_some())
+            .map(|(position, _)| position)
+            .collect();
+
+    let our_data = config.keymap.to_keymap_custom_data();
+    let ours = tokens(&our_data);
+    let recorded_tokens = tokens(&recorded.sonsei.wireless.keymap_custom);
+
+    assert_eq!(ours.len(), recorded_tokens.len());
+
+    for layer in 0..10 {
+        for position in 0..KEYS_PER_LAYER {
+            let index = layer * KEYS_PER_LAYER + position;
+
+            if modeled.contains(&position) {
+                assert_eq!(
+                    ours[index], recorded_tokens[index],
+                    "layer {layer}, wire position {position} is a modeled \
+                     key and must match the recorded default"
+                );
+            } else {
+                assert_eq!(
+                    ours[index], "0",
+                    "layer {layer}, wire position {position} is a \
+                     padding slot and must normalize to 0"
+                );
+                assert!(
+                    recorded_tokens[index] == "0" || recorded_tokens[index] == "65535",
+                    "layer {layer}, wire position {position}: unexpected \
+                     recorded padding value"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sonsei_default_superkeys_serialize_to_the_recorded_bazecor_data() {
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    // The superkey wire format is product-independent, memory limit
+    // included (the 512-slot map both products carry — the Defy
+    // module's constant names it).
+    let data = parsing::superkeys::SuperkeyMap::from(&config.superkeys)
+        .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()
+        .expect("the default superkeys map fits the device memory");
+
+    // The recorded virtual data is the four live superkeys and their
+    // terminators; our write carries exactly that prefix, then the
+    // `65535` padding to the 512-slot memory.
+    let all = tokens(&data);
+    let live = tokens(&recorded.sonsei.wireless.superkeys_map);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "65535"));
+}
+
+#[test]
+fn sonsei_default_macros_serialize_to_the_recorded_bazecor_data() {
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    // The macro wire format is product-independent, memory limit
+    // included (the 2048-byte map both products carry — the Defy
+    // module's constant names it).
+    let data = parsing::macros::MacroMap::from(&config.macros)
+        .to_command_data(DefyKeyboard::MACRO_MEMORY_SIZE)
+        .expect("the default macro map fits the device memory");
+
+    // As with the superkeys: the recorded data is the live bytes; our
+    // write pads to the 2048-byte memory with the `255` eraser byte.
+    let all = tokens(&data);
+    let live = tokens(&recorded.sonsei.wireless.macros_map);
+
+    assert_eq!(all[..live.len()], live[..]);
+    assert!(all[live.len()..].iter().all(|token| *token == "255"));
+}
+
+#[test]
+fn sonsei_default_palette_and_colormap_serialize_to_the_recorded_bazecor_data() {
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    // The RGB palette write carries all 16 colors (48 decimals) — no
+    // padding or eraser tail, so the write IS the recorded default,
+    // token for token.
+    let palette_data = config.palette.to_string();
+
+    assert_eq!(
+        tokens(&palette_data),
+        tokens(&recorded.sonsei.wireless.palette)
+    );
+    assert_eq!(tokens(&palette_data).len(), 48);
+
+    // Same for the colormap: ten 56-LED layers, no tail.
+    let colormap_data = config.colormap.to_colormap_map_data();
+
+    assert_eq!(
+        tokens(&colormap_data),
+        tokens(&recorded.sonsei.wireless.colormap_map)
+    );
+    assert_eq!(tokens(&colormap_data).len(), 560);
+}
+
+#[test]
+fn the_sonsei_default_superkeys_decode_to_their_documented_pattern() {
+    let config = sonsei_default_config();
+
+    let superkeys: Vec<_> = config.superkeys.iter().collect();
+
+    assert_eq!(superkeys.len(), 4);
+
+    // The factory pattern, pinned at the wire level: every superkey
+    // pairs one tap action with one hold action (`1` — "no action" —
+    // on tap-hold, double-tap, and double-tap-hold).
+    for superkey in &superkeys {
+        assert!(superkey.tap.is_some());
+        assert!(superkey.hold.is_some());
+        assert_eq!(superkey.tap_hold, None);
+        assert_eq!(superkey.double_tap, None);
+        assert_eq!(superkey.double_tap_hold, None);
+    }
+
+    // The exact actions, in map order, matching the shipped backup's
+    // own store entries one for one — the names ARE the evidence:
+    // `⌫/L3` (tap 42, hold 17452), `↵/L2` (40, 17451), ` 💡/Alt`
+    // (17154, 230), `⏯️/L3` (57, 17452) — the values the recorded
+    // superkeys.map carries. (The store's fourth entry carries `0`s
+    // where the map carries `1`s — no action either way. The names are
+    // the store's own, not keycode-table decodes: the tables name 57
+    // "Caps Lock".)
+    let taps: Vec<_> = superkeys.iter().map(|sk| sk.tap.unwrap()).collect();
+    let holds: Vec<_> = superkeys.iter().map(|sk| sk.hold.unwrap()).collect();
+
+    assert_eq!(
+        taps,
+        vec![
+            KeyKind::from(42),
+            KeyKind::from(40),
+            KeyKind::from(17154),
+            KeyKind::from(57),
+        ]
+    );
+    assert_eq!(
+        holds,
+        vec![
+            KeyKind::from(17452),
+            KeyKind::from(17451),
+            KeyKind::from(230),
+            KeyKind::from(17452),
+        ]
+    );
+}
+
+#[test]
+fn the_sonsei_default_macros_decode_to_hello_and_hola() {
+    let config = sonsei_default_config();
+
+    assert_eq!(config.macros.len(), 2);
+
+    let right_shift = KeyKind::from(225);
+
+    // "Hello": RightShift held while tapping H, released; E L L O
+    // tapped.
+    let expected_hello = [
+        MacroAction::KeyCodeDown(right_shift),
+        MacroAction::TapCode(KeyKind::from(11)),
+        MacroAction::KeyCodeUp(right_shift),
+        MacroAction::TapCode(KeyKind::from(8)),
+        MacroAction::TapCode(KeyKind::from(15)),
+        MacroAction::TapCode(KeyKind::from(15)),
+        MacroAction::TapCode(KeyKind::from(18)),
+    ];
+
+    // "Hola": RightShift held while tapping H, released; O L A
+    // tapped.
+    let expected_hola = [
+        MacroAction::KeyCodeDown(right_shift),
+        MacroAction::TapCode(KeyKind::from(11)),
+        MacroAction::KeyCodeUp(right_shift),
+        MacroAction::TapCode(KeyKind::from(18)),
+        MacroAction::TapCode(KeyKind::from(15)),
+        MacroAction::TapCode(KeyKind::from(4)),
+    ];
+
+    assert_eq!(config.macros[0].actions, expected_hello);
+    assert_eq!(config.macros[1].actions, expected_hola);
+}
+
+#[test]
+fn generated_sonsei_config_files_round_trip_to_the_write_shapes() {
+    // What `config init --product sonsei` writes is `serde_json`'s
+    // pretty form of each typed value; what the (Defy-bound, unit-4)
+    // apply paths will accept is the same value read back from that
+    // JSON. This is the Sonsei sibling of the Defy round-trip proof.
+    let recorded = recorded();
+    let config = sonsei_default_config();
+
+    let keymap_json =
+        serde_json::to_vec_pretty(&config.keymap).expect("a default keymap serializes");
+    let keymap: SonseiKeymap =
+        serde_json::from_slice(&keymap_json).expect("the written keymap JSON reads back");
+
+    let recorded_keymap: SonseiKeymap = recorded
+        .sonsei
+        .wireless
+        .keymap_custom
+        .parse()
+        .expect("the recorded default keymap data parses");
+
+    assert_eq!(
+        tokens(&keymap.to_keymap_custom_data()),
+        tokens(&recorded_keymap.to_keymap_custom_data())
+    );
+
+    let superkeys_json =
+        serde_json::to_vec_pretty(&config.superkeys).expect("a default superkeys map serializes");
+    let superkeys: SuperkeyMap =
+        serde_json::from_slice(&superkeys_json).expect("the written superkeys JSON reads back");
+
+    let data = parsing::superkeys::SuperkeyMap::from(&superkeys)
+        .to_command_data::<{ DefyKeyboard::SUPERKEY_MEMORY_SIZE }>()
+        .expect("the default superkeys map fits the device memory");
+    let live = tokens(&recorded.sonsei.wireless.superkeys_map);
+
+    assert_eq!(tokens(&data)[..live.len()], live[..]);
+
+    let macros_json =
+        serde_json::to_vec_pretty(&config.macros).expect("a default macro map serializes");
+    let macros: MacroMap =
+        serde_json::from_slice(&macros_json).expect("the written macros JSON reads back");
+
+    let data = parsing::macros::MacroMap::from(&macros)
+        .to_command_data(DefyKeyboard::MACRO_MEMORY_SIZE)
+        .expect("the default macro map fits the device memory");
+    let live = tokens(&recorded.sonsei.wireless.macros_map);
+
+    assert_eq!(tokens(&data)[..live.len()], live[..]);
+
+    let palette_json =
+        serde_json::to_vec_pretty(&config.palette).expect("a default palette serializes");
+    let palette: RgbPalette =
+        serde_json::from_slice(&palette_json).expect("the written palette JSON reads back");
+
+    assert_eq!(
+        tokens(&palette.to_string()),
+        tokens(&recorded.sonsei.wireless.palette)
+    );
+
+    let colormap_json =
+        serde_json::to_vec_pretty(&config.colormap).expect("a default colormap serializes");
+    let colormap: SonseiColormap =
+        serde_json::from_slice(&colormap_json).expect("the written colormap JSON reads back");
+
+    assert_eq!(
+        tokens(&colormap.to_colormap_map_data()),
+        tokens(&recorded.sonsei.wireless.colormap_map)
+    );
 }

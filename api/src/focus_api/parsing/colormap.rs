@@ -20,6 +20,12 @@
 //! ten of its layers; a write updates layers until the data runs out),
 //! and the exactly-ten write shape a Defy carries is enforced by the
 //! map type at the devices layer (`DefyColormap`).
+//!
+//! How wide one layer is differs by product — the Defy paints 178 LEDs
+//! per layer, the Sonsei 56 (keyboard only, no underglow; its shipped
+//! backup's `colormap.map` entries are 560 decimals, all 0–15, the
+//! same one-decimal-per-LED wire form) — so the width is the map
+//! types' parameter, 178 by default (the Defy's).
 
 use std::str::FromStr;
 
@@ -165,20 +171,27 @@ impl<'de> serde::Deserialize<'de> for PaletteIndex {
     }
 }
 
-/// One raw colormap layer: [`LEDS_PER_LAYER`] palette indices, in wire
-/// order (keyboard LEDs first, then underglow).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColormapLayer(pub [PaletteIndex; LEDS_PER_LAYER]);
-
-/// A raw colormap with uninterpreted palette indices, layer-major.
+/// One raw colormap layer: `LEDS` palette indices, in wire order (on
+/// the Defy, keyboard LEDs first, then underglow).
 ///
-/// Holds any whole number of complete layers, exactly like the wire
-/// format does; a partial (ragged) layer is not a colormap and fails
-/// the parse at that layer's start.
-#[derive(Clone, Debug, PartialEq, Eq, Deref)]
-pub struct Colormap(pub Vec<ColormapLayer>);
+/// The parameter is the product's layer width — the Defy's 178 (the
+/// default, so bare `ColormapLayer` is the Defy's layer) and the
+/// Sonsei's 56.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColormapLayer<const LEDS: usize = LEDS_PER_LAYER>(pub [PaletteIndex; LEDS]);
 
-impl FromStr for Colormap {
+/// A raw colormap with uninterpreted palette indices, layer-major, of
+/// `LEDS`-position layers.
+///
+/// The parameter is the product's layer width — the Defy's 178 (the
+/// default, so bare `Colormap` is the Defy's map) and the Sonsei's 56.
+/// Like the wire format itself, the type accepts any whole number of
+/// complete layers; a partial (ragged) layer is not a colormap and
+/// fails the parse at that layer's start.
+#[derive(Clone, Debug, PartialEq, Eq, Deref)]
+pub struct Colormap<const LEDS: usize = LEDS_PER_LAYER>(pub Vec<ColormapLayer<LEDS>>);
+
+impl<const LEDS: usize> FromStr for Colormap<LEDS> {
     type Err = ParseColormapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -197,7 +210,7 @@ impl FromStr for Colormap {
     }
 }
 
-impl std::fmt::Display for Colormap {
+impl<const LEDS: usize> std::fmt::Display for Colormap<LEDS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Written token by token rather than first-then-rest: a
         // layer-less colormap (`Colormap`'s field is public) renders as
@@ -221,13 +234,13 @@ impl std::fmt::Display for Colormap {
     }
 }
 
-fn layers_parser(input: &mut &str) -> ModalResult<Vec<ColormapLayer>> {
+fn layers_parser<const LEDS: usize>(input: &mut &str) -> ModalResult<Vec<ColormapLayer<LEDS>>> {
     repeat(1.., layer_parser).parse_next(input)
 }
 
-fn layer_parser(input: &mut &str) -> ModalResult<ColormapLayer> {
-    let layer = repeat::<_, _, Vec<_>, _, _>(LEDS_PER_LAYER, terminated(index_parser, opt(" ")))
-        .parse_next(input)?;
+fn layer_parser<const LEDS: usize>(input: &mut &str) -> ModalResult<ColormapLayer<LEDS>> {
+    let layer =
+        repeat::<_, _, Vec<_>, _, _>(LEDS, terminated(index_parser, opt(" "))).parse_next(input)?;
     let layer = layer.try_into().unwrap();
 
     Ok(ColormapLayer(layer))
@@ -488,28 +501,23 @@ mod tests {
 
         for (fixture, expected) in &recorded.devices {
             // The wire module is the DEFI's: 178 LEDs per layer. The
-            // Sonsei's map (56 per layer) is a different product's
-            // format this SDK does not parse — for it, the recording
-            // still proves the shape facts: exactly layers × size
-            // tokens, every one a storable palette index.
+            // Sonsei's map (56 per layer) runs the same proof at its
+            // own `LEDS` width: parse, chunk, and re-serialize
+            // byte-identically to the recorded wire.
             if expected.colormap_layer_size != LEDS_PER_LAYER {
-                let tokens = expected.colormap_wire.split_whitespace().count();
+                let colormap: Colormap<56> = expected
+                    .colormap_wire
+                    .parse()
+                    .unwrap_or_else(|err| panic!("{fixture} colormap does not parse: {err}"));
 
-                assert_eq!(
-                    tokens,
-                    expected.colormap_layers * expected.colormap_layer_size,
-                    "{fixture}"
-                );
+                assert_eq!(colormap.len(), expected.colormap_layers, "{fixture}");
                 assert!(
-                    expected
-                        .colormap_wire
-                        .split_whitespace()
-                        .all(|token| matches!(
-                            token.parse::<u8>(),
-                            Ok(value) if value <= PaletteIndex::MAX
-                        )),
+                    colormap
+                        .iter()
+                        .all(|layer| layer.0.len() == expected.colormap_layer_size),
                     "{fixture}"
                 );
+                assert_eq!(colormap.to_string(), expected.colormap_wire, "{fixture}");
 
                 continue;
             }

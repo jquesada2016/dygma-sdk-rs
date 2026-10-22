@@ -1,4 +1,15 @@
 //! Types for parsing keymaps.
+//!
+//! The keymap wire format is one flat stream of key codes, layer-major:
+//! layers of [`Keymap`]'s width, one decimal per position. How wide a
+//! layer is differs by product — the Defy keys off a 5×16 wire matrix
+//! (80 positions), the Sonsei off a 5×12 one (60) — so the width is
+//! [`Keymap`]'s type parameter, and how many layers a stream holds is
+//! the *domain's* business, not this format's: the parser accepts any
+//! whole number of complete layers (the device answers with all ten of
+//! its layers; a write updates layers until the data runs out), and
+//! the exactly-ten write shape is enforced by the map types at the
+//! devices layer (`DefyKeymap`, `SonseiKeymap`).
 
 pub mod keycode_tables;
 
@@ -32,11 +43,18 @@ pub struct ParseKeymapError {
     pub expected: String,
 }
 
-/// A complete raw keymap with individual layers and uninterpreted keycodes.
+/// A complete raw keymap with individual layers and uninterpreted
+/// keycodes, `KEYS_PER_LAYER` wire positions per layer.
+///
+/// The parameter is the product's layer width — the Defy's 80 (the
+/// default, so bare `Keymap` is the Defy's map) and the Sonsei's 60.
+/// Like the wire format itself, the type accepts any whole number of
+/// complete layers; see the [module docs](self) for where the
+/// exactly-ten write shape is enforced.
 #[derive(Clone, Debug, Deref)]
-pub struct Keymap(pub Vec<[KeyKind; 80]>);
+pub struct Keymap<const KEYS_PER_LAYER: usize = 80>(pub Vec<[KeyKind; KEYS_PER_LAYER]>);
 
-impl FromStr for Keymap {
+impl<const KEYS_PER_LAYER: usize> FromStr for Keymap<KEYS_PER_LAYER> {
     type Err = ParseKeymapError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -50,7 +68,7 @@ impl FromStr for Keymap {
     }
 }
 
-impl std::fmt::Display for Keymap {
+impl<const KEYS_PER_LAYER: usize> std::fmt::Display for Keymap<KEYS_PER_LAYER> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut iter = self.0.iter().flatten();
 
@@ -64,12 +82,16 @@ impl std::fmt::Display for Keymap {
     }
 }
 
-fn layers_parser(input: &mut &str) -> ModalResult<Vec<[KeyKind; 80]>> {
+fn layers_parser<const KEYS_PER_LAYER: usize>(
+    input: &mut &str,
+) -> ModalResult<Vec<[KeyKind; KEYS_PER_LAYER]>> {
     repeat(1.., layer_parser).parse_next(input)
 }
 
-fn layer_parser(input: &mut &str) -> ModalResult<[KeyKind; 80]> {
-    let layer = repeat::<_, _, Vec<_>, _, _>(80, terminated(key_kind_parser, opt(" ")))
+fn layer_parser<const KEYS_PER_LAYER: usize>(
+    input: &mut &str,
+) -> ModalResult<[KeyKind; KEYS_PER_LAYER]> {
+    let layer = repeat::<_, _, Vec<_>, _, _>(KEYS_PER_LAYER, terminated(key_kind_parser, opt(" ")))
         .parse_next(input)?;
     let layer = layer.try_into().unwrap();
 

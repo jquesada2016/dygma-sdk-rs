@@ -9,6 +9,7 @@ use dygma_cli::devices::defaults;
 use dygma_cli::devices::defy::{
     CreateBackupError, DefyColormap, DefyKeyboard, DefyKeymap, MacroMap, SuperkeyMap,
 };
+use dygma_cli::devices::restore;
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::parsing::palette::Palette;
 use dygma_cli::focus_api::{FocusApiConnection, parsing};
@@ -745,10 +746,15 @@ enum ConfigCommands {
     /// `macros apply`, `leds palette apply`, `leds colormap apply`).
     ///
     /// The defaults are evidence-backed, not invented: they match
-    /// Bazecor's shipped Defy defaults, whose two independent sources —
+    /// Bazecor's shipped defaults, whose two independent sources —
     /// the app's virtual keyboards and its shipped default backups —
     /// agree, and are differentially validated against a recording of
-    /// them (tools/bazecor-differential). Refuses to overwrite existing
+    /// them (tools/bazecor-differential). The Defy and the Sonsei are
+    /// modeled — the Sonsei's files carry the Sonsei's shapes (60
+    /// positions, 56 LEDs, RGB palette; the product has no device
+    /// transport in this CLI yet, so its files are for editing and
+    /// for backup conversion) — and the Raise generations, with no
+    /// modeled defaults, are refused. Refuses to overwrite existing
     /// files unless `--force` is passed.
     Init {
         /// The product to write the default config of.
@@ -776,6 +782,70 @@ struct ConfigFile {
     description: &'static str,
 }
 
+/// The five files a Defy `config init` writes, with the Defy's own
+/// shape descriptions.
+fn defy_config_files(out_dir: &Path) -> [ConfigFile; 5] {
+    [
+        ConfigFile {
+            path: out_dir.join("keymap.json"),
+            description: "the factory keymap: 10 layers (Base / Navigation / FKeys, then \
+                          blank), 70 keys each",
+        },
+        ConfigFile {
+            path: out_dir.join("superkeys.json"),
+            description: "the factory superkey: superkey 1, the clipboard keys (tap \
+                          Ctrl+C, hold Ctrl+V, tap-hold Ctrl+Shift+V, double-tap Ctrl+X)",
+        },
+        ConfigFile {
+            path: out_dir.join("macros.json"),
+            description: "the factory macro: macro 1, typing \"Hey, dygmate\"",
+        },
+        ConfigFile {
+            path: out_dir.join("palette.json"),
+            description: "the factory palette: 16 RGBW colors (amber accents, silver keys, \
+                          pure white)",
+        },
+        ConfigFile {
+            path: out_dir.join("colormap.json"),
+            description: "the factory colormap: 10 layers of palette indices, 178 LEDs each \
+                          (70 keyboard + 108 underglow)",
+        },
+    ]
+}
+
+/// The five files a Sonsei `config init` writes, with the Sonsei's
+/// own shape descriptions (the Sonsei's own factory shapes — 56 keys
+/// and LEDs per layer, RGB-only palette, four default superkeys and
+/// two default macros).
+fn sonsei_config_files(out_dir: &Path) -> [ConfigFile; 5] {
+    [
+        ConfigFile {
+            path: out_dir.join("keymap.json"),
+            description: "the factory keymap: 10 layers, 56 keys each",
+        },
+        ConfigFile {
+            path: out_dir.join("superkeys.json"),
+            description: "the factory superkeys: 4 superkeys, each pairing one tap \
+                          action with one hold action",
+        },
+        ConfigFile {
+            path: out_dir.join("macros.json"),
+            description: "the factory macros: macro 1 typing \"Hello\", macro 2 typing \
+                          \"Hola\"",
+        },
+        ConfigFile {
+            path: out_dir.join("palette.json"),
+            description: "the factory palette: 16 RGB colors (white keys framing, warm \
+                          and cold accents)",
+        },
+        ConfigFile {
+            path: out_dir.join("colormap.json"),
+            description: "the factory colormap: 10 layers of palette indices, 56 LEDs each \
+                          (keyboard only, no underglow)",
+        },
+    ]
+}
+
 impl ConfigCommands {
     async fn perform(self) -> Result<(), error_stack::Report<Error>> {
         let Self::Init {
@@ -798,32 +868,15 @@ impl ConfigCommands {
 
         let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("."));
 
-        let files = [
-            ConfigFile {
-                path: out_dir.join("keymap.json"),
-                description: "the factory keymap: 10 layers (Base / Navigation / FKeys, then \
-                              blank), 70 keys each",
-            },
-            ConfigFile {
-                path: out_dir.join("superkeys.json"),
-                description: "the factory superkey: superkey 1, the clipboard keys (tap \
-                              Ctrl+C, hold Ctrl+V, tap-hold Ctrl+Shift+V, double-tap Ctrl+X)",
-            },
-            ConfigFile {
-                path: out_dir.join("macros.json"),
-                description: "the factory macro: macro 1, typing \"Hey, dygmate\"",
-            },
-            ConfigFile {
-                path: out_dir.join("palette.json"),
-                description: "the factory palette: 16 RGBW colors (amber accents, silver keys, \
-                              pure white)",
-            },
-            ConfigFile {
-                path: out_dir.join("colormap.json"),
-                description: "the factory colormap: 10 layers of palette indices, 178 LEDs each \
-                              (70 keyboard + 108 underglow)",
-            },
-        ];
+        // The product dispatches the file set: each product's five
+        // files hold its own shapes, so the descriptions carry that
+        // product's shapes (the typed values dispatch with the write,
+        // below — the shapes of the files and of the values cannot
+        // disagree).
+        let files: [ConfigFile; 5] = match &config {
+            defaults::DefaultConfig::Defy(_) => defy_config_files(&out_dir),
+            defaults::DefaultConfig::Sonsei(_) => sonsei_config_files(&out_dir),
+        };
 
         // A real run refuses to clobber; the dry run reports the same
         // refusal a real run would produce, so it previews reality.
@@ -884,27 +937,38 @@ impl ConfigCommands {
         // Serialize-then-write, the #22 atomic helper: each file lands
         // whole or not at all. A failure part-way leaves the earlier
         // files written (each is independently valid); the error names
-        // the file that failed.
-        safe_pretty_json_file(&config.keymap, &files[0].path)
-            .await
-            .change_context(Error)
-            .attach_with(|| format!("writing {}", files[0].path.display()))?;
-        safe_pretty_json_file(&config.superkeys, &files[1].path)
-            .await
-            .change_context(Error)
-            .attach_with(|| format!("writing {}", files[1].path.display()))?;
-        safe_pretty_json_file(&config.macros, &files[2].path)
-            .await
-            .change_context(Error)
-            .attach_with(|| format!("writing {}", files[2].path.display()))?;
-        safe_pretty_json_file(&config.palette, &files[3].path)
-            .await
-            .change_context(Error)
-            .attach_with(|| format!("writing {}", files[3].path.display()))?;
-        safe_pretty_json_file(&config.colormap, &files[4].path)
-            .await
-            .change_context(Error)
-            .attach_with(|| format!("writing {}", files[4].path.display()))?;
+        // the file that failed. The typed values dispatch with the
+        // files: each product branch hands the writer its own five
+        // maps, so a file's shape and its contents come from the same
+        // branch.
+        match &config {
+            defaults::DefaultConfig::Defy(config) => {
+                write_five_config_files(
+                    &files,
+                    (
+                        &config.keymap,
+                        &config.superkeys,
+                        &config.macros,
+                        &config.palette,
+                        &config.colormap,
+                    ),
+                )
+                .await?;
+            }
+            defaults::DefaultConfig::Sonsei(config) => {
+                write_five_config_files(
+                    &files,
+                    (
+                        &config.keymap,
+                        &config.superkeys,
+                        &config.macros,
+                        &config.palette,
+                        &config.colormap,
+                    ),
+                )
+                .await?;
+            }
+        }
 
         println!(
             "Wrote the {product:?} default config (matching Bazecor's \
@@ -920,6 +984,52 @@ impl ConfigCommands {
 
         Ok(())
     }
+}
+
+/// Writes a product's five config files, one typed map per file, in
+/// the files' order — the shared body of a `config init` write. The
+/// maps are handed as a tuple so the one call site per product branch
+/// stays shape-checked: adding a product to [`DefaultConfig`] forces
+/// a new branch here, and the compiler holds the count of files and
+/// maps together.
+///
+/// Serialize-then-write, the #22 atomic helper, per file: each file
+/// lands whole or not at all. A failure part-way leaves the earlier
+/// files written (each is independently valid); the error names the
+/// file that failed.
+async fn write_five_config_files<K, S, M, P, C>(
+    files: &[ConfigFile; 5],
+    (keymap, superkeys, macros, palette, colormap): (&K, &S, &M, &P, &C),
+) -> Result<(), error_stack::Report<Error>>
+where
+    K: serde::Serialize,
+    S: serde::Serialize,
+    M: serde::Serialize,
+    P: serde::Serialize,
+    C: serde::Serialize,
+{
+    safe_pretty_json_file(keymap, &files[0].path)
+        .await
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", files[0].path.display()))?;
+    safe_pretty_json_file(superkeys, &files[1].path)
+        .await
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", files[1].path.display()))?;
+    safe_pretty_json_file(macros, &files[2].path)
+        .await
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", files[2].path.display()))?;
+    safe_pretty_json_file(palette, &files[3].path)
+        .await
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", files[3].path.display()))?;
+    safe_pretty_json_file(colormap, &files[4].path)
+        .await
+        .change_context(Error)
+        .attach_with(|| format!("writing {}", files[4].path.display()))?;
+
+    Ok(())
 }
 
 /// Prints the recorded-but-unwritten defaults disclosure, shared by
@@ -1963,8 +2073,10 @@ enum BackupCommands {
     /// Summarize a backup JSON file.
     ///
     /// This never opens a connection to the device: it only parses the
-    /// file and prints what it holds. Works with files written by
-    /// `backup create` and with Bazecor's own backup files.
+    /// file and prints what it holds — including the product the
+    /// backup's descriptor names, the field the product-aware commands
+    /// dispatch on. Works with files written by `backup create` and
+    /// with Bazecor's own backup files (any product).
     Show {
         /// The path of the backup JSON file.
         path: PathBuf,
@@ -1980,6 +2092,17 @@ enum BackupCommands {
     /// restore order (superkeys before the keymap) and `led.mode 0` is
     /// sent last. Note the known Bluetooth limitation: large payloads
     /// fail over BLE, so restore wired or over RF.
+    ///
+    /// Validation is product-dispatched: the backup's own descriptor
+    /// picks the validator, so a Defy backup validates through the
+    /// Defy's wire shapes and a Sonsei backup through the Sonsei's —
+    /// the cross-product guard stands in both directions, and
+    /// `backup convert` is the explicit pre-step between products.
+    /// The SEND path is Defy-bound: a Sonsei backup's validation is
+    /// plan-only (`--dry-run` prints the Sonsei-validated plan; a real
+    /// restore of one is refused before any connection is opened,
+    /// because this SDK has no Sonsei transport yet — convert it to a
+    /// Defy backup first).
     ///
     /// A PARTIAL capture — a file `backup create` saved from an
     /// interrupted run, marked `partial` — is refused: it does not
@@ -2364,6 +2487,23 @@ impl BackupCommands {
                 println!("neuron id: {}", backup.neuron_id);
                 println!("neuron name: {}", backup.neuron.name);
 
+                // The product the backup names — the field every
+                // product-aware command dispatches on (`backup
+                // restore`'s validation, `backup convert`'s target
+                // checks). The failure classes say different true
+                // things: a READABLE descriptor naming a product this
+                // SDK does not know prints that name (the same fact
+                // `backup restore`'s validation reports for the file);
+                // a descriptor that cannot be read at all says so
+                // rather than implying a product.
+                match conversions::Product::from_descriptor(backup.neuron.device.as_ref()) {
+                    Ok(product) => println!("product: {product}"),
+                    Err(conversions::ConversionError::UnknownProduct { product }) => {
+                        println!("product: {product} (not a product this SDK knows)")
+                    }
+                    Err(_) => println!("product: unknown (no readable device descriptor)"),
+                }
+
                 for (name, version) in [
                     ("bazecor", &backup.versions.bazecor),
                     ("kaleidoscope", &backup.versions.kaleidoscope),
@@ -2391,25 +2531,55 @@ impl BackupCommands {
                 store,
             } => {
                 // Everything offline first: parse the file, validate the
-                // whole backup, load the names store — nothing touches
-                // the device until all three succeeded.
+                // whole backup (through whatever product the backup
+                // names), load the names store — nothing touches the
+                // device until all three succeeded.
                 let backup = read_json_file::<DefyBackup>(&path).await?;
 
                 // A partial capture is refused by default; `--allow-partial`
                 // is the explicit acknowledgment that the file holds only
-                // part of a captured state.
+                // part of a captured state. The plan is product-dispatched:
+                // a Defy backup validates through the Defy's types, a
+                // Sonsei backup through the Sonsei's — the cross-product
+                // guard stands in both directions, and conversion is the
+                // explicit pre-step.
                 let plan = if allow_partial {
-                    DefyKeyboard::backup_restore_plan_allowing_partial(&backup)
+                    restore::backup_restore_plan_allowing_partial(&backup)
                 } else {
-                    DefyKeyboard::backup_restore_plan(&backup)
+                    restore::backup_restore_plan(&backup)
                 };
 
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(err) => {
-                        return Err(diagnostics::backup_validation_report(&path, err));
+                        return Err(diagnostics::restore_plan_report(&path, err));
                     }
                 };
+
+                // The product the plan just validated against (None: no
+                // readable descriptor — the Defy path, as the dispatch
+                // documents).
+                let product =
+                    conversions::Product::from_descriptor(backup.neuron.device.as_ref()).ok();
+
+                // The send path is Defy-bound: a Sonsei backup's plan is
+                // validation only (this SDK has no Sonsei transport —
+                // issue #24's unit 4), so a real restore refuses BEFORE
+                // any connection is opened, pointing at the conversion
+                // that produces a restorable file. (A Raise-generation
+                // backup never reaches here: the plan dispatch already
+                // refused it offline.)
+                if product == Some(conversions::Product::Sonsei) {
+                    return Err(Error
+                        .into_report()
+                        .attach(format!("restoring the backup in {}", path.display()))
+                        .attach(
+                            "the backup is for a Sonsei, and this SDK has no Sonsei \
+                             transport: a real restore to a Sonsei is not possible \
+                             here. `backup restore --dry-run` validates the file, and \
+                             `backup convert --to defy` converts it for a Defy restore",
+                        ));
+                }
 
                 let store_path = names_store_path(store.as_deref())?;
                 let mut names_store = load_names_store(&store_path).await?;
@@ -2438,6 +2608,19 @@ impl BackupCommands {
                         "On a real restore the backup's names are applied to the \
                         names store under the connected device's chip id."
                     );
+
+                    // Validation-only honesty for the product the send
+                    // path cannot serve: said on the Sonsei's dry run,
+                    // not left to be discovered by a refused real run.
+                    if product == Some(conversions::Product::Sonsei) {
+                        println!(
+                            "This backup is for a Sonsei: the plan above is \
+                            validation only — this SDK has no Sonsei transport \
+                            yet, so a real restore of it is refused \
+                            (`backup convert --to defy` produces a restorable \
+                            file)."
+                        );
+                    }
 
                     return Ok(());
                 }

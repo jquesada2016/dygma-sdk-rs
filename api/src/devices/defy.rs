@@ -361,28 +361,20 @@ mod error {
     }
 
     /// The Display message of [`BackupValidationError::PartialCapture`]:
-    /// names the missing commands, or — for a marker with an empty
-    /// missing list — says why the list is empty, never "0 command(s)
-    /// missing: " with a dangling separator. Such markers no longer
-    /// arise from this crate's captures (the identity probes cannot
-    /// interrupt one), but files saved by earlier versions of this
-    /// crate — captures interrupted at the probes — carry them, and
-    /// the refusal must word them. The single source of the refusal's
-    /// wording: the CLI's validation snippet renders this `Display`
-    /// directly.
+    /// the shared partial-capture refusal wording — the missing
+    /// commands, or, for a marker with an empty missing list, why the
+    /// list is empty. The single source of the wording lives beside the
+    /// marker type ([`PartialCapture::refusal_display`][refusal]),
+    /// shared with the Sonsei's restore validation; this wrapper keeps
+    /// the variant's `#[display]` pointing at a `&[String]`.
+    ///
+    /// [refusal]:
+    ///     crate::focus_api::parsing::backup::PartialCapture::refusal_display
     fn partial_capture_display(missing: &[String]) -> String {
-        if missing.is_empty() {
-            "the backup is a partial capture: the capture was interrupted \
-             after every command, before the backup could be assembled \
-             completely"
-                .to_owned()
-        } else {
-            format!(
-                "the backup is a partial capture: {} command(s) missing: {}",
-                missing.len(),
-                missing.join(", ")
-            )
+        parsing::backup::PartialCapture {
+            missing: missing.to_vec(),
         }
+        .refusal_display()
     }
 
     /// Error returned when a backup fails restore validation.
@@ -393,9 +385,9 @@ mod error {
     #[derive(Clone, Debug, Display, Error)]
     pub enum BackupValidationError {
         /// The backup's device descriptor names a product other than
-        /// the Defy. This crate speaks the Defy's wire formats only —
-        /// restoring another product's backup (a Raise's, say) would
-        /// write foreign data to the device.
+        /// the Defy. The Defy is the only product this crate restores
+        /// onto — restoring another product's backup (a Raise's, say)
+        /// would write foreign data to the device.
         #[display("the backup is for a `{product}`, not a Defy")]
         NotADefyBackup {
             /// The product the backup's device descriptor names.
@@ -2541,10 +2533,10 @@ impl std::hash::Hash for DefyKeymapLayer {
 impl DefyKeymapLayer {
     /// Get's the corresponding key given the key offset.
     ///
-    /// The key offset is an unsigned integer between 0 and 80 exclusive. Please refer
+    /// The key offset is an unsigned integer in the range `0..80`. Please refer
     /// to the [`LAYOUT`] constant for getting the key offset of a specific key.
     ///
-    /// Note that keys are between 0 and 80, but the keyboard only has 70 keys, therefore,
+    /// Note that keys are in `0..80`, but the keyboard only has 70 keys, therefore,
     /// some indices will return `None`, even though a keymap will contain a key code.
     /// In these cases, you can use either `u16::MIN` or `u16::MAX`, as it
     /// is only a padded placeholder.

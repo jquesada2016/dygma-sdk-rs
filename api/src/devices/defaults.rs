@@ -55,13 +55,17 @@
 //!   keyboards' `keymap.custom` (what a new device actually exposes
 //!   as its current config) is the consistent, backup-corroborated
 //!   default, and that is what this module ships.
-//! - The **settings** values the virtual keyboards carry (qukeys
-//!   250/80, superkeys timings 500/250/20/200/20, LED brightness 153,
-//!   mouse 20/2/20/2/2/100/127, idle timeouts 300/300) have a thinner
-//!   evidence class: backups capture no settings, so only the
-//!   simulation holds them. They are recorded in the expectations
-//!   file and not modeled here — this SDK has no settings file
-//!   format; settings live on the device (`settings get`/`set`).
+//! - The **settings** values the virtual keyboards carry have a
+//!   thinner evidence class: backups capture no settings, so only the
+//!   simulation holds them. The numbers differ per product — the Defy
+//!   virtuals carry qukeys 250/80, superkeys timings
+//!   500/250/20/200/20, LED brightness 153, mouse 20/2/20/2/2/100/127,
+//!   idle timeouts 300/300, while the Sonsei virtual's set (qukeys
+//!   200/100, superkeys 500/144/20/236/80, LED brightness 102/76,
+//!   idle timeouts 600/300, and more) is recorded alongside in the
+//!   expectations file. None are modeled here — this SDK has no
+//!   settings file format; settings live on the device
+//!   (`settings get`/`set`).
 //! - The default **palette** and **colormap** are modeled as typed
 //!   files too (`palette.json`, `colormap.json`) — WS-C gave them
 //!   human-readable formats. The embedded strings are the recorded
@@ -73,15 +77,24 @@
 //! Per-product status:
 //!
 //! - **Defy** — full default config, typed
-//!   ([`DefaultConfig`]), differentially validated against the
+//!   ([`DefaultConfig::Defy`]), differentially validated against the
 //!   recorded expectations (the tests compare this module's output
 //!   byte for byte, at the data level, with the recorded Bazecor
 //!   defaults).
-//! - **Sonsei** — the defaults exist and are recorded (one wireless
-//!   variant; four default superkeys, two default macros), but this
-//!   SDK models no human-readable Sonsei config files, so there is
-//!   nothing to hand back yet: [`default_config`] answers
-//!   [`NoDefaultConfigError`].
+//! - **Sonsei** — full default config, typed
+//!   ([`DefaultConfig::Sonsei`]): one wireless variant; four default
+//!   superkeys named by the shipped backup's own store entries —
+//!   `⌫/L3`, `↵/L2`, ` 💡/Alt`, `⏯️/L3`, each pairing one tap action
+//!   with one hold action (the store names are the backup's own
+//!   evidence; the table-decoded wire values are pinned separately in
+//!   the tests) — and two default macros (typing "Hello" and "Hola").
+//!   The
+//!   evidence is the same dual-source agreement as the Defy's, pinned
+//!   by the same tests. One known outlier recorded NOT replicated:
+//!   the SonseiWireless virtual's `keymap.default` entry is an
+//!   800-token Defy-shaped keymap on a 60-key product (copy-paste
+//!   drift, listed above); the backup-corroborated `keymap.custom` is
+//!   the default shipped here.
 //! - **Raise / Raise 2** — the virtual keyboards are recorded (each
 //!   in ANSI and ISO), but they have no device support, conversion, or
 //!   human-readable config model here, and the Raise shipped backups
@@ -92,16 +105,15 @@
 
 use crate::devices::conversions::Product;
 use crate::devices::defy::{DefyColormap, DefyKeymap, MacroMap, SuperkeyMap};
-use crate::focus_api::parsing::palette::Palette;
+use crate::devices::sonsei::{SonseiColormap, SonseiKeymap};
+use crate::focus_api::parsing::palette::{Palette, RgbPalette};
 pub use error::*;
 
 mod error {
     use super::*;
 
     /// Error returned by [`default_config`]: the product's default
-    /// config is either not modeled as human-readable files (the
-    /// Sonsei — its defaults are recorded in the differential
-    /// expectations) or has none this SDK can stand behind (the Raise
+    /// config has none this SDK can stand behind (the Raise
     /// generations). See the [module docs](super) for the per-product
     /// evidence map.
     #[derive(Clone, Copy, Debug, Display, Error, PartialEq, Eq)]
@@ -116,13 +128,27 @@ mod error {
 /// a keyboard of that product starts its life with, before any user
 /// edits — what `config init` writes.
 ///
-/// Every field is a fully-typed map of this SDK's human-readable
-/// format: the values round-trip through `serde` (the JSON files) and
-/// serialize to exactly the wire shapes the apply paths send. There is
-/// no partial or raw form: a [`DefaultConfig`] either exists for a
-/// product or [`default_config`] refuses with [`NoDefaultConfigError`].
+/// Every field of every variant is a fully-typed map of this SDK's
+/// human-readable format: the values round-trip through `serde` (the
+/// JSON files) and serialize to exactly the wire shapes the apply
+/// paths send. There is no partial or raw form: a [`DefaultConfig`]
+/// either exists for a product or [`default_config`] refuses with
+/// [`NoDefaultConfigError`]. The payloads are boxed: each product's
+/// config is a multi-kilobyte stack value (ten full layers of typed
+/// maps), and the enum would otherwise carry the largest product's
+/// whole footprint in every variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DefaultConfig {
+pub enum DefaultConfig {
+    /// The Defy's default config.
+    Defy(Box<DefyDefaultConfig>),
+    /// The Sonsei's default config.
+    Sonsei(Box<SonseiDefaultConfig>),
+}
+
+/// The Defy's default configuration: the five typed maps
+/// `config init` writes for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefyDefaultConfig {
     /// The default keymap — every layer as shipped.
     pub keymap: DefyKeymap,
     /// The default superkeys map.
@@ -135,17 +161,34 @@ pub struct DefaultConfig {
     pub colormap: DefyColormap,
 }
 
+/// The Sonsei's default configuration: the five typed maps
+/// `config init` writes for it. The superkeys and macros maps are the
+/// product-independent wire formats; the keymap, colormap, and palette
+/// are the Sonsei's own shapes (60 positions, 56 LEDs, RGB).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SonseiDefaultConfig {
+    /// The default keymap — every layer as shipped.
+    pub keymap: SonseiKeymap,
+    /// The default superkeys map.
+    pub superkeys: SuperkeyMap,
+    /// The default macro map.
+    pub macros: MacroMap,
+    /// The default 16-color RGB palette.
+    pub palette: RgbPalette,
+    /// The default ten-layer colormap.
+    pub colormap: SonseiColormap,
+}
+
 /// The default configuration of a Dygma product, in this SDK's
 /// human-readable config-file shapes.
 ///
-/// Only the Defy is modeled today (see the [module docs](self) for the
-/// evidence per product): the Sonsei's defaults exist and are
-/// recorded, but this SDK defines no human-readable Sonsei config
-/// files for them to fill; the Raise generations have neither. The
+/// The Defy and the Sonsei are modeled (see the [module docs](self)
+/// for the evidence per product); the Raise generations are not. The
 /// error names the product either way.
 pub fn default_config(product: Product) -> Result<DefaultConfig, NoDefaultConfigError> {
     match product {
-        Product::Defy => Ok(defy_default_config()),
+        Product::Defy => Ok(DefaultConfig::Defy(Box::new(defy_default_config()))),
+        Product::Sonsei => Ok(DefaultConfig::Sonsei(Box::new(sonsei_default_config()))),
         other => Err(NoDefaultConfigError { product: other }),
     }
 }
@@ -204,16 +247,59 @@ const DEFY_DEFAULT_PALETTE_DATA: &str = "255 196 0 0 0 254 24 0 0 0 0 255 231 25
 /// and the per-layer accent colors the factory ships.
 const DEFY_DEFAULT_COLORMAP_DATA: &str = "10 4 4 4 4 4 7 10 4 4 4 4 4 7 2 4 4 4 4 4 0 2 4 4 4 4 4 10 3 1 5 8 2 0 0 5 4 4 4 4 4 7 11 4 4 4 4 4 7 7 7 4 4 4 4 7 2 7 7 7 4 4 10 2 1 3 8 2 6 6 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 10 12 12 12 12 12 12 10 12 9 3 9 10 12 12 1 3 3 3 10 12 2 12 12 12 12 12 12 12 1 6 5 2 12 12 5 0 0 0 12 11 12 12 0 3 3 3 12 12 12 0 3 0 3 12 12 12 6 3 3 3 3 12 12 9 3 12 12 12 12 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 7 4 8 8 8 8 8 8 15 12 15 7 7 9 15 15 12 3 0 1 9 15 15 15 15 15 15 9 15 8 15 12 15 15 15 15 15 8 8 8 8 8 8 15 15 15 12 3 15 15 15 12 11 0 3 12 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 3 6 6 6 6 6 3 3 6 6 6 6 6 3 3 6 6 6 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15";
 
+/// The Sonsei's default keymap data — the factory layout, all ten
+/// layers, verbatim from the evidence sources.
+///
+/// One data-level detail, handled exactly like the Defy's (see
+/// [`DEFY_DEFAULT_KEYMAP_DATA`]): the four wire positions the
+/// [`crate::devices::sonsei::LAYOUT`] does not model (52–55, the
+/// thumb row's center) are not keys, and the recording carries
+/// `65535` (transparent) in them on layers 2–10 and `0` on layer 1.
+/// The typed [`SonseiKeymap`] structurally cannot hold those slots,
+/// and the serializer normalizes them to `0` — so the default config
+/// this module builds matches the recorded default on all 56 modeled
+/// keys of every layer, byte for byte, and differs from the recorded
+/// *string* only at those 4 non-key slots per layer (`65535` → `0` on
+/// layers 2–10) — a normalization pinned exactly by the tests.
+const SONSEI_DEFAULT_KEYMAP_DATA: &str = "41 30 31 32 33 34 35 36 37 38 39 42 43 20 26 8 21 23 28 24 12 18 19 40 53983 4 22 7 9 10 11 13 14 15 51 52 225 29 27 6 25 5 17 16 54 55 56 229 224 227 44 53981 0 0 0 0 53980 44 53982 54109 53 0 0 0 0 0 83 46 84 85 86 65535 65535 2094 46 2093 45 0 0 95 96 97 87 65535 65535 0 49 47 48 0 0 92 93 94 88 0 65535 65535 2097 2095 2096 0 0 89 90 91 99 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 98 65535 65535 65535 58 59 60 61 62 63 64 65 66 67 68 65535 20865 22710 22709 23785 0 75 74 82 77 0 69 65535 20866 54108 22733 23786 0 78 80 81 79 70 0 65535 65535 17154 17153 17152 0 0 0 0 0 0 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535 65535";
+
+/// The Sonsei's default superkeys map data, verbatim: FOUR superkeys
+/// — the factory key-pattern set (each: one action on tap, one on
+/// hold, `1` — the wire's "no action" — everywhere else), each with
+/// its `0` terminator, then the map's own terminating `0`. The exact
+/// actions are decoded through the types and pinned by the tests.
+const SONSEI_DEFAULT_SUPERKEYS_DATA: &str =
+    "42 17452 1 1 1 0 40 17451 1 1 1 0 17154 230 1 1 1 0 57 17452 1 1 1 0 0";
+
+/// The Sonsei's default macro map data, verbatim: TWO macros — the
+/// factory greeting pair, typing "Hello" and "Hola": RightShift held
+/// while tapping `H`, released; the remaining letters tapped.
+/// Opcodes `6`/`7`/`8` are keycode-down/up/tap, each carrying one u8
+/// keycode. Each macro's terminator `0`, then the map's own.
+const SONSEI_DEFAULT_MACROS_DATA: &str =
+    "6 225 8 11 7 225 8 8 8 15 8 15 8 18 0 6 225 8 11 7 225 8 18 8 15 8 4 0 0";
+
+/// The Sonsei's default palette, verbatim: the 16 factory RGB colors,
+/// 48 decimals (16 × 3 — the `RGBWMode: false` wire shape), exactly as
+/// recorded. Color 0 is the white the factory theme frames its keys
+/// with — the recorded colormap's default color for converted
+/// positions (see the conversions module).
+const SONSEI_DEFAULT_PALETTE_DATA: &str = "255 255 255 255 0 0 255 255 0 255 108 0 255 195 0 138 255 0 189 16 224 144 19 254 0 118 255 0 254 234 255 0 255 214 129 255 0 0 0 0 0 0 0 0 0 0 0 0";
+
+/// The Sonsei's default colormap, verbatim: ten layers of 56 palette
+/// indices painting the factory theme.
+const SONSEI_DEFAULT_COLORMAP_DATA: &str = "4 0 0 0 0 0 0 0 0 0 0 3 4 0 0 0 0 0 0 0 0 0 0 5 4 0 0 0 0 0 0 0 0 0 0 0 4 0 0 0 0 0 0 0 0 0 0 4 4 4 0 5 3 0 4 8 0 15 15 15 15 15 6 4 4 4 4 15 15 0 0 0 0 14 15 0 0 0 4 15 15 15 8 9 9 14 15 0 9 0 5 15 15 15 8 5 5 15 15 0 0 0 4 15 15 15 15 15 15 0 15 15 15 0 0 0 0 0 0 0 0 0 0 0 15 3 8 8 9 14 3 3 2 3 15 0 15 3 5 9 9 15 3 2 2 2 8 15 15 15 2 2 2 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15 15";
+
 /// Builds the Defy's typed default config from the embedded evidence
 /// data.
 ///
-/// The three parses cannot fail: the constants are the recorded,
+/// The parses cannot fail: the constants are the recorded,
 /// differentially-validated Bazecor defaults (the tests parse the
 /// recorded expectations through the same types and compare), and a
 /// mistyped constant would fail those tests on the first run — a
 /// panic here would be caught before any release, never in the field.
-fn defy_default_config() -> DefaultConfig {
-    DefaultConfig {
+fn defy_default_config() -> DefyDefaultConfig {
+    DefyDefaultConfig {
         keymap: DEFY_DEFAULT_KEYMAP_DATA.parse().expect(
             "the embedded default keymap data is the differentially-validated \
              Bazecor default, pinned by the defaults tests",
@@ -231,6 +317,39 @@ fn defy_default_config() -> DefaultConfig {
              Bazecor default, pinned by the defaults tests",
         ),
         colormap: DEFY_DEFAULT_COLORMAP_DATA.parse().expect(
+            "the embedded default colormap data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+    }
+}
+
+/// Builds the Sonsei's typed default config from the embedded evidence
+/// data.
+///
+/// The parses cannot fail: the constants are the recorded,
+/// differentially-validated Bazecor defaults (the tests parse the
+/// recorded expectations through the same types and compare), and a
+/// mistyped constant would fail those tests on the first run — a
+/// panic here would be caught before any release, never in the field.
+fn sonsei_default_config() -> SonseiDefaultConfig {
+    SonseiDefaultConfig {
+        keymap: SONSEI_DEFAULT_KEYMAP_DATA.parse().expect(
+            "the embedded default keymap data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        superkeys: SONSEI_DEFAULT_SUPERKEYS_DATA.parse().expect(
+            "the embedded default superkeys data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        macros: SONSEI_DEFAULT_MACROS_DATA.parse().expect(
+            "the embedded default macros data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        palette: SONSEI_DEFAULT_PALETTE_DATA.parse().expect(
+            "the embedded default palette data is the differentially-validated \
+             Bazecor default, pinned by the defaults tests",
+        ),
+        colormap: SONSEI_DEFAULT_COLORMAP_DATA.parse().expect(
             "the embedded default colormap data is the differentially-validated \
              Bazecor default, pinned by the defaults tests",
         ),

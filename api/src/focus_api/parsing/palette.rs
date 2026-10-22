@@ -141,9 +141,11 @@ impl RgbwColor {
 
 /// One RGB color: the three colored channels without the white one.
 ///
-/// Not a wire format of its own on the Defy — this is the display
-/// shape [`RgbwColor::to_rgb`] renders to, and the input
-/// [`RgbwColor::from_rgb`] guesses from.
+/// On the Defy this is only the display shape
+/// [`RgbwColor::to_rgb`] renders to (and the input
+/// [`RgbwColor::from_rgb`] guesses from); on the `RGBWMode: false`
+/// products (the Sonsei) it is the wire color itself — see
+/// [`RgbPalette`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RgbColor {
     /// Red channel, 0–255.
@@ -152,6 +154,11 @@ pub struct RgbColor {
     pub g: u8,
     /// Blue channel, 0–255.
     pub b: u8,
+}
+
+impl RgbColor {
+    /// How many wire decimals one RGB color carries.
+    pub const CHANNELS: usize = 3;
 }
 
 /// A full device palette: exactly [`COLORS`] RGBW colors, in palette
@@ -220,6 +227,115 @@ impl RgbwColor {
     /// The four channels in wire order (r, g, b, w).
     fn channels(self) -> [u8; 4] {
         [self.r, self.g, self.b, self.w]
+    }
+}
+
+/// Error when parsing RGB palette wire data.
+///
+/// The RGB palette's sibling of
+/// [`ParsePaletteError`], worded for the RGB shape — the two are
+/// separate types on purpose (see [`RgbPalette`]'s docs for the design
+/// call), so each names its own wire form.
+#[derive(Clone, Debug, Display, Error)]
+pub enum ParseRgbPaletteError {
+    /// The palette data is not valid wire data.
+    #[display("failed to parse palette data at byte offset {offset}: expected {expected}")]
+    MalformedData {
+        /// Byte offset of the failure — exactly the offending token:
+        /// the parse is one flat token stream (the color-count check
+        /// runs only after it ends), so a bad token fails the parse
+        /// right where it sits, wherever it sits.
+        offset: usize,
+        /// What the parser expected at `offset`, from the parser's own
+        /// context (e.g. `a channel value`).
+        expected: String,
+    },
+    /// The data holds well-formed decimals but not exactly
+    /// [`RGB_PALETTE_DECIMALS`] of them, so it is not an RGB palette.
+    #[display(
+        "palette data holds {found} values, not the {} an RGB palette carries \
+         ({} colors × {} RGB channels)",
+        RGB_PALETTE_DECIMALS,
+        COLORS,
+        RgbColor::CHANNELS
+    )]
+    WrongColorCount {
+        /// How many decimals the data holds.
+        found: usize,
+    },
+}
+
+/// How many decimals one RGB palette carries (16 colors × 3 RGB
+/// channels) — the Sonsei's `palette` wire shape.
+pub const RGB_PALETTE_DECIMALS: usize = COLORS * RgbColor::CHANNELS;
+
+/// A full RGB palette: exactly [`COLORS`] RGB colors, in palette
+/// order — the palette wire shape of the products whose descriptors
+/// carry `RGBWMode: false`: the Sonsei's descriptor states it
+/// explicitly in BOTH of Bazecor's sources, the hardware-virtual
+/// keyboard and the shipped backup (48 decimals on the wire; the
+/// shipped `palette` capture is exactly that).
+///
+/// This sits beside the RGBW [`Palette`] as its own type rather than a
+/// parameterized one: the two shapes differ in their error wordings
+/// (a count failure names the shape it wanted) and their JSON forms
+/// (3-channel vs 4-channel color objects), and keeping the Defy's
+/// types, messages, and diagnostics untouched was worth more than the
+/// few shared lines a generic would have saved. [`RgbColor`] — the
+/// display shape [`RgbwColor::to_rgb`] renders to — is the wire color
+/// here, with all three channels stored and sent verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RgbPalette(pub [RgbColor; COLORS]);
+
+impl FromStr for RgbPalette {
+    type Err = ParseRgbPaletteError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let channels =
+            palette_parser
+                .parse(s)
+                .map_err(|err| ParseRgbPaletteError::MalformedData {
+                    offset: err.offset(),
+                    expected: parse_expectation(err.inner().context())
+                        .unwrap_or_else(|| "a channel value".to_owned()),
+                })?;
+
+        // Exactly the palette's worth of channels, or no palette: a
+        // short stream is a corrupt read, a long one a write the
+        // firmware would answer as a read. Both fail here, by count.
+        let (colors, remainder) = channels.as_chunks::<{ RgbColor::CHANNELS }>();
+
+        let colors: Vec<RgbColor> = colors
+            .iter()
+            .map(|&[r, g, b]| RgbColor { r, g, b })
+            .collect();
+
+        // `as_chunks` leaves a tail shorter than one color in
+        // `remainder`; 48 channels plus a stray 49th must fail too, so
+        // both the tail and the color count are checked.
+        if !remainder.is_empty() || colors.len() != COLORS {
+            return Err(ParseRgbPaletteError::WrongColorCount {
+                found: channels.len(),
+            });
+        }
+
+        Ok(RgbPalette(colors.try_into().expect(
+            "the count check above proves exactly COLORS colors",
+        )))
+    }
+}
+
+impl std::fmt::Display for RgbPalette {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut channels = self.0.iter().flat_map(|color| [color.r, color.g, color.b]);
+
+        write!(f, "{}", channels.next().unwrap_or_default())?;
+
+        for channel in channels {
+            write!(f, " {channel}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -503,23 +619,27 @@ mod tests {
 
     #[test]
     fn our_display_rgb_matches_bazecors_parse_of_the_real_palettes() {
-        // For every recorded Defy fixture: our wire parse of the very
-        // same palette data, rendered through our `to_rgb`, is exactly
-        // what Bazecor's `parsePaletteRaw` (its `rgbw2b`) produces.
+        // For every recorded fixture: our wire parse of the very same
+        // palette data matches what Bazecor's `parsePaletteRaw` (its
+        // `rgbw2b` for the RGBW products) produces — through `to_rgb`
+        // for the RGBW palettes, and channel for channel for the plain
+        // RGB one, which `RgbPalette` parses directly.
         let recorded = recorded_leds();
 
         for (fixture, expected) in &recorded.devices {
             if !expected.rgbw_mode {
-                // The Sonsei's palette is plain RGB on the wire — a
-                // different product's format this SDK does not parse.
-                // The recording still proves the RGB shape: 16 colors
-                // of 3 channels, every channel in byte range.
-                assert_eq!(
-                    expected.palette_wire.split_whitespace().count(),
-                    expected.display_colors.len() * 3,
-                    "{fixture}"
-                );
-                assert_eq!(expected.display_colors.len(), COLORS, "{fixture}");
+                // The Sonsei's palette is plain RGB on the wire —
+                // `RgbPalette`'s exact shape. The recording proves it
+                // end to end: the wire data parses through `RgbPalette`
+                // to exactly the colors Bazecor renders for it (the
+                // RGB wire color IS the display color — no white
+                // channel, no conversion).
+                let palette: RgbPalette = expected
+                    .palette_wire
+                    .parse()
+                    .unwrap_or_else(|err| panic!("{fixture} palette does not parse: {err}"));
+
+                assert_eq!(palette.0.to_vec(), expected.display_colors, "{fixture}");
 
                 continue;
             }

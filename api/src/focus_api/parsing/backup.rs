@@ -196,6 +196,31 @@ impl PartialCapture {
     pub fn has_missing(&self) -> bool {
         !self.missing.is_empty()
     }
+
+    /// The Display message of a partial-capture refusal: names the
+    /// missing commands, or — for a marker with an empty missing list
+    /// — says why the list is empty, never "0 command(s) missing: "
+    /// with a dangling separator. Such markers no longer arise from
+    /// this crate's captures (the identity probes cannot interrupt
+    /// one), but files saved by earlier versions of this crate —
+    /// captures interrupted at the probes — carry them, and the
+    /// refusal must word them. The single source of the refusal's
+    /// wording, shared by every product's restore validation (the
+    /// CLI's validation snippets render this `Display` directly).
+    pub fn refusal_display(&self) -> String {
+        if self.missing.is_empty() {
+            "the backup is a partial capture: the capture was interrupted \
+             after every command, before the backup could be assembled \
+             completely"
+                .to_owned()
+        } else {
+            format!(
+                "the backup is a partial capture: {} command(s) missing: {}",
+                self.missing.len(),
+                self.missing.join(", ")
+            )
+        }
+    }
 }
 
 /// Computes the commands of the `expected` capture list that

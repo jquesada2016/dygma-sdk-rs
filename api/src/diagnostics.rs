@@ -24,10 +24,16 @@ use dygma_cli::devices::defy::{
     BackupEntryError, BackupValidationError, DefyColormap, DefyKeymap, MacroMap,
     ParseColormapError, ParseKeymapError, ParseMacroMapError, ParseSuperkeyMapError, SuperkeyMap,
 };
+use dygma_cli::devices::restore::RestorePlanError;
+use dygma_cli::devices::sonsei::{
+    self, ParseColormapError as SonseiParseColormapError,
+    ParseKeymapError as SonseiParseKeymapError,
+};
 use dygma_cli::focus_api::RunCommandError;
 use dygma_cli::focus_api::parsing::backup::DefyBackup;
 use dygma_cli::focus_api::parsing::palette::Palette;
 use dygma_cli::focus_api::parsing::palette::ParsePaletteError;
+use dygma_cli::focus_api::parsing::palette::ParseRgbPaletteError;
 use dygma_cli::names::NeuronNameStore;
 use error_stack::{AttachmentKind, FrameKind, IntoReport};
 use miette::{
@@ -458,19 +464,33 @@ pub(super) enum WireFormat {
     Palette,
     /// A `colormap.map` data string (178 palette indices per layer).
     Colormap,
+    /// A Sonsei `keymap.custom` data string (60 key codes per layer).
+    /// Never reaches the apply-command paths (the Sonsei has no
+    /// transport); it names the format in Sonsei backup-entry
+    /// diagnostics.
+    Keymap60,
+    /// A Sonsei `colormap.map` data string (56 palette indices per
+    /// layer). Same reach as [`WireFormat::Keymap60`].
+    Colormap56,
+    /// A Sonsei `palette` data string (3 RGB decimals per color, the
+    /// `RGBWMode: false` shape). Same reach as
+    /// [`WireFormat::Keymap60`].
+    PaletteRgb,
 }
 
 /// How many wire values one layer of each layered format carries, for
 /// the failure-site arithmetic that names the layer.
 impl WireFormat {
     /// Values per layer, when the format is layered (None for the
-    /// unlayered `palette`, and for superkeys/macros, whose layers are
+    /// unlayered palettes, and for superkeys/macros, whose layers are
     /// not uniform).
     fn values_per_layer(self) -> Option<usize> {
         match self {
             Self::Keymap => Some(80),
-            Self::Palette => None,
+            Self::Palette | Self::PaletteRgb => None,
             Self::Colormap => Some(178),
+            Self::Keymap60 => Some(60),
+            Self::Colormap56 => Some(56),
             Self::Superkeys | Self::Macros => None,
         }
     }
@@ -485,28 +505,31 @@ impl WireFormat {
             Self::Macros => "--macros",
             Self::Palette => "--palette",
             Self::Colormap => "--colormap",
+            Self::Keymap60 => "--keymap",
+            Self::Colormap56 => "--colormap",
+            Self::PaletteRgb => "--palette",
         }
     }
 
     /// The human noun for the format, used in messages.
     fn noun(self) -> &'static str {
         match self {
-            Self::Keymap => "keymap",
+            Self::Keymap | Self::Keymap60 => "keymap",
             Self::Superkeys => "superkeys",
             Self::Macros => "macros",
-            Self::Palette => "palette",
-            Self::Colormap => "colormap",
+            Self::Palette | Self::PaletteRgb => "palette",
+            Self::Colormap | Self::Colormap56 => "colormap",
         }
     }
 
     /// Stable identifier for the failure kind.
     fn code(self) -> &'static str {
         match self {
-            Self::Keymap => "dygma-cli::keymap::wire-parse",
+            Self::Keymap | Self::Keymap60 => "dygma-cli::keymap::wire-parse",
             Self::Superkeys => "dygma-cli::superkeys::wire-parse",
             Self::Macros => "dygma-cli::macros::wire-parse",
-            Self::Palette => "dygma-cli::palette::wire-parse",
-            Self::Colormap => "dygma-cli::colormap::wire-parse",
+            Self::Palette | Self::PaletteRgb => "dygma-cli::palette::wire-parse",
+            Self::Colormap | Self::Colormap56 => "dygma-cli::colormap::wire-parse",
         }
     }
 
@@ -532,6 +555,18 @@ impl WireFormat {
             Self::Colormap => {
                 "colormap wire data is space-separated palette indices (0-15) — 178 \
                  per layer, 10 layers per colormap.map write"
+            }
+            Self::Keymap60 => {
+                "Sonsei keymap wire data is space-separated u16 key codes — 60 per \
+                 layer, 10 layers per keymap.custom write"
+            }
+            Self::Colormap56 => {
+                "Sonsei colormap wire data is space-separated palette indices (0-15) — \
+                 56 per layer, 10 layers per colormap.map write"
+            }
+            Self::PaletteRgb => {
+                "Sonsei palette wire data is space-separated decimals — 3 RGB channels \
+                 per color (the RGBWMode: false shape), 16 colors per palette"
             }
         }
     }
@@ -875,23 +910,10 @@ fn wire_snippet(
     }
 }
 
-/// Builds the report for a backup that failed restore validation, with
-/// the located snippet attached. The raw file text is re-read here
-/// because this is where the path is at hand; when it cannot be read,
-/// the diagnostic renders without a snippet.
-pub(super) fn backup_validation_report(
-    path: &Path,
-    err: BackupValidationError,
-) -> error_stack::Report<Error> {
-    let text = std::fs::read_to_string(path).ok();
-
-    backup_validation_report_with_text(path, text.as_deref(), err)
-}
-
 /// Builds the validation-failure report from file text the caller
 /// already holds, so it can be exercised without touching the
 /// filesystem; when the text is unavailable, the diagnostic renders
-/// without a snippet.
+/// without a snippet. The Defy branch of [`restore_plan_report`].
 fn backup_validation_report_with_text(
     path: &Path,
     text: Option<&str>,
@@ -973,8 +995,8 @@ fn backup_validation_snippet(
             label: format!("this backup was captured from a `{product}`"),
             context,
             help: Some(
-                "the SDK speaks the Defy wire formats only — restoring another \
-                 product's backup would write foreign data to the device"
+                "the Defy is the only product this SDK restores onto — restoring \
+                 another product's backup would write foreign data to the device"
                     .to_owned(),
             ),
         },
@@ -1093,6 +1115,302 @@ fn wire_failure(source: &BackupEntryError) -> Option<(WireFormat, usize, bool)> 
         BackupEntryError::Colormap(ParseColormapError::MalformedData(inner)) => {
             Some((WireFormat::Colormap, inner.offset, inner.consumed_offender))
         }
+        _ => None,
+    }
+}
+
+// =====================================================================================
+// Product-dispatched restore-plan failures
+// =====================================================================================
+
+/// Builds the report for a backup whose restore plan failed, wherever
+/// the product dispatch put the failure: a Defy validator refusal
+/// renders exactly the Defy validation diagnostic (byte-identical to
+/// the pre-dispatch path), a Sonsei one the mirrored Sonsei wording,
+/// and a dispatch refusal (unknown product, no modeled restore) its
+/// own diagnostic. The raw file text is re-read here because this is
+/// where the path is at hand; when it cannot be read, the diagnostic
+/// renders without a snippet.
+pub(super) fn restore_plan_report(
+    path: &Path,
+    err: RestorePlanError,
+) -> error_stack::Report<Error> {
+    let text = std::fs::read_to_string(path).ok();
+
+    restore_plan_report_with_text(path, text.as_deref(), err)
+}
+
+/// Builds the restore-plan-failure report from file text the caller
+/// already holds, so it can be exercised without touching the
+/// filesystem; the dispatch behind [`restore_plan_report`].
+fn restore_plan_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: RestorePlanError,
+) -> error_stack::Report<Error> {
+    match err {
+        RestorePlanError::Defy(err) => backup_validation_report_with_text(path, text, err),
+        RestorePlanError::Sonsei(err) => sonsei_validation_report_with_text(path, text, err),
+        dispatch => dispatch_report_with_text(path, text, &dispatch),
+    }
+}
+
+/// Builds the Sonsei validation-failure report from file text the
+/// caller already holds; when the text is unavailable, the diagnostic
+/// renders without a snippet. The Sonsei sibling of
+/// [`backup_validation_report_with_text`].
+fn sonsei_validation_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: sonsei::BackupValidationError,
+) -> error_stack::Report<Error> {
+    let context_line = format!("validating the backup in {}", path.display());
+    let report = err
+        .clone()
+        .into_report()
+        .change_context(Error)
+        .attach(context_line.clone());
+
+    match text {
+        Some(text) => report.attach_opaque(sonsei_backup_validation_snippet(
+            path,
+            text,
+            &err,
+            vec![context_line],
+        )),
+        None => report,
+    }
+}
+
+/// Builds the report for a restore-plan DISPATCH refusal — a backup
+/// whose product the dispatch could not route to a validator (an
+/// unknown product name, or a known one with no modeled restore). Both
+/// are descriptor facts, so the span sits on the product value when
+/// the file text is available.
+fn dispatch_report_with_text(
+    path: &Path,
+    text: Option<&str>,
+    err: &RestorePlanError,
+) -> error_stack::Report<Error> {
+    let context_line = format!("validating the backup in {}", path.display());
+    let report = err
+        .clone()
+        .into_report()
+        .change_context(Error)
+        .attach(context_line.clone());
+
+    let snippet = text.map(|text| {
+        let (code, message, label, help) = match err {
+            RestorePlanError::UnknownProduct { product } => (
+                "dygma-cli::backup-restore::unknown-product",
+                err.to_string(),
+                format!("this backup names the unknown product `{product}`"),
+                "a backup's product must be one this SDK knows — the \
+                 descriptor's `neuron.device.info.product` names it, and \
+                 `backup show` prints what a file carries"
+                    .to_owned(),
+            ),
+            RestorePlanError::NoModeledRestore { product } => (
+                "dygma-cli::backup-restore::no-modeled-restore",
+                err.to_string(),
+                format!("this backup was captured from a `{product}`"),
+                format!(
+                    "the {product}'s backups convert but do not restore here — \
+                     convert it first (`dygma-cli backup convert --to defy`, with \
+                     `--keyboard-type` for a Raise target)"
+                ),
+            ),
+            RestorePlanError::Defy(_) | RestorePlanError::Sonsei(_) => {
+                unreachable!("a per-product validation refusal dispatches to its own report")
+            }
+        };
+
+        let product = match err {
+            RestorePlanError::UnknownProduct { product } => product.as_str(),
+            RestorePlanError::NoModeledRestore { product } => product.name(),
+            _ => unreachable!("handled above"),
+        };
+
+        ErrorSnippet {
+            code,
+            message,
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, product).unwrap_or((0, 0)),
+            label,
+            context: vec![context_line.clone()],
+            help: Some(help),
+        }
+    });
+
+    match snippet {
+        Some(snippet) => report.attach_opaque(snippet),
+        None => report,
+    }
+}
+
+/// Locates a Sonsei restore-validation failure in the raw JSON text.
+/// The Sonsei sibling of [`backup_validation_snippet`]: the same three
+/// refusal shapes, worded for the Sonsei (the partial-capture refusal
+/// renders identically — its wording's single source is the shared
+/// `PartialCapture::refusal_display`).
+fn sonsei_backup_validation_snippet(
+    path: &Path,
+    text: &str,
+    err: &sonsei::BackupValidationError,
+    context: Vec<String>,
+) -> ErrorSnippet {
+    match err {
+        sonsei::BackupValidationError::NotASonseiBackup { product } => ErrorSnippet {
+            code: "dygma-cli::backup::not-a-sonsei",
+            message: format!("the backup is for a `{product}`, not a Sonsei"),
+            source_name: path.display().to_string(),
+            source_text: text.to_owned(),
+            span: locate_product_value(text, product).unwrap_or((0, 0)),
+            label: format!("this backup was captured from a `{product}`"),
+            context,
+            help: Some(
+                "a Sonsei restore takes Sonsei-shaped data — cross-product \
+                 restores go through conversion (`dygma-cli backup convert`), and \
+                 this SDK has no Sonsei transport to restore onto in any case"
+                    .to_owned(),
+            ),
+        },
+        sonsei::BackupValidationError::PartialCapture { .. } => {
+            // The refusal's wording lives on the error type's Display
+            // (one source, including the empty-missing case); the
+            // snippet renders it verbatim — the same single source the
+            // Defy's refusal renders.
+            let message = err.to_string();
+
+            ErrorSnippet {
+                code: "dygma-cli::backup::partial-capture",
+                message,
+                source_name: path.display().to_string(),
+                source_text: text.to_owned(),
+                span: locate_partial_marker(text).unwrap_or((0, 0)),
+                label: "this marker says the file was saved from a failed capture".to_owned(),
+                context,
+                help: Some(
+                    "restoring it would write a half-captured configuration to the \
+                     device — complete the capture first (`dygma-cli backup create \
+                     --retry-missing <file>`), re-capture, or pass `--allow-partial` \
+                     to restore what the file holds"
+                        .to_owned(),
+                ),
+            }
+        }
+        sonsei::BackupValidationError::InvalidEntry { command, source } => {
+            let (span, label) = locate_data_value(text, command)
+                .map(|(start, len)| {
+                    sonsei_entry_span_and_label(&text[start..start + len], start, source)
+                })
+                .unwrap_or(((0, 0), source.to_string()));
+
+            // The `data` value is one huge line; show an excerpt around
+            // the span instead of the whole line.
+            let (source_text, span) = excerpt(text, span.0, span.1);
+
+            ErrorSnippet {
+                code: "dygma-cli::backup::invalid-entry",
+                message: format!("the `{command}` entry failed restore validation: {source}"),
+                source_name: format!("{} — `{command}` `data` (excerpt)", path.display()),
+                source_text,
+                span,
+                label,
+                context,
+                help: Some(
+                    "backups hold whole device maps — this `data` must be Sonsei wire \
+                     data (a Defy backup's entries are not; `backup convert` produces \
+                     Sonsei data from a Defy backup)"
+                        .to_owned(),
+                ),
+            }
+        }
+    }
+}
+
+/// The span and label for a Sonsei backup entry whose `data` failed
+/// validation, with the span offset based at `start` (the beginning of
+/// the entry's data value in the file). The Sonsei sibling of
+/// [`entry_span_and_label`]: the same three wire-site shapes, with the
+/// Sonsei's layer counts in the count labels (60-wide keymap, 56-wide
+/// colormap, RGB palette).
+fn sonsei_entry_span_and_label(
+    data: &str,
+    start: usize,
+    source: &sonsei::BackupEntryError,
+) -> ((usize, usize), String) {
+    match wire_site(data, sonsei_wire_failure(source)) {
+        WireSite::Offender { offset, token } => (
+            (start + offset, token.len()),
+            format!("not valid wire data: `{token}`"),
+        ),
+        WireSite::Stop { offset, token } => (
+            (start + offset, token.len()),
+            "parsing stopped here".to_owned(),
+        ),
+        WireSite::End => (
+            (start, 0),
+            "the data ended where a value was expected".to_owned(),
+        ),
+        // Layer-count rejections carry no offset. A keymap whose layer
+        // count is wrong parses as wire data, so the count is the
+        // whole story: say it with the Sonsei's numbers. The rest let
+        // the source's own message carry it.
+        WireSite::Unlocated { token } => {
+            if let sonsei::BackupEntryError::Keymap(SonseiParseKeymapError::IncorrectLayerCount(
+                _,
+            )) = source
+            {
+                let numbers = data.split_whitespace().count();
+                let first_token = token.map_or(0, |(_, token)| token.len());
+
+                return (
+                    (start, first_token),
+                    format!(
+                        "{numbers} codes = {} layers; a `keymap.custom` write carries \
+                         exactly 600 = 10",
+                        numbers / 60
+                    ),
+                );
+            }
+
+            ((start, 0), source.to_string())
+        }
+    }
+}
+
+/// The wire format and failure location of a Sonsei backup entry's
+/// parse failure, when it located one — plus whether the parser
+/// consumed the offending byte before rejecting it. The Sonsei sibling
+/// of [`wire_failure`]: the Sonsei's own keymap/colormap/palette parse
+/// errors map to the Sonsei-width formats; the superkeys and macros
+/// formats are product-independent, so their errors are the shared
+/// types.
+fn sonsei_wire_failure(source: &sonsei::BackupEntryError) -> Option<(WireFormat, usize, bool)> {
+    match source {
+        sonsei::BackupEntryError::Keymap(SonseiParseKeymapError::MalformedData(inner)) => {
+            Some((WireFormat::Keymap60, inner.offset, false))
+        }
+        sonsei::BackupEntryError::Superkeys(ParseSuperkeyMapError::MalformedData(inner)) => {
+            Some((WireFormat::Superkeys, inner.offset, false))
+        }
+        sonsei::BackupEntryError::Macros(ParseMacroMapError::MalformedData(inner)) => {
+            Some((WireFormat::Macros, inner.offset, inner.unsupported_kind))
+        }
+        sonsei::BackupEntryError::Palette(ParseRgbPaletteError::MalformedData {
+            offset, ..
+        }) => Some((WireFormat::PaletteRgb, *offset, false)),
+        sonsei::BackupEntryError::Colormap(SonseiParseColormapError::MalformedData(inner)) => {
+            Some((
+                WireFormat::Colormap56,
+                inner.offset,
+                inner.consumed_offender,
+            ))
+        }
+        // A color-count rejection names its count; there is no single
+        // token to point at.
         _ => None,
     }
 }
@@ -1435,11 +1753,17 @@ fn wire_offender(text: &str, offset: usize, format: WireFormat) -> Option<(usize
             // past u8 is the failure. (A colormap index of 16..255
             // never reaches this scan — the range rejection consumed
             // it and reports consumed-offender — so the u8 check is
-            // what remains: a 3+ digit token.)
-            WireFormat::Macros | WireFormat::Palette | WireFormat::Colormap => {
-                token.parse::<u8>().is_err()
+            // what remains: a 3+ digit token.) The Sonsei widths ride
+            // the same domains: its colormap indices and RGB channels
+            // are bytes, its key codes u16.
+            WireFormat::Macros
+            | WireFormat::Palette
+            | WireFormat::Colormap
+            | WireFormat::Colormap56
+            | WireFormat::PaletteRgb => token.parse::<u8>().is_err(),
+            WireFormat::Keymap | WireFormat::Superkeys | WireFormat::Keymap60 => {
+                token.parse::<u16>().is_err()
             }
-            WireFormat::Keymap | WireFormat::Superkeys => token.parse::<u16>().is_err(),
         };
 
         if invalid {
@@ -1663,8 +1987,8 @@ Error:
     ·                       ╰── this backup was captured from a `Raise`
  13 │         "keyboardType": "wireless",
     ╰────
-  help: the SDK speaks the Defy wire formats only — restoring another product's backup would write
-        foreign data to the device
+  help: the Defy is the only product this SDK restores onto — restoring another product's backup
+        would write foreign data to the device
 
 Error: 
   × validating the backup in backup.json
@@ -2108,6 +2432,162 @@ Error:
         );
 
         assert_eq!(render_plain(&report), NINE_GOLDEN);
+    }
+
+    /// The exact no-color render for the Sonsei cross-product refusal
+    /// (golden).
+    const SONSEI_WRONG_PRODUCT_GOLDEN: &str = r#"dygma-cli::backup::not-a-sonsei
+
+  × the backup is for a `Defy`, not a Sonsei
+    ╭─[backup.json:12:21]
+ 11 │         "vendor": "Dygma",
+ 12 │         "product": "Defy",
+    ·                     ──┬─
+    ·                       ╰── this backup was captured from a `Defy`
+ 13 │         "keyboardType": "wireless",
+    ╰────
+  help: a Sonsei restore takes Sonsei-shaped data — cross-product restores go through conversion
+        (`dygma-cli backup convert`), and this SDK has no Sonsei transport to restore onto in any
+        case
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+    /// The exact no-color render for the Sonsei wrong-width layer
+    /// count (golden) — the label states the Sonsei's counts.
+    const SONSEI_NINE_GOLDEN: &str = r#"dygma-cli::backup::invalid-entry
+
+  × the `keymap.custom` entry failed restore validation: keymap does not have exactly 10 layers
+   ╭─[backup.json — `keymap.custom` `data` (excerpt):3:16]
+ 2 │       "command": "keymap.custom",
+ 3 │       "data": "41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 
+   ·                ─┬
+   ·                 ╰── 540 codes = 9 layers; a `keymap.custom` write carries exactly 600 = 10
+   ╰────
+  help: backups hold whole device maps — this `data` must be Sonsei wire data (a Defy backup's
+        entries are not; `backup convert` produces Sonsei data from a Defy backup)
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+    /// The exact no-color render for the unknown-product dispatch
+    /// refusal (golden).
+    const UNKNOWN_PRODUCT_GOLDEN: &str = r#"dygma-cli::backup-restore::unknown-product
+
+  × the backup's device descriptor names the unknown product `Keyboard 3000`
+    ╭─[backup.json:12:21]
+ 11 │         "vendor": "Dygma",
+ 12 │         "product": "Keyboard 3000",
+    ·                     ──────┬──────
+    ·                           ╰── this backup names the unknown product `Keyboard 3000`
+ 13 │         "keyboardType": "wireless",
+    ╰────
+  help: a backup's product must be one this SDK knows — the descriptor's
+        `neuron.device.info.product` names it, and `backup show` prints what a file carries
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+    /// The exact no-color render for the no-modeled-restore dispatch
+    /// refusal (golden).
+    const NO_MODELED_RESTORE_GOLDEN: &str = r#"dygma-cli::backup-restore::no-modeled-restore
+
+  × no restore validation is modeled for the Raise; convert the backup to a supported target to
+  │ restore it
+    ╭─[backup.json:12:21]
+ 11 │         "vendor": "Dygma",
+ 12 │         "product": "Raise",
+    ·                     ──┬──
+    ·                       ╰── this backup was captured from a `Raise`
+ 13 │         "keyboardType": "wireless",
+    ╰────
+  help: the Raise's backups convert but do not restore here — convert it first (`dygma-cli backup
+        convert --to defy`, with `--keyboard-type` for a Raise target)
+
+Error: 
+  × validating the backup in backup.json
+
+Error: 
+  × something went wrong running the command
+"#;
+
+    /// Renders a Defy backup refused by the SONSEI validator (the
+    /// mirrored cross-product guard, reached through the direct
+    /// library validator — the dispatch itself routes a Defy backup to
+    /// the Defy validator, so the CLI cannot produce this shape) and
+    /// pins the exact no-color output: the span sits on the product
+    /// value, and the help names the conversion path and the transport
+    /// boundary.
+    #[test]
+    fn sonsei_wrong_product_backup_renders_the_product_value() {
+        let text = backup_json("Defy", "Silver Defy", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let err = RestorePlanError::Sonsei(
+            dygma_cli::devices::sonsei::backup_restore_plan(&backup).unwrap_err(),
+        );
+        let report = restore_plan_report_with_text(Path::new("backup.json"), Some(&text), err);
+
+        assert_eq!(render_plain(&report), SONSEI_WRONG_PRODUCT_GOLDEN);
+    }
+
+    /// Renders a Sonsei backup whose `keymap.custom` holds nine
+    /// 60-wide layers and pins the exact no-color output: the label
+    /// must state the Sonsei's counts (600 = 10), not the Defy's.
+    #[test]
+    fn sonsei_nine_layer_backup_renders_the_layer_counts() {
+        let layer = vec!["41"; 60].join(" ");
+        let nine = vec![layer; 9].join(" ");
+        let text = backup_json("Sonsei", "Silver Sonsei", &nine);
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = restore_plan_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::restore::backup_restore_plan(&backup).unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), SONSEI_NINE_GOLDEN);
+    }
+
+    /// Renders a backup naming a product the SDK does not know and
+    /// pins the exact no-color output: the dispatch refusal sits on
+    /// the product value, and the help points at `backup show`.
+    #[test]
+    fn unknown_product_backup_renders_the_product_value() {
+        let text = backup_json("Keyboard 3000", "Mystery Keyboard", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = restore_plan_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::restore::backup_restore_plan(&backup).unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), UNKNOWN_PRODUCT_GOLDEN);
+    }
+
+    /// Renders a Raise backup refused by the restore dispatch (known
+    /// product, no modeled restore) and pins the exact no-color
+    /// output: the help names the conversion that produces a
+    /// restorable file.
+    #[test]
+    fn no_modeled_restore_backup_renders_the_product_value() {
+        let text = backup_json("Raise", "Silver Raise", &keymap_wire(10));
+        let backup: DefyBackup = serde_json::from_str(&text).unwrap();
+        let report = restore_plan_report_with_text(
+            Path::new("backup.json"),
+            Some(&text),
+            dygma_cli::devices::restore::backup_restore_plan(&backup).unwrap_err(),
+        );
+
+        assert_eq!(render_plain(&report), NO_MODELED_RESTORE_GOLDEN);
     }
 
     /// Renders a Raise backup that `backup convert` cannot target and
