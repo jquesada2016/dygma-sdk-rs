@@ -1,5 +1,5 @@
 //! Types for parsing and serializing the wireless and battery Focus
-//! commands (`wireless.battery.*`, `wireless.rf.*`,
+//! commands (`wireless.battery.*`, `wireless.energy.*`, `wireless.rf.*`,
 //! `wireless.bluetooth.*`).
 //!
 //! The Defy's wireless side is served by its wireless Neuron's
@@ -11,13 +11,24 @@
 //! default backups and the app's virtual keyboards, recorded by
 //! `tools/bazecor-differential/record-wireless.mjs`). Per-claim
 //! evidence is cited on each type.
+//!
+//! Two evidence grades live side by side here, and every type names
+//! its own: a typed wire shape where a capture pins one
+//! ([`BatteryLevel`], [`EnergyModes`], …), and raw passthrough where
+//! none does (the Bluetooth store reads return the response verbatim —
+//! every capture of them is the empty factory store, so nothing is
+//! claimed about a populated one). The `wireless.energy.*` family and
+//! `wireless.rf.stability` are carried by no Defy source at all — only
+//! the app's four virtual keyboards and the shipped Raise2 backup pair
+//! record them — and no Bazecor renderer code sends or reads any of
+//! them; their semantics rest on the command names alone.
 
 use std::str::FromStr;
 
 use winnow::{
     ModalResult, Parser,
     ascii::{dec_uint, space0},
-    combinator::terminated,
+    combinator::{eof, repeat, terminated},
     stream::AsChar,
     token::take_while,
 };
@@ -44,6 +55,14 @@ pub enum ParseWirelessError {
     /// but the data was something else.
     #[display("expected `1`, `0`, `true`, or `false`, got: {_0}")]
     RfChannelHop(#[error(not(source))] String),
+    /// A `wireless.energy.modes` response was expected (a non-empty
+    /// run of space-separated decimal mode values — every capture
+    /// carries eleven), but the data was something else. An empty
+    /// response fails here too: the firmware answers a command it does
+    /// not serve with an empty response, and an empty mode table is
+    /// not a reading to misreport.
+    #[display("expected space-separated decimal mode values, got: {_0}")]
+    EnergyModes(#[error(not(source))] String),
 }
 
 /// Which half of the split keyboard a battery command addresses.
@@ -370,6 +389,101 @@ pub fn rf_channel_hop_command_data(value: bool) -> &'static str {
     if value { "1" } else { "0" }
 }
 
+/// The energy-management mode table (`wireless.energy.modes`): one
+/// decimal value per energy-management mode.
+///
+/// The captured shape is eleven `0`s — the same eleven-value table in
+/// all four of the app's virtual wireless keyboards and in the shipped
+/// Raise2 backup pair (recorded in `expectations/wireless.json`) — but
+/// the count is deliberately NOT enforced here: a single shape from
+/// sources that carry no consumer is not a documented domain, and a
+/// real firmware serving a different mode count must read, not fail.
+/// The values' semantics are unknown — no Bazecor renderer ever sends
+/// or reads this command (its only appearances are the virtual
+/// keyboards' command maps and the shipped backups), `FOCUS_API.md`
+/// does not document it, and no Defy source captures it — so the type
+/// claims exactly what the captures pin: a non-empty run of decimals.
+/// The parse error carries the offending response verbatim.
+///
+/// An empty response is not a table: the firmware answers a command it
+/// does not serve with an empty response, and an empty parse would
+/// misreport "the device has no modes" instead of failing the read.
+/// The inner value is private so an empty table is unrepresentable —
+/// the type carries that rule structurally instead of trusting every
+/// construction site; build values through [`FromStr`] or
+/// [`EnergyModes::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnergyModes(Vec<u16>);
+
+impl EnergyModes {
+    /// Creates a mode table, returning `None` when the table is empty:
+    /// an empty table is the firmware's "command not served" answer,
+    /// not a mode configuration to report.
+    pub fn new(values: Vec<u16>) -> Option<Self> {
+        (!values.is_empty()).then_some(Self(values))
+    }
+
+    /// The mode values.
+    pub fn get(&self) -> &[u16] {
+        &self.0
+    }
+
+    /// Converts the table into a form suitable for sending to the
+    /// keyboard as the data of a `wireless.energy.modes` write: the
+    /// values space-separated, the same shape a read carries.
+    ///
+    /// No source records a write of this command — the shape mirrors
+    /// the read, nothing more.
+    pub fn to_command_data(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl FromStr for EnergyModes {
+    type Err = ParseWirelessError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let values = energy_modes_parser
+            .parse(s)
+            .map_err(|_| ParseWirelessError::EnergyModes(s.to_owned()))?;
+
+        Self::new(values).ok_or(ParseWirelessError::EnergyModes(s.to_owned()))
+    }
+}
+
+impl std::fmt::Display for EnergyModes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let values = self
+            .0
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        f.write_str(&values)
+    }
+}
+
+/// Parses a non-empty run of space-separated decimal mode values,
+/// optionally followed by whitespace, and nothing else.
+fn energy_modes_parser(input: &mut &str) -> ModalResult<Vec<u16>> {
+    let values = repeat(1.., terminated(dec_uint::<_, u16, _>, space0)).parse_next(input)?;
+    eof.parse_next(input)?;
+
+    Ok(values)
+}
+
+/// Returns the command data for writing `wireless.energy.disable`: the
+/// bool word `"true"` or `"false"`.
+///
+/// The bool word is the only form any source carries — the virtual
+/// wireless keyboards store `true` for this command, and no Bazecor
+/// renderer ever sends it, so there is no write form to follow beyond
+/// the captured vocabulary.
+pub fn energy_disable_command_data(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
 /// The keyboard's Bluetooth device name (`wireless.bluetooth.deviceName`).
 ///
 /// The response is the name verbatim, possibly empty — every shipped
@@ -478,13 +592,12 @@ mod tests {
         #[serde(rename = "scope_commands")]
         scope_commands: Vec<String>,
         /// Virtual keyboard and shipped-backup captures, keyed by
-        /// source then command. Sources also carry wireless commands
-        /// OUTSIDE the WS-D scope (the `wireless.energy.*` family,
+        /// source then command. Besides the WS-D scope commands the
+        /// recording was built for, the sources carry the commands
+        /// issue #23 split out of #4 (the `wireless.energy.*` family,
         /// `wireless.rf.stability`, the `wireless.bluetooth` store
-        /// management commands) — recorded as the evidence map, not
-        /// parsed here: issue #4's command list does not include them,
-        /// and this unit builds none; they are tracked for a scope
-        /// decision in their own parity issue (#23).
+        /// management commands); the differential below parses BOTH
+        /// sets — every recorded response, scope or not.
         sources: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
         /// Commands whose captured forms disagree between sources,
         /// recorded as notes instead of equality checks, and the
@@ -573,6 +686,57 @@ mod tests {
                 // data, not a parse shape.
                 assert_eq!(data.trim(), "", "{source} `{command}`");
             }
+            "wireless.energy.modes" => {
+                let modes = data
+                    .parse::<EnergyModes>()
+                    .unwrap_or_else(parse_failure(source, command, data));
+
+                // The recorded table round-trips exactly, and every
+                // source that carries the command carries the same
+                // eleven-zero shape.
+                assert_eq!(modes.to_string(), data, "{source} `{command}`");
+                assert_eq!(
+                    modes,
+                    EnergyModes::new(vec![0; 11]).unwrap(),
+                    "{source} `{command}`: every recording source answers \
+                     the same eleven-zero table"
+                );
+            }
+            "wireless.energy.disable" => {
+                // The only captured form is the bool word: parse it
+                // with the type the read uses, and pin the polarity
+                // the capture actually carries.
+                let disabled = data
+                    .parse::<crate::focus_api::parsing::settings::BoolWord>()
+                    .unwrap_or_else(parse_failure(source, command, data));
+
+                assert!(
+                    disabled.0,
+                    "{source} `{command}`: every capture reads `true`"
+                );
+                assert_eq!(disabled.to_string(), data, "{source} `{command}`");
+            }
+            "wireless.energy.currentMode" | "wireless.rf.stability" => {
+                // A plain decimal both times: the mode selector reads
+                // 0, the stability reading reads 0. The scale and the
+                // domain are undocumented — the parse claims decimal,
+                // nothing more.
+                let value = data
+                    .parse::<crate::focus_api::parsing::settings::DecimalU16>()
+                    .unwrap_or_else(parse_failure(source, command, data));
+
+                assert_eq!(value.0, 0, "{source} `{command}`");
+            }
+            "wireless.bluetooth.macs"
+            | "wireless.bluetooth.peer_ids"
+            | "wireless.bluetooth.remove"
+            | "wireless.bluetooth.list" => {
+                // The paired-device store: every capture holds the
+                // empty factory store, which is data, not a parse
+                // shape — the SDK reads these raw and claims nothing
+                // about a populated store (no capture of one exists).
+                assert_eq!(data.trim(), "", "{source} `{command}`");
+            }
             other => panic!("unmapped scope command `{other}` — extend the match"),
         }
     }
@@ -587,17 +751,17 @@ mod tests {
 
     #[test]
     fn our_parses_agree_with_every_recorded_response() {
-        // Every recorded WS-D response parses with the SDK type its
-        // command maps to. This is the WS-D differential: the shapes
-        // are the app's own data, machine-recorded, not transcribed.
+        // Every recorded response parses with the SDK type its command
+        // maps to — the WS-D scope commands AND the #23 commands the
+        // recording also carries. This is the WS-D differential: the
+        // shapes are the app's own data, machine-recorded, not
+        // transcribed. A re-recording that adds a wireless command
+        // fails on the unmapped-command arm until its shape is
+        // adjudicated, not slips past unexamined.
         let recorded = recorded_wireless();
 
-        for (source, commands) in &recorded.sources {
-            for command in &recorded.scope_commands {
-                let Some(data) = commands.get(command) else {
-                    continue;
-                };
-
+        for (source, entries) in &recorded.sources {
+            for (command, data) in entries {
                 assert_recorded_response_parses(source, command, data);
             }
         }
@@ -630,6 +794,39 @@ mod tests {
         recorded_sources.sort_unstable();
 
         assert_eq!(recorded_sources, expected);
+    }
+
+    #[test]
+    fn the_recording_scope_stays_the_ws_d_command_list() {
+        // The scope list is what drives the recorder's absence notes
+        // (a scope command no source captures is recorded AS absent),
+        // so it must not drift silently: a change here is a change to
+        // what the recording claims to cover, and is re-adjudicated
+        // deliberately.
+        let recorded = recorded_wireless();
+        let mut expected = [
+            "wireless.battery.left.level",
+            "wireless.battery.right.level",
+            "wireless.battery.left.status",
+            "wireless.battery.right.status",
+            "wireless.battery.savingMode",
+            "wireless.battery.forceRead",
+            "wireless.rf.power",
+            "wireless.rf.channelHop",
+            "wireless.rf.syncPairing",
+            "wireless.bluetooth.deviceName",
+            "wireless.bluetooth.infoChannel 1",
+            "wireless.bluetooth.infoChannel 2",
+            "wireless.bluetooth.infoChannel 3",
+            "wireless.bluetooth.infoChannel 4",
+            "wireless.bluetooth.infoChannel 5",
+        ];
+        expected.sort_unstable();
+
+        let mut scope = recorded.scope_commands.clone();
+        scope.sort();
+
+        assert_eq!(scope, expected);
     }
 
     #[test]
@@ -682,6 +879,104 @@ mod tests {
             RfChannelHop(false)
         );
         assert_eq!("0".parse::<RfChannelHop>().unwrap(), RfChannelHop(false));
+    }
+
+    #[test]
+    fn the_bluetooth_store_commands_are_recorded_as_the_empty_factory_store() {
+        // The #23 store reads rest on exactly one captured fact: every
+        // source that carries `wireless.bluetooth.{macs,peer_ids,
+        // remove,list}` records the empty string — no capture of a
+        // POPULATED store exists in any of Bazecor's data sources. The
+        // SDK reads these raw and claims nothing about a populated
+        // one; if a future recording captures a populated store, this
+        // pins the moment to re-adjudicate its shape.
+        let recorded = recorded_wireless();
+
+        for (source, entries) in &recorded.sources {
+            for command in [
+                "wireless.bluetooth.macs",
+                "wireless.bluetooth.peer_ids",
+                "wireless.bluetooth.remove",
+                "wireless.bluetooth.list",
+            ] {
+                let Some(data) = entries.get(command) else {
+                    continue;
+                };
+
+                assert_eq!(
+                    data.trim(),
+                    "",
+                    "{source} `{command}`: a capture stopped recording the \
+                     empty factory store — re-adjudicate the store's shape"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn energy_modes_parses_the_recorded_table() {
+        // The recorded eleven-zero table, bare and with the trailing
+        // separator space the firmware appends.
+        assert_eq!(
+            "0 0 0 0 0 0 0 0 0 0 0".parse::<EnergyModes>().unwrap(),
+            EnergyModes::new(vec![0; 11]).unwrap()
+        );
+        assert_eq!(
+            "0 0 0 0 0 0 0 0 0 0 0 ".parse::<EnergyModes>().unwrap(),
+            EnergyModes::new(vec![0; 11]).unwrap()
+        );
+
+        // Distinct values survive, and the wire form round-trips: the
+        // write data is the read shape.
+        let modes = "3 0 12".parse::<EnergyModes>().unwrap();
+
+        assert_eq!(modes, EnergyModes::new(vec![3, 0, 12]).unwrap());
+        assert_eq!(modes.get(), &[3, 0, 12]);
+        assert_eq!(modes.to_string(), "3 0 12");
+        assert_eq!(modes.to_command_data(), "3 0 12");
+        assert_eq!(
+            EnergyModes::new(vec![0; 11]).unwrap().to_command_data(),
+            "0 0 0 0 0 0 0 0 0 0 0"
+        );
+
+        // NOT a table: an empty response (what the firmware answers a
+        // command it does not serve with), a non-decimal, trailing
+        // garbage. Each fails with the response named.
+        assert!(matches!(
+            "".parse::<EnergyModes>(),
+            Err(ParseWirelessError::EnergyModes(_))
+        ));
+        assert!(matches!(
+            "  ".parse::<EnergyModes>(),
+            Err(ParseWirelessError::EnergyModes(_))
+        ));
+        assert!(matches!(
+            "0 1 x".parse::<EnergyModes>(),
+            Err(ParseWirelessError::EnergyModes(_))
+        ));
+        assert!(matches!(
+            "65536".parse::<EnergyModes>(),
+            Err(ParseWirelessError::EnergyModes(_))
+        ));
+
+        // The empty table is unrepresentable through the type's own
+        // constructor, not just through the parser.
+        assert!(EnergyModes::new(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn energy_disable_writes_the_captured_bool_word() {
+        // The bool word is the only form any source carries.
+        assert_eq!(energy_disable_command_data(true), "true");
+        assert_eq!(energy_disable_command_data(false), "false");
+
+        // The read type is the same vocabulary.
+        assert_eq!(
+            "true "
+                .parse::<crate::focus_api::parsing::settings::BoolWord>()
+                .unwrap(),
+            crate::focus_api::parsing::settings::BoolWord(true)
+        );
     }
 
     #[test]

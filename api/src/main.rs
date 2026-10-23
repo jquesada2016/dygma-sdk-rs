@@ -667,6 +667,21 @@ enum ReadableSetting {
     RfChannelHop,
     /// The Bluetooth device name (possibly empty).
     BluetoothDeviceName,
+    /// The energy-management mode table (space-separated decimals).
+    ///
+    /// Recorded by Bazecor's virtual wireless keyboards and its shipped
+    /// Raise2 backups only — no Defy source carries it, and a device
+    /// that does not serve the command answers an empty response, which
+    /// fails the read.
+    EnergyModes,
+    /// Whether the energy-management feature is disabled (`true`/`false`).
+    ///
+    /// The flag's polarity rests on the command name alone: no Bazecor
+    /// code path ever sends or reads it.
+    EnergyManagementDisabled,
+    /// The active energy-management mode (a decimal; the valid range is
+    /// documented nowhere).
+    EnergyCurrentMode,
 }
 
 /// A single setting that can be written to the device.
@@ -736,6 +751,24 @@ enum WritableSetting {
     /// so an all-whitespace value — like an empty one — writes
     /// nothing: the firmware answers a data-less write as a read).
     BluetoothDeviceName,
+    /// The energy-management mode table, space-separated decimals.
+    ///
+    /// No source records a write of this command — the write mirrors
+    /// the read shape, nothing more.
+    EnergyModes,
+    /// Whether the energy-management feature is disabled
+    /// (`1`/`0`/`true`/`false`; written as the bool word the captures
+    /// carry).
+    ///
+    /// No source records a write of this command, and the flag's
+    /// polarity rests on the command name alone.
+    EnergyManagementDisabled,
+    /// The active energy-management mode (a decimal; the valid range is
+    /// documented nowhere — this sends whatever number it is given).
+    ///
+    /// No source records a write of this command — the write mirrors
+    /// the read shape, nothing more.
+    EnergyCurrentMode,
 }
 
 /// The products `config init` knows, as CLI arguments.
@@ -1265,10 +1298,13 @@ enum SettingsCommands {
         ///
         /// Numbers are plain decimals. `only-custom` accepts
         /// `1`/`0`/`true`/`false`. `default-layer` accepts a layer
-        /// number or `none`. `battery-saving-mode` and
-        /// `rf-channel-hop` accept `1`/`0`/`true`/`false`, `rf-power`
-        /// accepts `0`/`1`/`2`, and `bluetooth-device-name` is sent
-        /// unquoted; surrounding whitespace is trimmed.
+        /// number or `none`. `battery-saving-mode`,
+        /// `rf-channel-hop`, and `energy-management-disabled` accept
+        /// `1`/`0`/`true`/`false`, `rf-power` accepts `0`/`1`/`2`,
+        /// `energy-current-mode` accepts a decimal, `energy-modes`
+        /// accepts a non-empty space-separated run of decimals, and
+        /// `bluetooth-device-name` is sent unquoted; surrounding
+        /// whitespace is trimmed.
         value: String,
     },
     /// Resets every plugin setting stored in the device's EEPROM.
@@ -1567,6 +1603,24 @@ impl SettingsCommands {
                         .await
                         .change_context(Error)
                         .attach("reading `wireless.bluetooth.deviceName` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::EnergyModes => defy
+                        .get_energy_modes()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.energy.modes` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::EnergyManagementDisabled => defy
+                        .get_energy_management_disabled()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.energy.disable` from the Defy")?
+                        .to_string(),
+                    ReadableSetting::EnergyCurrentMode => defy
+                        .get_energy_current_mode()
+                        .await
+                        .change_context(Error)
+                        .attach("reading `wireless.energy.currentMode` from the Defy")?
                         .to_string(),
                 };
 
@@ -1943,8 +1997,9 @@ fn brightness_percent(brightness: u8) -> u16 {
     (u16::from(brightness) * 100 + 127) / 255
 }
 
-/// The wireless commands: the live side-battery state, and the two
-/// wireless actions. The persisted wireless settings ride
+/// The wireless commands: the live side-battery state, the RF
+/// stability reading, the Bluetooth pairing store, and the wireless
+/// actions. The persisted wireless settings ride
 /// `settings get`/`settings set`, exactly like the LED settings do.
 #[derive(Subcommand)]
 enum WirelessCommands {
@@ -1958,6 +2013,37 @@ enum WirelessCommands {
     /// commands enumerate on wireless hardware only), so on wired
     /// hardware this fails at the first read.
     Status,
+    /// Reads the RF link stability reading (`wireless.rf.stability`),
+    /// as a plain decimal — the reading's scale is documented nowhere.
+    ///
+    /// No Defy source captures the command (it is recorded by Bazecor's
+    /// virtual wireless keyboards and its shipped Raise2 backups only)
+    /// and no Bazecor code path ever sends it, so a device that does
+    /// not serve it answers an empty response, which fails the read.
+    RfStability,
+    /// Reads the Bluetooth pairing store (`wireless.bluetooth.macs`,
+    /// `wireless.bluetooth.peer_ids`, `wireless.bluetooth.list`): the
+    /// three responses verbatim, trimmed of separator whitespace.
+    ///
+    /// Every recorded capture holds the empty factory store, so nothing
+    /// is claimed about a populated store's shape — no capture of one
+    /// exists. Like `status`, the reads run in sequence and the first
+    /// failure fails the command with no partial output.
+    BluetoothStore,
+    /// Sends `wireless.bluetooth.remove <identifier>`: a request to
+    /// remove one device from the Bluetooth pairing store, the
+    /// identifier sent verbatim and unquoted.
+    ///
+    /// No Bazecor code path ever sends this command — whether the
+    /// firmware wants a MAC address, a peer id, or something else is
+    /// not pinned by any source, and the response is discarded (the
+    /// success message states what was sent, not what the device now
+    /// does). Inspect the store afterwards with `wireless
+    /// bluetooth-store`.
+    BluetoothRemove {
+        /// The identifier of the device to remove, sent verbatim.
+        identifier: String,
+    },
     /// Forces the Neuron to re-read both sides' battery state
     /// (`wireless.battery.forceRead`). The sides' answers update a
     /// couple of seconds later; run `wireless status` again after
@@ -2054,6 +2140,73 @@ impl WirelessCommands {
                 for (channel, info) in info_channels {
                     println!("bluetooth info channel {}: {info}", channel.get());
                 }
+
+                Ok(())
+            }
+            Self::RfStability => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                let stability = defy
+                    .get_rf_stability()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.rf.stability` from the Defy")?;
+
+                println!("rf stability: {stability}");
+
+                Ok(())
+            }
+            Self::BluetoothStore => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                // The `status` shape: every read runs to completion
+                // before the first print, so a mid-sequence failure
+                // leaves no partial output on stdout.
+                let macs = defy
+                    .get_bluetooth_macs()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.bluetooth.macs` from the Defy")?;
+                let peer_ids = defy
+                    .get_bluetooth_peer_ids()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.bluetooth.peer_ids` from the Defy")?;
+                let list = defy
+                    .get_bluetooth_list()
+                    .await
+                    .change_context(Error)
+                    .attach("reading `wireless.bluetooth.list` from the Defy")?;
+
+                println!("bluetooth macs: {macs}");
+                println!("bluetooth peer ids: {peer_ids}");
+                println!("bluetooth list: {list}");
+
+                Ok(())
+            }
+            Self::BluetoothRemove { identifier } => {
+                let mut defy = DefyKeyboard::new()
+                    .await
+                    .change_context(Error)
+                    .attach("connecting to the Defy keyboard")?;
+
+                defy.remove_bluetooth_device(&identifier)
+                    .await
+                    .change_context(Error)
+                    .attach("sending `wireless.bluetooth.remove` to the Defy")?;
+
+                println!(
+                    "Sent `wireless.bluetooth.remove {identifier}` to the Defy; \
+                     the command's write grammar is unadjudicated — inspect \
+                     the store with `wireless bluetooth-store` to see what \
+                     the device holds now."
+                );
 
                 Ok(())
             }
@@ -3301,6 +3454,9 @@ enum SettingWrite {
     RfPower(parsing::wireless::RfPower),
     RfChannelHop(bool),
     BluetoothDeviceName(parsing::wireless::DeviceName),
+    EnergyModes(parsing::wireless::EnergyModes),
+    EnergyManagementDisabled(bool),
+    EnergyCurrentMode(u16),
 }
 
 /// Parses a setting write from its command-line value string. This
@@ -3463,6 +3619,22 @@ fn parse_setting_write(
         WritableSetting::BluetoothDeviceName => {
             SettingWrite::BluetoothDeviceName(parsing::wireless::DeviceName::new(value))
         }
+        WritableSetting::EnergyModes => SettingWrite::EnergyModes(
+            value
+                .parse::<parsing::wireless::EnergyModes>()
+                .change_context(Error)
+                .attach("parsing the value; expected space-separated decimal mode values")?,
+        ),
+        WritableSetting::EnergyManagementDisabled => SettingWrite::EnergyManagementDisabled(
+            parse_bool_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected 1/0/true/false")?,
+        ),
+        WritableSetting::EnergyCurrentMode => SettingWrite::EnergyCurrentMode(
+            parse_u16_value(value)
+                .change_context(Error)
+                .attach("parsing the value; expected a decimal mode number")?,
+        ),
     };
 
     Ok(write)
@@ -3503,6 +3675,9 @@ impl SettingWrite {
             Self::RfPower(_) => "wireless.rf.power",
             Self::RfChannelHop(_) => "wireless.rf.channelHop",
             Self::BluetoothDeviceName(_) => "wireless.bluetooth.deviceName",
+            Self::EnergyModes(_) => "wireless.energy.modes",
+            Self::EnergyManagementDisabled(_) => "wireless.energy.disable",
+            Self::EnergyCurrentMode(_) => "wireless.energy.currentMode",
         }
     }
 
@@ -3664,6 +3839,21 @@ impl SettingWrite {
                 .await
                 .change_context(Error)
                 .attach("writing `wireless.bluetooth.deviceName` to the Defy"),
+            Self::EnergyModes(value) => defy
+                .set_energy_modes(&value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.energy.modes` to the Defy"),
+            Self::EnergyManagementDisabled(value) => defy
+                .set_energy_management_disabled(value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.energy.disable` to the Defy"),
+            Self::EnergyCurrentMode(value) => defy
+                .set_energy_current_mode(value)
+                .await
+                .change_context(Error)
+                .attach("writing `wireless.energy.currentMode` to the Defy"),
         }
     }
 }

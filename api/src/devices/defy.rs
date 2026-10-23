@@ -214,7 +214,10 @@ mod error {
     /// wireless reads (`wireless.battery.{left,right}.{level,status}`,
     /// `wireless.battery.savingMode`, `wireless.rf.power`,
     /// `wireless.rf.channelHop`, `wireless.bluetooth.deviceName`,
-    /// `wireless.bluetooth.infoChannel`).
+    /// `wireless.bluetooth.infoChannel`, `wireless.energy.modes`,
+    /// `wireless.energy.disable`, `wireless.energy.currentMode`,
+    /// `wireless.rf.stability`, `wireless.bluetooth.{macs,peer_ids,
+    /// list}`).
     #[derive(Debug, Display, From, Error)]
     pub enum GetSettingError {
         /// Failed to run the command.
@@ -592,6 +595,14 @@ impl DefyKeyboard {
     const WIRELESS_RF_SYNC_PAIRING_COMMAND_NAME: &str = "wireless.rf.syncPairing";
     const WIRELESS_BLUETOOTH_DEVICE_NAME_COMMAND_NAME: &str = "wireless.bluetooth.deviceName";
     const WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME: &str = "wireless.bluetooth.infoChannel";
+    const WIRELESS_ENERGY_MODES_COMMAND_NAME: &str = "wireless.energy.modes";
+    const WIRELESS_ENERGY_DISABLE_COMMAND_NAME: &str = "wireless.energy.disable";
+    const WIRELESS_ENERGY_CURRENT_MODE_COMMAND_NAME: &str = "wireless.energy.currentMode";
+    const WIRELESS_RF_STABILITY_COMMAND_NAME: &str = "wireless.rf.stability";
+    const WIRELESS_BLUETOOTH_MACS_COMMAND_NAME: &str = "wireless.bluetooth.macs";
+    const WIRELESS_BLUETOOTH_PEER_IDS_COMMAND_NAME: &str = "wireless.bluetooth.peer_ids";
+    const WIRELESS_BLUETOOTH_REMOVE_COMMAND_NAME: &str = "wireless.bluetooth.remove";
+    const WIRELESS_BLUETOOTH_LIST_COMMAND_NAME: &str = "wireless.bluetooth.list";
     /// The memory size of the superkey map.
     pub const SUPERKEY_MEMORY_SIZE: usize = 512;
 
@@ -1614,6 +1625,192 @@ impl DefyKeyboard {
         Ok(res.trim().to_owned())
     }
 
+    /// Reads the energy-management mode table
+    /// (`wireless.energy.modes`): one decimal value per
+    /// energy-management mode, parsed as
+    /// [`EnergyModes`](parsing::wireless::EnergyModes).
+    ///
+    /// The captured evidence is eleven `0`s — the same table in all
+    /// four of Bazecor's virtual wireless keyboards and in its shipped
+    /// Raise2 backup pair. No Defy source captures the command (it is
+    /// absent from `FOCUS_API.md`, from every shipped Defy backup, and
+    /// from every Bazecor renderer code path — the renderer never
+    /// sends it), so the values' semantics rest on the command's name
+    /// alone, and a firmware that does not serve the command answers
+    /// an empty response, which fails the read with the response
+    /// named. Same evidence class as
+    /// [`DefyKeyboard::get_battery_level`] (wireless hardware only).
+    pub async fn get_energy_modes(
+        &mut self,
+    ) -> Result<parsing::wireless::EnergyModes, GetSettingError> {
+        self.get_wireless_setting(Self::WIRELESS_ENERGY_MODES_COMMAND_NAME)
+            .await
+    }
+
+    /// Write the energy-management mode table
+    /// (`wireless.energy.modes`) as the space-separated values a read
+    /// carries.
+    ///
+    /// No source records a write of this command — no Bazecor code
+    /// path ever sends it — so the write grammar is unadjudicated
+    /// beyond mirroring the read shape. Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_energy_modes(
+        &mut self,
+        modes: &parsing::wireless::EnergyModes,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_ENERGY_MODES_COMMAND_NAME,
+            &modes.to_command_data(),
+        )
+        .await
+    }
+
+    /// Reads the energy-management disable flag
+    /// (`wireless.energy.disable`).
+    ///
+    /// The only captured form is the bool word `true` (Bazecor's four
+    /// virtual wireless keyboards and its shipped Raise2 backup pair);
+    /// the read parses that vocabulary with
+    /// [`BoolWord`](parsing::settings::BoolWord). What `true` MEANS
+    /// rests on the command's name alone — no renderer ever sends or
+    /// reads the command, `FOCUS_API.md` does not document it, and no
+    /// Defy source captures it, so the flag's polarity is
+    /// name-derived, not observed. Same evidence class as
+    /// [`DefyKeyboard::get_energy_modes`].
+    pub async fn get_energy_management_disabled(&mut self) -> Result<bool, GetSettingError> {
+        self.get_setting::<parsing::settings::BoolWord>(Self::WIRELESS_ENERGY_DISABLE_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Write the energy-management disable flag
+    /// (`wireless.energy.disable`) as the bool word the captures
+    /// carry.
+    ///
+    /// No source records a write of this command, so the write grammar
+    /// is unadjudicated beyond the captured vocabulary, and whether
+    /// the firmware accepts a write at all is unverified. Same write
+    /// caveat as [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_energy_management_disabled(
+        &mut self,
+        disabled: bool,
+    ) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_ENERGY_DISABLE_COMMAND_NAME,
+            parsing::wireless::energy_disable_command_data(disabled),
+        )
+        .await
+    }
+
+    /// Reads the active energy-management mode
+    /// (`wireless.energy.currentMode`).
+    ///
+    /// Every capture reads `0`; the valid mode range is documented
+    /// nowhere (the eleven-entry
+    /// [`modes`](DefyKeyboard::get_energy_modes) table suggests modes
+    /// are indexed, but that is inference from one shape, not a
+    /// documented domain), so the value is served as a plain decimal.
+    /// No renderer ever sends or reads the command; the same evidence
+    /// class as [`DefyKeyboard::get_energy_modes`].
+    pub async fn get_energy_current_mode(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(
+            Self::WIRELESS_ENERGY_CURRENT_MODE_COMMAND_NAME,
+        )
+        .await
+        .map(|value| value.0)
+    }
+
+    /// Write the active energy-management mode
+    /// (`wireless.energy.currentMode`) as a decimal.
+    ///
+    /// No source records a write of this command, so the write grammar
+    /// is unadjudicated beyond mirroring the read shape, and the valid
+    /// mode range is unknown — this sends whatever number it is given.
+    /// Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn set_energy_current_mode(&mut self, mode: u16) -> Result<(), SetSettingError> {
+        self.set_setting(
+            Self::WIRELESS_ENERGY_CURRENT_MODE_COMMAND_NAME,
+            &mode.to_string(),
+        )
+        .await
+    }
+
+    /// Reads the RF link stability reading (`wireless.rf.stability`).
+    ///
+    /// Every capture reads `0` (the four virtual wireless keyboards
+    /// and the shipped Raise2 backup pair); the reading's scale is
+    /// documented nowhere, so the value is served as a plain decimal.
+    /// No renderer ever sends or reads the command, and no Defy source
+    /// captures it — a firmware that does not serve it answers an
+    /// empty response, which fails the read with the response named.
+    /// Same evidence class as
+    /// [`DefyKeyboard::get_energy_modes`].
+    pub async fn get_rf_stability(&mut self) -> Result<u16, GetSettingError> {
+        self.get_setting::<parsing::settings::DecimalU16>(Self::WIRELESS_RF_STABILITY_COMMAND_NAME)
+            .await
+            .map(|value| value.0)
+    }
+
+    /// Reads the paired-device store's MAC addresses
+    /// (`wireless.bluetooth.macs`).
+    ///
+    /// The response is served verbatim, trimmed of the separator
+    /// whitespace a Focus response carries: every capture — the
+    /// shipped Defy AND Raise2 backups, and the four virtual wireless
+    /// keyboards — holds the empty factory store, and no capture of a
+    /// POPULATED store exists, so this claims nothing about the
+    /// response's shape or content. The paired-store purpose of the
+    /// `wireless.bluetooth.*` group rests on the commands' names
+    /// alone. Same evidence class as
+    /// [`DefyKeyboard::get_bluetooth_info_channel`].
+    pub async fn get_bluetooth_macs(&mut self) -> Result<String, GetSettingError> {
+        self.get_raw_wireless_response(Self::WIRELESS_BLUETOOTH_MACS_COMMAND_NAME)
+            .await
+    }
+
+    /// Reads the paired-device store's peer ids
+    /// (`wireless.bluetooth.peer_ids`). Same evidence class as
+    /// [`DefyKeyboard::get_bluetooth_macs`].
+    pub async fn get_bluetooth_peer_ids(&mut self) -> Result<String, GetSettingError> {
+        self.get_raw_wireless_response(Self::WIRELESS_BLUETOOTH_PEER_IDS_COMMAND_NAME)
+            .await
+    }
+
+    /// Reads the paired-device list (`wireless.bluetooth.list`). Same
+    /// evidence class as [`DefyKeyboard::get_bluetooth_macs`].
+    pub async fn get_bluetooth_list(&mut self) -> Result<String, GetSettingError> {
+        self.get_raw_wireless_response(Self::WIRELESS_BLUETOOTH_LIST_COMMAND_NAME)
+            .await
+    }
+
+    /// Removes a device from the paired-device store
+    /// (`wireless.bluetooth.remove`), sending `identifier` verbatim
+    /// and unquoted as the command's data.
+    ///
+    /// No Bazecor code path ever sends this command — its write
+    /// grammar is unadjudicated: whether the firmware wants a MAC
+    /// address, a peer id, an index into
+    /// [`get_bluetooth_macs`](DefyKeyboard::get_bluetooth_macs), or
+    /// something else is not pinned by any source, so this makes no
+    /// claim about the identifier's form and no claim about the
+    /// response (it is discarded). An empty identifier writes an empty
+    /// payload, which the firmware answers as a read — a silent
+    /// no-op, not a removal. Same write caveat as
+    /// [`DefyKeyboard::set_battery_saving_mode`].
+    pub async fn remove_bluetooth_device(
+        &mut self,
+        identifier: &str,
+    ) -> Result<(), RunCommandError> {
+        write_setting(
+            &mut self.focus_api,
+            Self::WIRELESS_BLUETOOTH_REMOVE_COMMAND_NAME,
+            identifier,
+        )
+        .await
+    }
+
     /// Reset every plugin setting stored in the device's EEPROM to the
     /// erased state.
     ///
@@ -1942,9 +2139,22 @@ impl DefyKeyboard {
 
     /// Runs a settings command with the given write data.
     async fn set_setting(&mut self, command: &str, data: &str) -> Result<(), SetSettingError> {
-        self.run_command(command, Some(data)).await?;
+        write_setting(&mut self.focus_api, command, data).await?;
 
         Ok(())
+    }
+
+    /// Runs a wireless read whose response the SDK serves verbatim:
+    /// the raw response, trimmed of the separator whitespace a Focus
+    /// response carries — the one body of the raw-passthrough reads,
+    /// the thinnest evidence class, where no capture pins a shape the
+    /// response could be parsed into. Delegates to [`read_raw_response`],
+    /// the same script-drivable seam pattern as [`read_setting`].
+    async fn get_raw_wireless_response(
+        &mut self,
+        command: &str,
+    ) -> Result<String, GetSettingError> {
+        read_raw_response(&mut self.focus_api, command).await
     }
 }
 
@@ -1968,6 +2178,37 @@ where
         .map_err(GetSettingError::CommandFailed)?;
 
     T::from_str(&res).map_err(Into::into)
+}
+
+/// Sends a settings command with write data over any connection —
+/// [`DefyKeyboard::set_setting`]'s body, shared with the one
+/// data-carrying wireless action (`wireless.bluetooth.remove`) so every
+/// write runs exactly one way, and script-drivable like the reads
+/// ([`read_setting`]).
+async fn write_setting(
+    connection: &mut impl FocusApiConnection,
+    command: &str,
+    data: &str,
+) -> Result<(), RunCommandError> {
+    connection.run_command(command, Some(data)).await?;
+
+    Ok(())
+}
+
+/// Runs a wireless read whose response the SDK serves verbatim: the raw
+/// response, trimmed of the separator whitespace a Focus response
+/// carries — [`DefyKeyboard::get_raw_wireless_response`]'s body, over
+/// any connection so tests can drive it against scripted responses,
+/// the same seam [`read_setting`] gives the parsed reads.
+async fn read_raw_response(
+    connection: &mut impl FocusApiConnection,
+    command: &str,
+) -> Result<String, GetSettingError> {
+    connection
+        .run_command(command, None)
+        .await
+        .map_err(GetSettingError::CommandFailed)
+        .map(|res| res.trim().to_owned())
 }
 
 /// The capture core of [`DefyKeyboard::create_backup`] and
@@ -3211,6 +3452,43 @@ mod tests {
             DefyKeyboard::WIRELESS_BLUETOOTH_INFO_CHANNEL_COMMAND_NAME,
             "wireless.bluetooth.infoChannel"
         );
+        // The #23 commands: their spellings are pinned to the
+        // hardware-virtual keyboard definitions' command-map keys
+        // (`DefyWireless.ts` at the pinned Bazecor commit) — the
+        // spellings exist in no renderer code path, so a typo would
+        // fail only on hardware.
+        assert_eq!(
+            DefyKeyboard::WIRELESS_ENERGY_MODES_COMMAND_NAME,
+            "wireless.energy.modes"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_ENERGY_DISABLE_COMMAND_NAME,
+            "wireless.energy.disable"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_ENERGY_CURRENT_MODE_COMMAND_NAME,
+            "wireless.energy.currentMode"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_RF_STABILITY_COMMAND_NAME,
+            "wireless.rf.stability"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_MACS_COMMAND_NAME,
+            "wireless.bluetooth.macs"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_PEER_IDS_COMMAND_NAME,
+            "wireless.bluetooth.peer_ids"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_REMOVE_COMMAND_NAME,
+            "wireless.bluetooth.remove"
+        );
+        assert_eq!(
+            DefyKeyboard::WIRELESS_BLUETOOTH_LIST_COMMAND_NAME,
+            "wireless.bluetooth.list"
+        );
     }
 
     #[tokio::test]
@@ -3246,6 +3524,165 @@ mod tests {
 
         // Both scripted commands were actually issued, in order.
         connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn the_issue_23_energy_reads_join_command_spelling_response_and_parse_offline() {
+        // The recorded shapes of the energy-family and stability reads
+        // (expectations/wireless.json), driven end-to-end over the same
+        // seam the methods use: the command spelled on the wire (the
+        // production constants), the response the sources record, the
+        // typed value parsed out.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("wireless.energy.modes", "0 0 0 0 0 0 0 0 0 0 0 "),
+                ScriptedConnection::ok("wireless.energy.disable", "true"),
+                ScriptedConnection::ok("wireless.energy.currentMode", "0"),
+                ScriptedConnection::ok("wireless.rf.stability", "0"),
+            ]
+            .into(),
+        };
+
+        let modes: parsing::wireless::EnergyModes = read_setting(
+            &mut connection,
+            DefyKeyboard::WIRELESS_ENERGY_MODES_COMMAND_NAME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            modes,
+            parsing::wireless::EnergyModes::new(vec![0; 11]).unwrap()
+        );
+
+        let disabled: bool = read_setting::<parsing::settings::BoolWord>(
+            &mut connection,
+            DefyKeyboard::WIRELESS_ENERGY_DISABLE_COMMAND_NAME,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(disabled);
+
+        let current_mode: u16 = read_setting::<parsing::settings::DecimalU16>(
+            &mut connection,
+            DefyKeyboard::WIRELESS_ENERGY_CURRENT_MODE_COMMAND_NAME,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(current_mode, 0);
+
+        let stability: u16 = read_setting::<parsing::settings::DecimalU16>(
+            &mut connection,
+            DefyKeyboard::WIRELESS_RF_STABILITY_COMMAND_NAME,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(stability, 0);
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn an_unserved_energy_modes_read_fails_on_the_empty_response() {
+        // A firmware that does not serve `wireless.energy.modes` answers
+        // an empty response; an empty table is not a reading, so the
+        // read fails naming the response — the "unserved" leg of the
+        // served/unserved/empty/failed probe pattern (no #23 command
+        // probes first; each is one straight command).
+        let mut connection = ScriptedConnection {
+            script: [ScriptedConnection::ok("wireless.energy.modes", "")].into(),
+        };
+
+        let err = read_setting::<parsing::wireless::EnergyModes>(
+            &mut connection,
+            DefyKeyboard::WIRELESS_ENERGY_MODES_COMMAND_NAME,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                GetSettingError::WirelessParsingFailure(
+                    parsing::wireless::ParseWirelessError::EnergyModes(_)
+                )
+            ),
+            "the empty response must fail the modes read: {err:?}"
+        );
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn the_issue_23_raw_store_reads_join_command_spelling_and_passthrough_offline() {
+        // The paired-device store reads serve the response verbatim,
+        // trimmed: the recorded empty factory store reads back empty,
+        // and a populated-shaped response would come through as-is
+        // (nothing is claimed about its shape). The failed-transport
+        // leg rides the same error the parsed reads raise.
+        let mut connection = ScriptedConnection {
+            script: [
+                ScriptedConnection::ok("wireless.bluetooth.macs", ""),
+                ScriptedConnection::ok("wireless.bluetooth.peer_ids", " \r"),
+                ScriptedConnection::ok("wireless.bluetooth.list", "aa:bb:cc:dd:ee:ff "),
+                ScriptedConnection::failed("wireless.bluetooth.macs"),
+            ]
+            .into(),
+        };
+
+        for (command, expected) in [
+            (DefyKeyboard::WIRELESS_BLUETOOTH_MACS_COMMAND_NAME, ""),
+            (DefyKeyboard::WIRELESS_BLUETOOTH_PEER_IDS_COMMAND_NAME, ""),
+            (
+                DefyKeyboard::WIRELESS_BLUETOOTH_LIST_COMMAND_NAME,
+                "aa:bb:cc:dd:ee:ff",
+            ),
+        ] {
+            let store = read_raw_response(&mut connection, command).await.unwrap();
+
+            assert_eq!(store, expected, "`{command}` passthrough");
+        }
+
+        let err = read_raw_response(
+            &mut connection,
+            DefyKeyboard::WIRELESS_BLUETOOTH_MACS_COMMAND_NAME,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, GetSettingError::CommandFailed(_)),
+            "a failed transport read must carry the command error: {err:?}"
+        );
+
+        connection.assert_spent();
+    }
+
+    #[tokio::test]
+    async fn the_bluetooth_remove_write_sends_the_identifier_as_the_command_data() {
+        // `wireless.bluetooth.remove`'s whole contract is the data it
+        // sends — its write grammar is unadjudicated (no source records
+        // a write), so the identifier travels verbatim and whatever the
+        // device answers is discarded, success or content alike.
+        let mut connection = RecordingConnection::default();
+
+        write_setting(
+            &mut connection,
+            DefyKeyboard::WIRELESS_BLUETOOTH_REMOVE_COMMAND_NAME,
+            "aa:bb:cc:dd:ee:ff",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            connection.sent,
+            [(
+                "wireless.bluetooth.remove".to_owned(),
+                Some("aa:bb:cc:dd:ee:ff".to_owned())
+            )]
+        );
     }
 
     #[test]
@@ -4313,6 +4750,29 @@ mod tests {
             assert_eq!(command, expected, "the capture ran an unscripted command");
 
             response
+        }
+    }
+
+    /// A recording Focus API connection: it answers every command with
+    /// a fixed success and logs the (command, data) pairs it was
+    /// handed. The write seam's double — a write's contract is the data
+    /// it sends, so the test asserts what was recorded, not what came
+    /// back (writes discard the response).
+    #[derive(Debug, Default)]
+    struct RecordingConnection {
+        sent: Vec<(String, Option<String>)>,
+    }
+
+    impl FocusApiConnection for RecordingConnection {
+        async fn run_command(
+            &mut self,
+            command: &str,
+            data: Option<&str>,
+        ) -> Result<String, RunCommandError> {
+            self.sent
+                .push((command.to_owned(), data.map(str::to_owned)));
+
+            Ok(String::new())
         }
     }
 
